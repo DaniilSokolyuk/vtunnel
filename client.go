@@ -8,46 +8,87 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
+const defaultPingInterval = 30 * time.Second
+
 // Client connects to a vtunnel server and forwards connections
 type Client struct {
-	conn     *websocket.Conn
-	forwards map[int]string // remotePort -> localAddr
-	streams  map[uint32]net.Conn
-	mu       sync.RWMutex
-	writeMu  sync.Mutex
-	done     chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
+	wsURL        string
+	headers      http.Header
+	conn         *websocket.Conn
+	forwards     map[int]string // remotePort -> localAddr
+	streams      map[uint32]net.Conn
+	mu           sync.RWMutex
+	writeMu      sync.Mutex
+	done         chan struct{}
+	closeOnce    sync.Once
+	ctx          context.Context
+	cancel       context.CancelFunc
+	pingInterval time.Duration
 }
 
-// NewClient creates a new vtunnel client
-func NewClient() *Client {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Client{
-		forwards: make(map[int]string),
-		streams:  make(map[uint32]net.Conn),
-		done:     make(chan struct{}),
-		ctx:      ctx,
-		cancel:   cancel,
+// Option configures a Client
+type Option func(*Client)
+
+// WithPingInterval sets the ping interval (0 = default 30s, negative = disabled)
+func WithPingInterval(d time.Duration) Option {
+	return func(c *Client) {
+		c.pingInterval = d
 	}
 }
 
+// WithHeaders sets HTTP headers for the WebSocket handshake
+func WithHeaders(h http.Header) Option {
+	return func(c *Client) {
+		c.headers = h
+	}
+}
+
+// NewClient creates a new vtunnel client
+func NewClient(wsURL string, opts ...Option) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &Client{
+		wsURL:        wsURL,
+		forwards:     make(map[int]string),
+		streams:      make(map[uint32]net.Conn),
+		done:         make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		pingInterval: defaultPingInterval,
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
 // Connect establishes a WebSocket connection to the server
-func (c *Client) Connect(wsURL string, headers http.Header) error {
+func (c *Client) Connect() error {
 	dialer := websocket.Dialer{}
-	conn, _, err := dialer.DialContext(c.ctx, wsURL, headers)
+	conn, _, err := dialer.DialContext(c.ctx, c.wsURL, c.headers)
 	if err != nil {
 		return err
 	}
 
 	c.conn = conn
+
+	// Set up keepalive
+	if c.pingInterval > 0 {
+		c.conn.SetReadDeadline(time.Now().Add(c.pingInterval * 2))
+		c.conn.SetPongHandler(func(string) error {
+			c.conn.SetReadDeadline(time.Now().Add(c.pingInterval * 2))
+			return nil
+		})
+		go c.pingLoop()
+	}
+
 	go c.readLoop()
 
-	log.Printf("[vtunnel-client] Connected to %s", wsURL)
+	log.Printf("[vtunnel-client] Connected to %s", c.wsURL)
 	return nil
 }
 
@@ -63,8 +104,10 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 
 // Close closes the client and all connections
 func (c *Client) Close() error {
-	c.cancel()
-	close(c.done)
+	c.closeOnce.Do(func() {
+		c.cancel()
+		close(c.done)
+	})
 
 	c.mu.Lock()
 	for _, conn := range c.streams {
@@ -81,6 +124,8 @@ func (c *Client) Close() error {
 
 // readLoop reads messages from the server
 func (c *Client) readLoop() {
+	defer c.conn.Close()
+
 	for {
 		select {
 		case <-c.done:
@@ -196,6 +241,26 @@ func (c *Client) removeStream(streamID uint32) {
 
 	if ok && conn != nil {
 		conn.Close()
+	}
+}
+
+// pingLoop sends periodic ping messages to keep the connection alive
+func (c *Client) pingLoop() {
+	ticker := time.NewTicker(c.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-ticker.C:
+			c.writeMu.Lock()
+			err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(c.pingInterval))
+			c.writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		}
 	}
 }
 

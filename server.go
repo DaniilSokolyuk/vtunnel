@@ -5,8 +5,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -37,6 +39,20 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 	defer s.cleanup()
 
 	log.Println("[vtunnel-server] Client connected")
+
+	// Set up keepalive - reset deadline when client pings us
+	s.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+	s.conn.SetPingHandler(func(data string) error {
+		s.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		// Must send pong back (default handler does this, but we replaced it)
+		s.writeMu.Lock()
+		err := s.conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(10*time.Second))
+		s.writeMu.Unlock()
+		if err == websocket.ErrCloseSent {
+			return nil
+		}
+		return err
+	})
 
 	for {
 		select {
@@ -72,7 +88,7 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 
 // handleListen starts listening on a port
 func (s *Server) handleListen(port int) {
-	addr := net.JoinHostPort("127.0.0.1", itoa(port))
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Printf("[vtunnel-server] Failed to listen on %s: %v", addr, err)
@@ -210,27 +226,4 @@ func (s *Server) cleanup() {
 	}
 
 	log.Println("[vtunnel-server] Cleanup complete")
-}
-
-// itoa converts int to string without importing strconv
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b [20]byte
-	pos := len(b)
-	neg := i < 0
-	if neg {
-		i = -i
-	}
-	for i > 0 {
-		pos--
-		b[pos] = byte('0' + i%10)
-		i /= 10
-	}
-	if neg {
-		pos--
-		b[pos] = '-'
-	}
-	return string(b[pos:])
 }

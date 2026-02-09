@@ -7,12 +7,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
 
-	"vtunnel"
+	"github.com/DaniilSokolyuk/vtunnel"
 )
 
 var upgrader = websocket.Upgrader{
@@ -51,8 +52,8 @@ func TestBasicTunnel(t *testing.T) {
 	t.Logf("Tunnel server running at %s", wsURL)
 
 	// 3. Connect vtunnel client
-	client := vtunnel.NewClient()
-	err := client.Connect(wsURL, nil)
+	client := vtunnel.NewClient(wsURL)
+	err := client.Connect()
 	if err != nil {
 		t.Fatalf("Client connect error: %v", err)
 	}
@@ -109,8 +110,8 @@ func TestMultiplePorts(t *testing.T) {
 	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
 
 	// Connect client
-	client := vtunnel.NewClient()
-	client.Connect(wsURL, nil)
+	client := vtunnel.NewClient(wsURL)
+	client.Connect()
 	defer client.Close()
 
 	// Listen on two ports
@@ -168,8 +169,8 @@ func TestMultipleConnections(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
 
-	client := vtunnel.NewClient()
-	client.Connect(wsURL, nil)
+	client := vtunnel.NewClient(wsURL)
+	client.Connect()
 	defer client.Close()
 
 	port := 18084
@@ -220,8 +221,8 @@ func TestLargePayload(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
 
-	client := vtunnel.NewClient()
-	client.Connect(wsURL, nil)
+	client := vtunnel.NewClient(wsURL)
+	client.Connect()
 	defer client.Close()
 
 	port := 18085
@@ -275,8 +276,8 @@ func TestTCPStream(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
 
-	client := vtunnel.NewClient()
-	client.Connect(wsURL, nil)
+	client := vtunnel.NewClient(wsURL)
+	client.Connect()
 	defer client.Close()
 
 	port := 18086
@@ -307,4 +308,189 @@ func TestTCPStream(t *testing.T) {
 	}
 
 	t.Logf("TCP echo: %s", string(buf[:n]))
+}
+
+// TestPingPong tests that ping/pong keepalive works
+func TestPingPong(t *testing.T) {
+	var pingReceived, pongSent int
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	// Simple WebSocket server that tracks pings
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		// Track ping frames
+		conn.SetPingHandler(func(data string) error {
+			mu.Lock()
+			pingReceived++
+			mu.Unlock()
+			// Send pong back
+			err := conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+			if err == nil {
+				mu.Lock()
+				pongSent++
+				mu.Unlock()
+			}
+			return err
+		})
+
+		// Just read messages to keep connection alive
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			conn.SetReadDeadline(time.Now().Add(time.Second))
+			if _, _, err := conn.ReadMessage(); err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+					// Ignore timeout errors
+					if !strings.Contains(err.Error(), "timeout") {
+						return
+					}
+				}
+			}
+		}
+	}))
+	defer tunnelServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
+
+	// Connect with short ping interval for testing
+	client := vtunnel.NewClient(wsURL, vtunnel.WithPingInterval(100*time.Millisecond))
+	err := client.Connect()
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+
+	// Wait for several pings
+	time.Sleep(350 * time.Millisecond)
+
+	close(done)
+	client.Close()
+
+	mu.Lock()
+	pings := pingReceived
+	pongs := pongSent
+	mu.Unlock()
+
+	t.Logf("Pings received: %d, Pongs sent: %d", pings, pongs)
+
+	if pings < 2 {
+		t.Errorf("Expected at least 2 pings, got %d", pings)
+	}
+	if pongs < 2 {
+		t.Errorf("Expected at least 2 pongs, got %d", pongs)
+	}
+}
+
+// TestPingPongTimeout tests that connection closes on pong timeout
+func TestPingPongTimeout(t *testing.T) {
+	serverClosed := make(chan struct{})
+
+	// Server that doesn't respond to pings
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		defer close(serverClosed)
+
+		// Ignore pings - don't respond with pong
+		conn.SetPingHandler(func(string) error {
+			return nil // Do nothing, no pong sent
+		})
+
+		// Just read to keep connection open
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer tunnelServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
+
+	// Very short intervals: ping every 50ms, timeout after 100ms (2x ping interval)
+	client := vtunnel.NewClient(wsURL, vtunnel.WithPingInterval(50*time.Millisecond))
+	err := client.Connect()
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+	defer client.Close()
+
+	// Wait for timeout - should happen within 150ms (100ms timeout + margin)
+	select {
+	case <-serverClosed:
+		t.Log("Connection closed as expected due to pong timeout")
+	case <-time.After(500 * time.Millisecond):
+		t.Error("Connection did not close after pong timeout")
+	}
+}
+
+// TestDisabledPing tests that ping can be disabled
+func TestDisabledPing(t *testing.T) {
+	var pingReceived int
+	var mu sync.Mutex
+	done := make(chan struct{})
+
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		conn.SetPingHandler(func(string) error {
+			mu.Lock()
+			pingReceived++
+			mu.Unlock()
+			return nil
+		})
+
+		// Just read messages
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			conn.SetReadDeadline(time.Now().Add(time.Second))
+			conn.ReadMessage()
+		}
+	}))
+	defer tunnelServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
+
+	// Connect with ping disabled (negative value)
+	client := vtunnel.NewClient(wsURL, vtunnel.WithPingInterval(-1))
+	err := client.Connect()
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+
+	// Wait a bit
+	time.Sleep(200 * time.Millisecond)
+
+	close(done)
+	client.Close()
+
+	mu.Lock()
+	pings := pingReceived
+	mu.Unlock()
+
+	if pings != 0 {
+		t.Errorf("Expected 0 pings with disabled ping, got %d", pings)
+	}
+
+	t.Logf("Pings with disabled mode: %d", pings)
 }
