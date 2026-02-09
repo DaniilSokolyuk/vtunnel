@@ -78,11 +78,7 @@ func (c *Client) Connect() error {
 
 	// Set up keepalive
 	if c.pingInterval > 0 {
-		c.conn.SetReadDeadline(time.Now().Add(c.pingInterval * 2))
-		c.conn.SetPongHandler(func(string) error {
-			c.conn.SetReadDeadline(time.Now().Add(c.pingInterval * 2))
-			return nil
-		})
+		c.conn.SetPongHandler(nil)
 		go c.pingLoop()
 	}
 
@@ -258,8 +254,10 @@ func (c *Client) pingLoop() {
 			err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(c.pingInterval))
 			c.writeMu.Unlock()
 			if err != nil {
+				log.Printf("[vtunnel-client] Ping failed: %v", err)
 				return
 			}
+			log.Printf("[vtunnel-client] Ping sent")
 		}
 	}
 }

@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -41,18 +40,7 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 	log.Println("[vtunnel-server] Client connected")
 
 	// Set up keepalive - reset deadline when client pings us
-	s.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-	s.conn.SetPingHandler(func(data string) error {
-		s.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
-		// Must send pong back (default handler does this, but we replaced it)
-		s.writeMu.Lock()
-		err := s.conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(10*time.Second))
-		s.writeMu.Unlock()
-		if err == websocket.ErrCloseSent {
-			return nil
-		}
-		return err
-	})
+	s.conn.SetPingHandler(nil)
 
 	for {
 		select {
