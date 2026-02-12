@@ -78,7 +78,33 @@ Actually hits:   http://localhost:3000/hello (on your machine!)
 go install github.com/DaniilSokolyuk/vtunnel/cmd/vtunnel@latest
 ```
 
-## Usage
+## CLI
+
+### Server
+
+```bash
+vtunnel server -port 3001
+```
+
+### Client
+
+```bash
+# Forward remote port to local service
+vtunnel client -server ws://tunnel.example.com/ -forward 9000=localhost:3000
+
+# Multiple forwards
+vtunnel client -server ws://tunnel.example.com/ \
+  -forward 9000=localhost:3000 \
+  -forward 9001=localhost:8080
+
+# TLS termination — vtunnel connects to upstream via TLS,
+# clients access the service via plain HTTP on localhost
+vtunnel client -server ws://tunnel.example.com/ \
+  -forward 8085=tls://www.google.com:443
+# curl http://127.0.0.1:8085/ → 200 OK from google
+```
+
+## Go API
 
 ### Server
 
@@ -98,7 +124,7 @@ var upgrader = websocket.Upgrader{
 }
 
 func main() {
-    http.HandleFunc("/tunnel", func(w http.ResponseWriter, r *http.Request) {
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
         conn, err := upgrader.Upgrade(w, r, nil)
         if err != nil {
             log.Printf("Upgrade error: %v", err)
@@ -131,7 +157,7 @@ import (
 
 func main() {
     // Connect to tunnel server
-    client := vtunnel.NewClient("wss://tunnel.example.com/tunnel",
+    client := vtunnel.NewClient("wss://tunnel.example.com/",
         vtunnel.WithPingInterval(30*time.Second),
     )
 
@@ -146,6 +172,9 @@ func main() {
 
     // Remote :9001 -> Local :8080
     client.Listen(9001, "localhost:8080")
+
+    // TLS termination: remote :8085 -> google.com:443 (vtunnel handles TLS)
+    client.Listen(8085, "tls://www.google.com:443")
 
     // Wait for interrupt
     c := make(chan os.Signal, 1)
