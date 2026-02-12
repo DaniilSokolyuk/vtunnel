@@ -1,12 +1,15 @@
 package vtunnel
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -166,7 +169,7 @@ func (c *Client) handleConnect(streamID uint32, port int) {
 		return
 	}
 
-	conn, err := net.Dial("tcp", localAddr)
+	conn, err := c.dialTarget(localAddr)
 	if err != nil {
 		log.Printf("[vtunnel-client] Failed to connect to %s: %v", localAddr, err)
 		c.sendMessage(Message{Type: MsgClose, StreamID: streamID})
@@ -257,9 +260,70 @@ func (c *Client) pingLoop() {
 				log.Printf("[vtunnel-client] Ping failed: %v", err)
 				return
 			}
-			log.Printf("[vtunnel-client] Ping sent")
 		}
 	}
+}
+
+// dialTarget dials the target address; if it has a "tls://" prefix,
+// a TLS connection is established with the appropriate ServerName,
+// and the HTTP Host header is rewritten to match the target host.
+func (c *Client) dialTarget(addr string) (net.Conn, error) {
+	if after, ok := strings.CutPrefix(addr, "tls://"); ok {
+		host, _, err := net.SplitHostPort(after)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := tls.Dial("tcp", after, &tls.Config{ServerName: host})
+		if err != nil {
+			return nil, err
+		}
+		return newHostRewriteConn(conn, host), nil
+	}
+	return net.Dial("tcp", addr)
+}
+
+// hostRewriteConn wraps a net.Conn and rewrites the HTTP Host header
+// to match the target hostname for TLS-terminated connections.
+// It scans each Write call for a Host header line and replaces the value.
+type hostRewriteConn struct {
+	net.Conn
+	host    string
+	hostBin []byte // pre-built replacement: "Host: <target>\r\n"
+}
+
+func newHostRewriteConn(conn net.Conn, host string) *hostRewriteConn {
+	return &hostRewriteConn{
+		Conn:    conn,
+		host:    host,
+		hostBin: []byte("Host: " + host + "\r\n"),
+	}
+}
+
+func (c *hostRewriteConn) Write(p []byte) (int, error) {
+	// Fast path: no Host header in this chunk
+	const prefix = "\r\nHost: "
+	start := bytes.Index(p, []byte(prefix))
+	if start == -1 {
+		return c.Conn.Write(p)
+	}
+
+	// Find end of the Host line
+	valueStart := start + len(prefix)
+	end := bytes.Index(p[valueStart:], []byte("\r\n"))
+	if end == -1 {
+		return c.Conn.Write(p)
+	}
+
+	// Build rewritten data: before Host line + new Host + after Host line
+	var rewritten []byte
+	rewritten = append(rewritten, p[:start+2]...) // up to and including \r\n before "Host: "
+	rewritten = append(rewritten, c.hostBin...)   // "Host: <target>\r\n"
+	rewritten = append(rewritten, p[valueStart+end+2:]...)
+	_, err := c.Conn.Write(rewritten)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
 
 // sendMessage sends a message to the server

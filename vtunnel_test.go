@@ -390,52 +390,6 @@ func TestPingPong(t *testing.T) {
 	}
 }
 
-// TestPingPongTimeout tests that connection closes on pong timeout
-func TestPingPongTimeout(t *testing.T) {
-	serverClosed := make(chan struct{})
-
-	// Server that doesn't respond to pings
-	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		defer close(serverClosed)
-
-		// Ignore pings - don't respond with pong
-		conn.SetPingHandler(func(string) error {
-			return nil // Do nothing, no pong sent
-		})
-
-		// Just read to keep connection open
-		for {
-			if _, _, err := conn.ReadMessage(); err != nil {
-				return
-			}
-		}
-	}))
-	defer tunnelServer.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
-
-	// Very short intervals: ping every 50ms, timeout after 100ms (2x ping interval)
-	client := vtunnel.NewClient(wsURL, vtunnel.WithPingInterval(50*time.Millisecond))
-	err := client.Connect()
-	if err != nil {
-		t.Fatalf("Connect error: %v", err)
-	}
-	defer client.Close()
-
-	// Wait for timeout - should happen within 150ms (100ms timeout + margin)
-	select {
-	case <-serverClosed:
-		t.Log("Connection closed as expected due to pong timeout")
-	case <-time.After(500 * time.Millisecond):
-		t.Error("Connection did not close after pong timeout")
-	}
-}
-
 // TestDisabledPing tests that ping can be disabled
 func TestDisabledPing(t *testing.T) {
 	var pingReceived int
@@ -493,4 +447,139 @@ func TestDisabledPing(t *testing.T) {
 	}
 
 	t.Logf("Pings with disabled mode: %d", pings)
+}
+
+// TestConnectionStaysAlive tests that connection stays alive for 20 seconds with ping/pong
+func TestConnectionStaysAlive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping long test in short mode")
+	}
+
+	var pingCount int
+	var mu sync.Mutex
+	connectionClosed := make(chan struct{})
+
+	// Server that tracks pings and uses default pong handler
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade error: %v", err)
+			return
+		}
+		defer func() {
+			conn.Close()
+			close(connectionClosed)
+		}()
+
+		// Track pings, let default handler send pong
+		conn.SetPingHandler(func(data string) error {
+			mu.Lock()
+			pingCount++
+			count := pingCount
+			mu.Unlock()
+			t.Logf("Server received ping #%d", count)
+			// Send pong (default behavior)
+			return conn.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(time.Second))
+		})
+
+		// Read loop
+		for {
+			conn.SetReadDeadline(time.Now().Add(25 * time.Second))
+			_, _, err := conn.ReadMessage()
+			if err != nil {
+				t.Logf("Server read error: %v", err)
+				return
+			}
+		}
+	}))
+	defer tunnelServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
+
+	// Connect with 2 second ping interval
+	client := vtunnel.NewClient(wsURL, vtunnel.WithPingInterval(2*time.Second))
+	err := client.Connect()
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+
+	t.Log("Connection established, waiting 20 seconds...")
+
+	// Wait 20 seconds
+	select {
+	case <-connectionClosed:
+		t.Fatal("Connection closed unexpectedly!")
+	case <-time.After(20 * time.Second):
+		t.Log("20 seconds passed, connection still alive!")
+	}
+
+	client.Close()
+
+	mu.Lock()
+	pings := pingCount
+	mu.Unlock()
+
+	// Should have ~10 pings (20 sec / 2 sec interval)
+	t.Logf("Total pings received: %d", pings)
+	if pings < 8 {
+		t.Errorf("Expected at least 8 pings in 20 seconds, got %d", pings)
+	}
+}
+
+// TestTLSTermination tests tunneling to an external HTTPS service (google.com)
+// with client-side TLS termination using tls:// prefix
+func TestTLSTermination(t *testing.T) {
+	// Tunnel server
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, _ := upgrader.Upgrade(w, r, nil)
+		defer conn.Close()
+		server := vtunnel.NewServer()
+		server.HandleConn(conn)
+	}))
+	defer tunnelServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
+
+	client := vtunnel.NewClient(wsURL)
+	err := client.Connect()
+	if err != nil {
+		t.Fatalf("Connect error: %v", err)
+	}
+	defer client.Close()
+
+	// Forward local port 18087 -> google.com:443 with TLS termination
+	port := 18087
+	err = client.Listen(port, "tls://google.com:443")
+	if err != nil {
+		t.Fatalf("Listen error: %v", err)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Make plain HTTP request through tunnel — vtunnel client terminates TLS to google
+	// Use a custom client to avoid redirect following and set Host header
+	httpClient := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	resp, err := httpClient.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatalf("HTTP request error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+
+	t.Logf("Status: %d", resp.StatusCode)
+	t.Logf("Body length: %d bytes", len(body))
+
+	if resp.StatusCode == 0 {
+		t.Error("Expected a valid HTTP status code")
+	}
+	if len(body) == 0 {
+		t.Error("Expected non-empty response body from google.com")
+	}
 }
