@@ -10,6 +10,8 @@ const (
 	MsgConnect   = "connect"    // server -> client: new connection accepted
 	MsgData      = "data"       // bidirectional: data for a stream
 	MsgClose     = "close"      // bidirectional: close a stream
+	MsgPing      = "ping"       // client -> server: keepalive ping
+	MsgPong      = "pong"       // server -> client: keepalive pong
 )
 
 // Message is the wire format for vtunnel protocol

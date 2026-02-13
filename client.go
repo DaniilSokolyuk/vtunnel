@@ -189,6 +189,8 @@ func (c *Client) readLoop(conn *websocket.Conn, errc chan<- error, connDone chan
 		}
 
 		switch msg.Type {
+		case MsgPong:
+			// pong received; deadline already reset above
 		case MsgConnect:
 			c.handleConnect(msg.StreamID, msg.Port)
 		case MsgData:
@@ -297,10 +299,13 @@ func (c *Client) removeStream(streamID uint32) {
 	}
 }
 
-// pingLoop sends periodic ping messages to keep the connection alive
+// pingLoop sends periodic application-level ping messages to keep the connection alive.
+// Uses JSON messages instead of WebSocket control frames to work through proxies.
 func (c *Client) pingLoop(conn *websocket.Conn, connDone <-chan struct{}) {
 	ticker := time.NewTicker(c.pingInterval)
 	defer ticker.Stop()
+
+	pingMsg, _ := json.Marshal(Message{Type: MsgPing})
 
 	for {
 		select {
@@ -310,7 +315,7 @@ func (c *Client) pingLoop(conn *websocket.Conn, connDone <-chan struct{}) {
 			return
 		case <-ticker.C:
 			c.writeMu.Lock()
-			err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(c.pingInterval))
+			err := conn.WriteMessage(websocket.TextMessage, pingMsg)
 			c.writeMu.Unlock()
 			if err != nil {
 				log.Printf("[vtunnel-client] Ping failed: %v", err)
@@ -432,9 +437,6 @@ func (c *Client) startConn(conn *websocket.Conn) chan error {
 	if c.pingInterval > 0 {
 		c.readDeadline = c.pingInterval * 2
 		_ = conn.SetReadDeadline(time.Now().Add(c.readDeadline))
-		conn.SetPongHandler(func(string) error {
-			return conn.SetReadDeadline(time.Now().Add(c.readDeadline))
-		})
 		go c.pingLoop(conn, connDone)
 	} else {
 		c.readDeadline = 0

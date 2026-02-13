@@ -45,18 +45,9 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 
 	log.Println("[vtunnel-server] Client connected")
 
-	// Set up keepalive - reset deadline when client pings us
+	// Set up keepalive read deadline
 	if s.readDeadline > 0 {
 		_ = s.conn.SetReadDeadline(time.Now().Add(s.readDeadline))
-		s.conn.SetPingHandler(func(appData string) error {
-			_ = s.conn.SetReadDeadline(time.Now().Add(s.readDeadline))
-			s.writeMu.Lock()
-			err := s.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(defaultCloseWriteWait))
-			s.writeMu.Unlock()
-			return err
-		})
-	} else {
-		s.conn.SetPingHandler(nil)
 	}
 
 	for {
@@ -91,6 +82,8 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 		}
 
 		switch msg.Type {
+		case MsgPing:
+			s.sendMessage(Message{Type: MsgPong})
 		case MsgListen:
 			s.handleListen(msg.Port)
 		case MsgData:
