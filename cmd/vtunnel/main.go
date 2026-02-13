@@ -10,14 +10,18 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 
 	vtunnel "github.com/DaniilSokolyuk/vtunnel"
 )
 
+const defaultHandshakeTimeout = 60 * time.Second
+
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	HandshakeTimeout: defaultHandshakeTimeout,
+	CheckOrigin:      func(r *http.Request) bool { return true },
 }
 
 func usage() {
@@ -80,7 +84,7 @@ func runClient(args []string) {
 		log.Fatal("[vtunnel] at least one -forward is required")
 	}
 
-	client := vtunnel.NewClient(*server)
+	client := vtunnel.NewClient(*server, vtunnel.WithAutoReconnect(true))
 	if err := client.Connect(); err != nil {
 		log.Fatalf("[vtunnel] Connect error: %v", err)
 	}

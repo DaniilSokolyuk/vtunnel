@@ -8,27 +8,30 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
 
 // Server handles reverse tunnel connections from clients
 type Server struct {
-	conn      *websocket.Conn
-	listeners map[int]net.Listener
-	streams   map[uint32]net.Conn
-	streamID  uint32
-	mu        sync.RWMutex
-	writeMu   sync.Mutex
-	done      chan struct{}
+	conn         *websocket.Conn
+	listeners    map[int]net.Listener
+	streams      map[uint32]net.Conn
+	streamID     uint32
+	mu           sync.RWMutex
+	writeMu      sync.Mutex
+	done         chan struct{}
+	readDeadline time.Duration
 }
 
 // NewServer creates a new vtunnel server
 func NewServer() *Server {
 	return &Server{
-		listeners: make(map[int]net.Listener),
-		streams:   make(map[uint32]net.Conn),
-		done:      make(chan struct{}),
+		listeners:    make(map[int]net.Listener),
+		streams:      make(map[uint32]net.Conn),
+		done:         make(chan struct{}),
+		readDeadline: defaultPingInterval * 2,
 	}
 }
 
@@ -40,7 +43,18 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 	log.Println("[vtunnel-server] Client connected")
 
 	// Set up keepalive - reset deadline when client pings us
-	s.conn.SetPingHandler(nil)
+	if s.readDeadline > 0 {
+		_ = s.conn.SetReadDeadline(time.Now().Add(s.readDeadline))
+		s.conn.SetPingHandler(func(appData string) error {
+			_ = s.conn.SetReadDeadline(time.Now().Add(s.readDeadline))
+			s.writeMu.Lock()
+			err := s.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(defaultCloseWriteWait))
+			s.writeMu.Unlock()
+			return err
+		})
+	} else {
+		s.conn.SetPingHandler(nil)
+	}
 
 	for {
 		select {
@@ -51,10 +65,15 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+			if closeErr, ok := err.(*websocket.CloseError); ok {
+				log.Printf("[vtunnel-server] Close error: code=%d text=%q", closeErr.Code, closeErr.Text)
+			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
 				log.Printf("[vtunnel-server] Read error: %v", err)
 			}
 			return
+		}
+		if s.readDeadline > 0 {
+			_ = s.conn.SetReadDeadline(time.Now().Add(s.readDeadline))
 		}
 
 		var msg Message
@@ -76,10 +95,19 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 
 // handleListen starts listening on a port
 func (s *Server) handleListen(port int) {
+	s.mu.RLock()
+	_, exists := s.listeners[port]
+	s.mu.RUnlock()
+	if exists {
+		s.sendMessage(Message{Type: MsgListenOK, Port: port})
+		return
+	}
+
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Printf("[vtunnel-server] Failed to listen on %s: %v", addr, err)
+		s.sendMessage(Message{Type: MsgListenErr, Port: port, Error: err.Error()})
 		return
 	}
 
@@ -88,6 +116,7 @@ func (s *Server) handleListen(port int) {
 	s.mu.Unlock()
 
 	log.Printf("[vtunnel-server] Listening on %s", addr)
+	s.sendMessage(Message{Type: MsgListenOK, Port: port})
 
 	go s.acceptLoop(ln, port)
 }
@@ -206,6 +235,7 @@ func (s *Server) cleanup() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.closeConn(websocket.CloseGoingAway, "")
 	for _, ln := range s.listeners {
 		ln.Close()
 	}
@@ -214,4 +244,15 @@ func (s *Server) cleanup() {
 	}
 
 	log.Println("[vtunnel-server] Cleanup complete")
+}
+
+func (s *Server) closeConn(code int, reason string) {
+	if s.conn == nil {
+		return
+	}
+	deadline := time.Now().Add(defaultCloseWriteWait)
+	s.writeMu.Lock()
+	_ = s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), deadline)
+	s.writeMu.Unlock()
+	_ = s.conn.Close()
 }

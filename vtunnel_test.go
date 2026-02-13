@@ -20,6 +20,45 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+func freePort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for free port: %v", err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func waitForConn(t *testing.T, connCh <-chan *websocket.Conn, timeout time.Duration) *websocket.Conn {
+	t.Helper()
+	select {
+	case conn := <-connCh:
+		return conn
+	case <-time.After(timeout):
+		t.Fatalf("timeout waiting for websocket connection")
+		return nil
+	}
+}
+
+func waitForHTTP(t *testing.T, port int, expected string, timeout time.Duration) {
+	t.Helper()
+	client := &http.Client{Timeout: 200 * time.Millisecond}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+		if err == nil {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if string(body) == expected {
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("timeout waiting for HTTP on port %d", port)
+}
+
 // TestBasicTunnel tests basic HTTP proxying through the tunnel
 func TestBasicTunnel(t *testing.T) {
 	// 1. Start a backend HTTP server (simulates LLM Proxy)
@@ -200,6 +239,56 @@ func TestMultipleConnections(t *testing.T) {
 			t.Error(result)
 		}
 	}
+}
+
+// TestAutoReconnectReplaysListen verifies that reconnect replays listens.
+func TestAutoReconnectReplaysListen(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("ok"))
+	}))
+	defer backend.Close()
+
+	connCh := make(chan *websocket.Conn, 2)
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("Upgrade error: %v", err)
+			return
+		}
+		select {
+		case connCh <- conn:
+		default:
+		}
+		server := vtunnel.NewServer()
+		server.HandleConn(conn)
+	}))
+	defer tunnelServer.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(tunnelServer.URL, "http")
+
+	client := vtunnel.NewClient(
+		wsURL,
+		vtunnel.WithAutoReconnect(true),
+		vtunnel.WithPingInterval(100*time.Millisecond),
+		vtunnel.WithReconnectBackoff(50*time.Millisecond, 200*time.Millisecond),
+	)
+	if err := client.Connect(); err != nil {
+		t.Fatalf("Client connect error: %v", err)
+	}
+	defer client.Close()
+
+	port := freePort(t)
+	if err := client.Listen(port, backend.Listener.Addr().String()); err != nil {
+		t.Fatalf("Listen error: %v", err)
+	}
+
+	waitForHTTP(t, port, "ok", 2*time.Second)
+
+	conn1 := waitForConn(t, connCh, 2*time.Second)
+	_ = conn1.Close()
+
+	_ = waitForConn(t, connCh, 3*time.Second)
+	waitForHTTP(t, port, "ok", 3*time.Second)
 }
 
 // TestLargePayload tests transferring large data

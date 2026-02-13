@@ -249,6 +249,8 @@ The tunnel uses a simple JSON-based protocol over WebSocket:
 | Message Type | Direction | Description |
 |-------------|-----------|-------------|
 | `listen` | Client -> Server | Request server to listen on a port |
+| `listen_ok` | Server -> Client | Listen established for a port |
+| `listen_err` | Server -> Client | Listen failed for a port |
 | `connect` | Server -> Client | New TCP connection received |
 | `data` | Bidirectional | Stream data |
 | `close` | Bidirectional | Close a stream |

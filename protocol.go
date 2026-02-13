@@ -4,10 +4,12 @@ import "encoding/json"
 
 // Message types
 const (
-	MsgListen  = "listen"  // client -> server: start listening on port
-	MsgConnect = "connect" // server -> client: new connection accepted
-	MsgData    = "data"    // bidirectional: data for a stream
-	MsgClose   = "close"   // bidirectional: close a stream
+	MsgListen    = "listen"     // client -> server: start listening on port
+	MsgListenOK  = "listen_ok"  // server -> client: listen established
+	MsgListenErr = "listen_err" // server -> client: listen failed
+	MsgConnect   = "connect"    // server -> client: new connection accepted
+	MsgData      = "data"       // bidirectional: data for a stream
+	MsgClose     = "close"      // bidirectional: close a stream
 )
 
 // Message is the wire format for vtunnel protocol
@@ -16,6 +18,7 @@ type Message struct {
 	Port     int    `json:"port,omitempty"`
 	StreamID uint32 `json:"stream_id,omitempty"`
 	Data     []byte `json:"data,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 // MarshalJSON implements custom JSON marshaling for Message
