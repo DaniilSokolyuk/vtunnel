@@ -2,10 +2,12 @@ package vtunnel
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,7 +40,8 @@ func NewServer() *Server {
 // HandleConn handles a WebSocket connection from a client
 func (s *Server) HandleConn(conn *websocket.Conn) {
 	s.conn = conn
-	defer s.cleanup()
+	reason := "shutdown"
+	defer func() { s.cleanup(reason) }()
 
 	log.Println("[vtunnel-server] Client connected")
 
@@ -59,6 +62,7 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 	for {
 		select {
 		case <-s.done:
+			reason = "server_done"
 			return
 		default:
 		}
@@ -66,9 +70,13 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			if closeErr, ok := err.(*websocket.CloseError); ok {
+				reason = fmt.Sprintf("peer_close code=%d text=%s", closeErr.Code, closeErr.Text)
 				log.Printf("[vtunnel-server] Close error: code=%d text=%q", closeErr.Code, closeErr.Text)
 			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				reason = fmt.Sprintf("read_error %v", err)
 				log.Printf("[vtunnel-server] Read error: %v", err)
+			} else {
+				reason = fmt.Sprintf("read_end %v", err)
 			}
 			return
 		}
@@ -229,13 +237,14 @@ func (s *Server) sendMessage(msg Message) {
 }
 
 // cleanup closes all resources
-func (s *Server) cleanup() {
+func (s *Server) cleanup(reason string) {
 	close(s.done)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.closeConn(websocket.CloseGoingAway, "")
+	log.Printf("[vtunnel-server] Cleanup: reason=%s", reason)
+	s.closeConn(websocket.CloseGoingAway, wsCloseReason(reason))
 	for _, ln := range s.listeners {
 		ln.Close()
 	}
@@ -252,7 +261,19 @@ func (s *Server) closeConn(code int, reason string) {
 	}
 	deadline := time.Now().Add(defaultCloseWriteWait)
 	s.writeMu.Lock()
-	_ = s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), deadline)
+	err := s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), deadline)
 	s.writeMu.Unlock()
+	if err != nil {
+		log.Printf("[vtunnel-server] Close write error: %v", err)
+	}
 	_ = s.conn.Close()
+}
+
+func wsCloseReason(reason string) string {
+	reason = strings.ReplaceAll(reason, "\n", " ")
+	reason = strings.ReplaceAll(reason, "\r", " ")
+	if len(reason) > 120 {
+		reason = reason[:120]
+	}
+	return reason
 }
