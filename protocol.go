@@ -16,11 +16,12 @@ const (
 
 // Message is the wire format for vtunnel protocol
 type Message struct {
-	Type     string `json:"type"`
-	Port     int    `json:"port,omitempty"`
-	StreamID uint32 `json:"stream_id,omitempty"`
-	Data     []byte `json:"data,omitempty"`
-	Error    string `json:"error,omitempty"`
+	Type      string `json:"type"`
+	Port      int    `json:"port,omitempty"`
+	StreamID  uint32 `json:"stream_id,omitempty"`
+	Data      []byte `json:"data,omitempty"`
+	Error     string `json:"error,omitempty"`
+	LocalAddr string `json:"local_addr,omitempty"`
 }
 
 // MarshalJSON implements custom JSON marshaling for Message

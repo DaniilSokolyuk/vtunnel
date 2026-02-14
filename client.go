@@ -129,7 +129,7 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 	c.mu.Unlock()
 
 	log.Printf("[vtunnel-client] Requesting listen: remote=%d -> local=%s", remotePort, localAddr)
-	if err := c.sendMessage(Message{Type: MsgListen, Port: remotePort}); err != nil {
+	if err := c.sendMessage(Message{Type: MsgListen, Port: remotePort, LocalAddr: localAddr}); err != nil {
 		if c.autoReconnect && errors.Is(err, ErrNotConnected) {
 			return nil
 		}
@@ -521,14 +521,14 @@ func (c *Client) disconnectCleanup() {
 
 func (c *Client) replayForwards() {
 	c.mu.RLock()
-	ports := make([]int, 0, len(c.forwards))
-	for port := range c.forwards {
-		ports = append(ports, port)
+	fwds := make(map[int]string, len(c.forwards))
+	for port, addr := range c.forwards {
+		fwds[port] = addr
 	}
 	c.mu.RUnlock()
 
-	for _, port := range ports {
-		if err := c.sendMessage(Message{Type: MsgListen, Port: port}); err != nil && !errors.Is(err, ErrNotConnected) {
+	for port, addr := range fwds {
+		if err := c.sendMessage(Message{Type: MsgListen, Port: port, LocalAddr: addr}); err != nil && !errors.Is(err, ErrNotConnected) {
 			log.Printf("[vtunnel-client] Re-listen failed for port %d: %v", port, err)
 		}
 	}

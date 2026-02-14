@@ -17,14 +17,17 @@ import (
 
 // Server handles reverse tunnel connections from clients
 type Server struct {
-	conn         *websocket.Conn
-	listeners    map[int]net.Listener
-	streams      map[uint32]net.Conn
-	streamID     uint32
-	mu           sync.RWMutex
-	writeMu      sync.Mutex
-	done         chan struct{}
-	readDeadline time.Duration
+	conn          *websocket.Conn
+	listeners     map[int]net.Listener
+	streams       map[uint32]net.Conn
+	streamID      uint32
+	mu            sync.RWMutex
+	writeMu       sync.Mutex
+	done          chan struct{}
+	readDeadline  time.Duration
+	domainMap     map[string]string // host:port -> 127.0.0.1:tunnelPort for proxy
+	proxyListener net.Listener      // proxy listener (survives reconnections)
+	proxyDone     chan struct{}     // proxy shutdown signal
 }
 
 // NewServer creates a new vtunnel server
@@ -34,12 +37,20 @@ func NewServer() *Server {
 		streams:      make(map[uint32]net.Conn),
 		done:         make(chan struct{}),
 		readDeadline: defaultPingInterval * 2,
+		domainMap:    make(map[string]string),
 	}
 }
 
 // HandleConn handles a WebSocket connection from a client
 func (s *Server) HandleConn(conn *websocket.Conn) {
+	// Reset connection-specific state for reuse
+	s.mu.Lock()
 	s.conn = conn
+	s.listeners = make(map[int]net.Listener)
+	s.streams = make(map[uint32]net.Conn)
+	s.done = make(chan struct{})
+	s.mu.Unlock()
+
 	reason := "shutdown"
 	defer func() { s.cleanup(reason) }()
 
@@ -85,7 +96,7 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 		case MsgPing:
 			s.sendMessage(Message{Type: MsgPong})
 		case MsgListen:
-			s.handleListen(msg.Port)
+			s.handleListen(msg.Port, msg.LocalAddr)
 		case MsgData:
 			s.handleData(msg.StreamID, msg.Data)
 		case MsgClose:
@@ -95,7 +106,7 @@ func (s *Server) HandleConn(conn *websocket.Conn) {
 }
 
 // handleListen starts listening on a port
-func (s *Server) handleListen(port int) {
+func (s *Server) handleListen(port int, localAddr string) {
 	s.mu.RLock()
 	_, exists := s.listeners[port]
 	s.mu.RUnlock()
@@ -118,6 +129,18 @@ func (s *Server) handleListen(port int) {
 
 	log.Printf("[vtunnel-server] Listening on %s", addr)
 	s.sendMessage(Message{Type: MsgListenOK, Port: port})
+
+	// Register domain mapping for proxy if localAddr specifies a non-loopback host
+	if localAddr != "" {
+		host, _, err := net.SplitHostPort(localAddr)
+		if err == nil && host != "localhost" && host != "127.0.0.1" && host != "::1" {
+			target := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+			s.mu.Lock()
+			s.domainMap[localAddr] = target
+			s.mu.Unlock()
+			log.Printf("[vtunnel-server] Proxy mapping: %s -> %s", localAddr, target)
+		}
+	}
 
 	go s.acceptLoop(ln, port)
 }
@@ -231,7 +254,12 @@ func (s *Server) sendMessage(msg Message) {
 
 // cleanup closes all resources
 func (s *Server) cleanup(reason string) {
-	close(s.done)
+	select {
+	case <-s.done:
+		// already closed
+	default:
+		close(s.done)
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -30,7 +30,8 @@ func usage() {
   vtunnel client [flags]
 
 Server flags:
-  -port int    WebSocket listen port (default 3001)
+  -port int     WebSocket listen port (default 3001)
+  -proxy int    HTTP CONNECT proxy port (0 = disabled, default 0)
 
 Client flags:
   -server string    WebSocket server URL (e.g. ws://example.com/)
@@ -57,10 +58,21 @@ func main() {
 	}
 }
 
+var server = vtunnel.NewServer()
+
 func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	port := fs.Int("port", 3001, "WebSocket listen port")
+	proxyPort := fs.Int("proxy", 0, "HTTP CONNECT proxy port (0 = disabled)")
 	fs.Parse(args)
+
+	if *proxyPort > 0 {
+		proxyAddr := fmt.Sprintf(":%d", *proxyPort)
+		if err := server.StartProxy(proxyAddr); err != nil {
+			log.Fatalf("[vtunnel] Failed to start proxy: %v", err)
+		}
+		log.Printf("[vtunnel] CONNECT proxy on %s", proxyAddr)
+	}
 
 	http.HandleFunc("/", handleWebSocket)
 	http.HandleFunc("/health", handleHealth)
@@ -134,8 +146,6 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-
-	server := vtunnel.NewServer()
 	server.HandleConn(conn)
 }
 
