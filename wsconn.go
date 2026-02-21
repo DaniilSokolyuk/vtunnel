@@ -15,11 +15,11 @@ import (
 )
 
 // wsConn wraps a *websocket.Conn as a net.Conn for use with SSH.
-// Reads buffer leftover bytes from oversized WS messages.
+// Reads stream directly from the WS message reader to avoid allocations.
 // Writes send each call as a single binary WS message.
 type wsConn struct {
 	*websocket.Conn
-	buff []byte
+	reader io.Reader
 }
 
 // NewWSConn wraps a *websocket.Conn as a net.Conn suitable for SSH.
@@ -28,21 +28,26 @@ func NewWSConn(ws *websocket.Conn) net.Conn {
 }
 
 func (c *wsConn) Read(dst []byte) (int, error) {
-	var src []byte
-	if len(c.buff) > 0 {
-		src = c.buff
-		c.buff = nil
-	} else if _, msg, err := c.Conn.ReadMessage(); err == nil {
-		src = msg
-	} else {
-		return 0, err
+	for {
+		if c.reader != nil {
+			n, err := c.reader.Read(dst)
+			if err == io.EOF {
+				c.reader = nil
+			}
+			if n > 0 {
+				return n, nil
+			}
+			if err != nil && err != io.EOF {
+				return 0, err
+			}
+			continue
+		}
+		_, r, err := c.Conn.NextReader()
+		if err != nil {
+			return 0, err
+		}
+		c.reader = r
 	}
-	n := copy(dst, src)
-	if n < len(src) {
-		c.buff = make([]byte, len(src)-n)
-		copy(c.buff, src[n:])
-	}
-	return n, nil
 }
 
 func (c *wsConn) Write(b []byte) (int, error) {
