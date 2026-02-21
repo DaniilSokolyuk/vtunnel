@@ -103,6 +103,20 @@ func keepAliveLoop(sshConn ssh.Conn, interval time.Duration) {
 	}
 }
 
+// handleRequests replies to SSH ping requests (keepalive).
+func handleRequests(reqs <-chan *ssh.Request) {
+	for r := range reqs {
+		switch r.Type {
+		case "ping":
+			r.Reply(true, []byte("pong"))
+		default:
+			if r.WantReply {
+				r.Reply(false, nil)
+			}
+		}
+	}
+}
+
 // rejectChannels rejects all incoming SSH channels.
 func rejectChannels(chans <-chan ssh.NewChannel) {
 	for ch := range chans {

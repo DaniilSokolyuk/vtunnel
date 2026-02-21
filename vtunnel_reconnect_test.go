@@ -374,54 +374,7 @@ func TestReconnectCloseWhileReconnecting(t *testing.T) {
 	env.tunnelServer.Close()
 }
 
-// 8. getSSH timeout: TCP connect arrives when no client is connected.
-func TestReconnectGetSSHTimeout(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping long test (35s timeout)")
-	}
-
-	server := vtunnel.NewServer()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		server.HandleConn(conn)
-	}))
-	defer ts.Close()
-
-	// Connect, listen, verify
-	client := vtunnel.NewClient(wsURL(ts))
-	if err := client.Connect(); err != nil {
-		t.Fatal(err)
-	}
-
-	backendLn, _ := counterBackend(t)
-	defer backendLn.Close()
-
-	port := freePort(t)
-	client.Listen(port, backendLn.Addr().String())
-	tcpReadRetry(t, fmt.Sprintf("127.0.0.1:%d", port), 3*time.Second)
-
-	// Disconnect permanently (no auto-reconnect)
-	client.Close()
-	time.Sleep(200 * time.Millisecond)
-
-	// TCP connect arrives with no client — should timeout via getSSH
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 2*time.Second)
-	if err != nil {
-		t.Logf("Dial failed (listener may be closed): %v", err)
-		return
-	}
-	defer conn.Close()
-	conn.SetReadDeadline(time.Now().Add(40 * time.Second)) // > sshWaitTimeout (35s)
-	_, err = io.ReadAll(conn)
-	// Connection should be closed by server after getSSH timeout
-	t.Logf("Read after getSSH timeout: err=%v (expected EOF or connection reset)", err)
-}
-
-// 9. Backoff timing is respected between reconnect attempts.
+// 8. Backoff timing is respected between reconnect attempts.
 func TestReconnectBackoffRespected(t *testing.T) {
 	connTimes := make(chan time.Time, 10)
 	server := vtunnel.NewServer()

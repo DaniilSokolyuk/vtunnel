@@ -180,8 +180,8 @@ func (c *Client) dialOnce() (ssh.Conn, error) {
 
 	// Accept tunnel channels from server
 	go c.handleChannels(chans)
-	// Discard any server-initiated requests
-	go ssh.DiscardRequests(reqs)
+	// Handle server-initiated requests (ping/pong)
+	go handleRequests(reqs)
 	// Keepalive
 	if c.keepAlive > 0 {
 		go keepAliveLoop(sshConn, c.keepAlive)
