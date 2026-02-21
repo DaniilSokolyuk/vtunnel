@@ -1,7 +1,9 @@
 package vtunnel
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -21,6 +23,9 @@ const (
 type Server struct {
 	sshConfig *ssh.ServerConfig
 	keepAlive time.Duration
+
+	// Client authentication
+	clientPubKey ssh.PublicKey // nil = no auth
 
 	// Active SSH connection
 	activeConn   ssh.Conn
@@ -49,18 +54,23 @@ func WithServerKeepAlive(d time.Duration) ServerOption {
 	}
 }
 
+// WithClientKey sets the authorized client public key ("vt-pub-...").
+// When set, only clients with the matching private key can connect.
+// The server host key is deterministically derived from this key,
+// enabling automatic MITM protection on the client side.
+func WithClientKey(pubKey string) ServerOption {
+	return func(s *Server) {
+		key, err := parsePublicKey(pubKey)
+		if err != nil {
+			panic(fmt.Sprintf("vtunnel: invalid client key: %v", err))
+		}
+		s.clientPubKey = key
+	}
+}
+
 // NewServer creates a new vtunnel server.
 func NewServer(opts ...ServerOption) *Server {
-	hostKey, err := generateHostKey()
-	if err != nil {
-		panic("vtunnel: generate host key: " + err.Error())
-	}
-
-	sshConfig := &ssh.ServerConfig{NoClientAuth: true}
-	sshConfig.AddHostKey(hostKey)
-
 	s := &Server{
-		sshConfig: sshConfig,
 		keepAlive: defaultKeepAlive,
 		connReady: make(chan struct{}),
 		listeners: make(map[int]net.Listener),
@@ -69,6 +79,36 @@ func NewServer(opts ...ServerOption) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
+
+	// Build SSH config after options are applied
+	var hostKey ssh.Signer
+	var err error
+	if s.clientPubKey != nil {
+		hostKey, err = deriveHostKey(s.clientPubKey)
+	} else {
+		hostKey, err = generateHostKey()
+	}
+	if err != nil {
+		panic("vtunnel: generate host key: " + err.Error())
+	}
+
+	sshConfig := &ssh.ServerConfig{}
+	sshConfig.AddHostKey(hostKey)
+
+	if s.clientPubKey != nil {
+		expected := s.clientPubKey.Marshal()
+		sshConfig.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
+			if bytes.Equal(key.Marshal(), expected) {
+				return &ssh.Permissions{}, nil
+			}
+			return nil, fmt.Errorf("unauthorized key")
+		}
+	} else {
+		sshConfig.NoClientAuth = true
+		log.Println("[vtunnel-server] WARNING: No client key configured. Authentication is DISABLED. Do NOT use in production! Use --client-key or VTUNNEL_CLIENT_KEY.")
+	}
+
+	s.sshConfig = sshConfig
 	return s
 }
 
@@ -76,7 +116,7 @@ func NewServer(opts ...ServerOption) *Server {
 // Listeners persist across reconnections; acceptLoops keep running and
 // use getSSH() to wait for the next connection.
 func (s *Server) HandleConn(wsConn *websocket.Conn) {
-	conn := newWSConn(wsConn)
+	conn := NewWSConn(wsConn)
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
 	if err != nil {
 		log.Printf("[vtunnel-server] SSH handshake failed: %v", err)

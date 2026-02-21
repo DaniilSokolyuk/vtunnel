@@ -22,7 +22,8 @@ type wsConn struct {
 	buff []byte
 }
 
-func newWSConn(ws *websocket.Conn) net.Conn {
+// NewWSConn wraps a *websocket.Conn as a net.Conn suitable for SSH.
+func NewWSConn(ws *websocket.Conn) net.Conn {
 	return &wsConn{Conn: ws}
 }
 

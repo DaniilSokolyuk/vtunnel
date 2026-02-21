@@ -45,6 +45,7 @@ type Client struct {
 	autoReconnect bool
 	reconnectMin  time.Duration
 	reconnectMax  time.Duration
+	authSigner    ssh.Signer // nil = no auth
 }
 
 // Option configures a Client.
@@ -84,6 +85,19 @@ func WithReconnectBackoff(min, max time.Duration) Option {
 	}
 }
 
+// WithKey sets the client private key for authentication ("vt-priv-...").
+// When set, the client authenticates via SSH public key auth and
+// verifies the server's identity using a derived host key.
+func WithKey(privKey string) Option {
+	return func(c *Client) {
+		signer, err := parsePrivateKey(privKey)
+		if err != nil {
+			panic(fmt.Sprintf("vtunnel: invalid key: %v", err))
+		}
+		c.authSigner = signer
+	}
+}
+
 // NewClient creates a new vtunnel client.
 func NewClient(wsURL string, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -100,6 +114,9 @@ func NewClient(wsURL string, opts ...Option) *Client {
 	}
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.authSigner == nil {
+		log.Println("[vtunnel-client] WARNING: No key configured. Authentication is DISABLED. Do NOT use in production! Use --key or VTUNNEL_KEY.")
 	}
 	return c
 }
@@ -167,10 +184,20 @@ func (c *Client) dialOnce() (ssh.Conn, error) {
 		return nil, err
 	}
 
-	conn := newWSConn(wsConn)
+	conn := NewWSConn(wsConn)
 	sshConfig := &ssh.ClientConfig{
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		User:            "vtunnel",
+		User: "vtunnel",
+	}
+	if c.authSigner != nil {
+		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(c.authSigner)}
+		hostSigner, err := deriveHostKey(c.authSigner.PublicKey())
+		if err != nil {
+			wsConn.Close()
+			return nil, fmt.Errorf("derive host key: %w", err)
+		}
+		sshConfig.HostKeyCallback = ssh.FixedHostKey(hostSigner.PublicKey())
+	} else {
+		sshConfig.HostKeyCallback = ssh.InsecureIgnoreHostKey()
 	}
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, "", sshConfig)
 	if err != nil {
