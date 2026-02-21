@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -26,8 +25,6 @@ const (
 	defaultReconnectMax     = 5 * time.Second
 )
 
-var ErrNotConnected = errors.New("vtunnel: not connected")
-
 // Client connects to a vtunnel server and forwards connections.
 type Client struct {
 	wsURL     string
@@ -41,11 +38,10 @@ type Client struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	keepAlive     time.Duration
-	autoReconnect bool
-	reconnectMin  time.Duration
-	reconnectMax  time.Duration
-	authSigner    ssh.Signer // nil = no auth
+	keepAlive    time.Duration
+	reconnectMin time.Duration
+	reconnectMax time.Duration
+	authSigner   ssh.Signer // nil = no auth
 }
 
 // Option configures a Client.
@@ -67,13 +63,6 @@ func WithPingInterval(d time.Duration) Option {
 func WithHeaders(h http.Header) Option {
 	return func(c *Client) {
 		c.headers = h
-	}
-}
-
-// WithAutoReconnect enables or disables automatic reconnects after disconnects.
-func WithAutoReconnect(enabled bool) Option {
-	return func(c *Client) {
-		c.autoReconnect = enabled
 	}
 }
 
@@ -102,15 +91,14 @@ func WithKey(privKey string) Option {
 func NewClient(wsURL string, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
-		wsURL:         wsURL,
-		forwards:      make(map[int]string),
-		done:          make(chan struct{}),
-		ctx:           ctx,
-		cancel:        cancel,
-		keepAlive:     defaultKeepAlive,
-		autoReconnect: false,
-		reconnectMin:  defaultReconnectMin,
-		reconnectMax:  defaultReconnectMax,
+		wsURL:        wsURL,
+		forwards:     make(map[int]string),
+		done:         make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		keepAlive:    defaultKeepAlive,
+		reconnectMin: defaultReconnectMin,
+		reconnectMax: defaultReconnectMax,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -123,20 +111,11 @@ func NewClient(wsURL string, opts ...Option) *Client {
 
 // Connect establishes a WebSocket+SSH connection to the server.
 func (c *Client) Connect() error {
-	sshConn, err := c.dialOnce()
-	if err != nil {
+	if err := c.connectOnce(); err != nil {
 		return err
 	}
-	c.setSSH(sshConn)
-	c.replayForwards()
-
-	if c.autoReconnect {
-		go c.reconnectLoop(sshConn)
-	} else {
-		go c.waitAndClose(sshConn)
-	}
-
 	log.Printf("[vtunnel-client] Connected to %s", c.wsURL)
+	go c.connectionLoop()
 	return nil
 }
 
@@ -150,10 +129,7 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 
 	sshConn := c.getSSH()
 	if sshConn == nil {
-		if c.autoReconnect {
-			return nil // will be replayed on reconnect
-		}
-		return ErrNotConnected
+		return nil // will be replayed on reconnect
 	}
 
 	return c.sendListen(sshConn, remotePort, localAddr)
@@ -352,56 +328,49 @@ func (c *Client) getSSH() ssh.Conn {
 	return conn
 }
 
-func (c *Client) waitAndClose(sshConn ssh.Conn) {
-	sshConn.Wait()
-	select {
-	case <-c.done:
-	default:
-		c.Close()
+// connectOnce dials, sets the SSH connection, and replays forwards.
+func (c *Client) connectOnce() error {
+	conn, err := c.dialOnce()
+	if err != nil {
+		return err
 	}
+	c.setSSH(conn)
+	c.replayForwards()
+	return nil
 }
 
-func (c *Client) reconnectLoop(sshConn ssh.Conn) {
+// connectionLoop waits for the current connection to die, then reconnects
+// with exponential backoff. Runs until the client is closed.
+func (c *Client) connectionLoop() {
+	// Wait for current connection to die
+	if conn := c.getSSH(); conn != nil {
+		conn.Wait()
+	}
+
 	bo := c.newBackoff()
-
-	// Wait for first connection to die
-	sshConn.Wait()
-
 	for {
 		if c.ctx.Err() != nil {
 			return
 		}
 
+		err := c.connectOnce()
+		if err != nil {
+			delay := bo.NextBackOff()
+			log.Printf("[vtunnel-client] Reconnect failed: %v (retrying in %v)", err, delay)
+			select {
+			case <-c.done:
+				return
+			case <-time.After(delay):
+			}
+			continue
+		}
+
 		bo.Reset()
-		for {
-			if c.ctx.Err() != nil {
-				return
-			}
+		log.Printf("[vtunnel-client] Reconnected to %s", c.wsURL)
 
-			conn, err := c.dialOnce()
-			if err != nil {
-				delay := bo.NextBackOff()
-				log.Printf("[vtunnel-client] Reconnect failed: %v (retrying in %v)", err, delay)
-				select {
-				case <-c.done:
-					return
-				case <-time.After(delay):
-				}
-				continue
-			}
-
-			if c.ctx.Err() != nil {
-				conn.Close()
-				return
-			}
-
-			c.setSSH(conn)
-			c.replayForwards()
-			log.Printf("[vtunnel-client] Reconnected to %s", c.wsURL)
-
-			// Block until this connection dies
+		// Block until this connection dies
+		if conn := c.getSSH(); conn != nil {
 			conn.Wait()
-			break
 		}
 	}
 }

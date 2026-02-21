@@ -233,7 +233,6 @@ func TestAuthReconnectWithKey(t *testing.T) {
 	defer ts.Close()
 
 	client := vtunnel.NewClient(wsURL(ts),
-		vtunnel.WithAutoReconnect(true),
 		vtunnel.WithKeepAlive(200*time.Millisecond),
 		vtunnel.WithReconnectBackoff(50*time.Millisecond, 200*time.Millisecond),
 		vtunnel.WithKey(priv),

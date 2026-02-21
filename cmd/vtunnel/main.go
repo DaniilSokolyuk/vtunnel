@@ -116,7 +116,6 @@ func runClient(args []string) {
 	}
 
 	var opts []vtunnel.Option
-	opts = append(opts, vtunnel.WithAutoReconnect(true))
 	if *key != "" {
 		opts = append(opts, vtunnel.WithKey(*key))
 		log.Println("[vtunnel] Key authentication enabled")

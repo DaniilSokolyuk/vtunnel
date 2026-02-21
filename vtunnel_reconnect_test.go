@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -42,7 +41,6 @@ func newReconnectEnv(t *testing.T, opts ...vtunnel.Option) *reconnectEnv {
 	}))
 
 	defaults := []vtunnel.Option{
-		vtunnel.WithAutoReconnect(true),
 		vtunnel.WithKeepAlive(200 * time.Millisecond),
 		vtunnel.WithReconnectBackoff(50*time.Millisecond, 200*time.Millisecond),
 	}
@@ -393,7 +391,6 @@ func TestReconnectBackoffRespected(t *testing.T) {
 	maxBackoff := 300 * time.Millisecond
 
 	client := vtunnel.NewClient(wsURL(ts),
-		vtunnel.WithAutoReconnect(true),
 		vtunnel.WithKeepAlive(200*time.Millisecond),
 		vtunnel.WithReconnectBackoff(minBackoff, maxBackoff),
 	)
@@ -428,69 +425,5 @@ done:
 			t.Errorf("attempt %d→%d interval %v < min %v", i-1, i, interval, minBackoff)
 		}
 		t.Logf("attempt %d→%d: %v", i-1, i, interval)
-	}
-}
-
-// 10. Without WithAutoReconnect, WS drop causes client shutdown.
-func TestReconnectNoAutoReconnect(t *testing.T) {
-	connCh := make(chan *websocket.Conn, 5)
-	server := vtunnel.NewServer()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		select {
-		case connCh <- conn:
-		default:
-		}
-		server.HandleConn(conn)
-	}))
-	defer ts.Close()
-
-	// No WithAutoReconnect
-	client := vtunnel.NewClient(wsURL(ts), vtunnel.WithKeepAlive(100*time.Millisecond))
-	if err := client.Connect(); err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-
-	// Kill WS
-	select {
-	case conn := <-connCh:
-		conn.Close()
-	case <-time.After(2 * time.Second):
-		t.Fatal("no WS connection")
-	}
-
-	// Wait and verify no reconnect attempt
-	time.Sleep(500 * time.Millisecond)
-	select {
-	case <-connCh:
-		t.Fatal("unexpected reconnect — auto-reconnect should be disabled")
-	default:
-		t.Log("No reconnect attempt (correct)")
-	}
-
-	// Verify that a Listen after disconnect returns error or is silent
-	backend := httpBackend(t, "x")
-	defer backend.Close()
-	port := freePort(t)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		// Should not hang
-		client.Listen(port, backend.Listener.Addr().String())
-	}()
-
-	done := make(chan struct{})
-	go func() { wg.Wait(); close(done) }()
-	select {
-	case <-done:
-		t.Log("Listen() returned after disconnect (correct)")
-	case <-time.After(3 * time.Second):
-		t.Fatal("Listen() hung after disconnect")
 	}
 }
