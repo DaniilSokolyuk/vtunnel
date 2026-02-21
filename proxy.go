@@ -3,7 +3,6 @@ package vtunnel
 import (
 	"bufio"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -15,27 +14,28 @@ import (
 const (
 	proxyDialTimeout    = 10 * time.Second
 	proxyIOTimeout      = 60 * time.Second
+	proxyIdleTimeout    = 5 * time.Minute
 	proxyMaxHeaderBytes = 8192
 )
 
 func (s *Server) SetDomainMapping(domain, target string) {
-	s.mu.Lock()
+	s.domainMu.Lock()
 	s.domainMap[domain] = target
-	s.mu.Unlock()
+	s.domainMu.Unlock()
 	log.Printf("[vtunnel-proxy] Domain mapping added: %s -> %s", domain, target)
 }
 
 func (s *Server) RemoveDomainMapping(domain string) {
-	s.mu.Lock()
+	s.domainMu.Lock()
 	delete(s.domainMap, domain)
-	s.mu.Unlock()
+	s.domainMu.Unlock()
 	log.Printf("[vtunnel-proxy] Domain mapping removed: %s", domain)
 }
 
 func (s *Server) resolveDomain(domain string) (string, bool) {
-	s.mu.RLock()
+	s.domainMu.RLock()
 	target, ok := s.domainMap[domain]
-	s.mu.RUnlock()
+	s.domainMu.RUnlock()
 	return target, ok
 }
 
@@ -47,6 +47,7 @@ func (s *Server) StartProxy(addr string) error {
 
 	s.proxyListener = ln
 	s.proxyDone = make(chan struct{})
+	s.proxyOnce = sync.Once{} // reset for potential re-use
 
 	log.Printf("[vtunnel-proxy] Listening on %s", addr)
 
@@ -55,16 +56,14 @@ func (s *Server) StartProxy(addr string) error {
 }
 
 func (s *Server) CloseProxy() {
-	if s.proxyDone != nil {
-		select {
-		case <-s.proxyDone:
-		default:
+	s.proxyOnce.Do(func() {
+		if s.proxyDone != nil {
 			close(s.proxyDone)
 		}
-	}
-	if s.proxyListener != nil {
-		s.proxyListener.Close()
-	}
+		if s.proxyListener != nil {
+			s.proxyListener.Close()
+		}
+	})
 }
 
 func (s *Server) proxyAcceptLoop() {
@@ -106,7 +105,7 @@ func (s *Server) handleProxyConn(conn net.Conn) {
 	if req.Method == http.MethodConnect {
 		s.handleConnect(conn, br, req)
 	} else {
-		s.handlePlainHTTP(conn, br, req)
+		s.handlePlainHTTP(conn, req)
 	}
 }
 
@@ -136,6 +135,8 @@ func (s *Server) handleConnect(clientConn net.Conn, br *bufio.Reader, req *http.
 	}
 	defer upstream.Close()
 
+	setTCPOptions(upstream)
+
 	_, err = fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n")
 	if err != nil {
 		log.Printf("[vtunnel-proxy] CONNECT write 200 failed: %v", err)
@@ -159,7 +160,7 @@ func (s *Server) handleConnect(clientConn net.Conn, br *bufio.Reader, req *http.
 	bridgeConns(clientConn, upstream, br)
 }
 
-func (s *Server) handlePlainHTTP(clientConn net.Conn, br *bufio.Reader, req *http.Request) {
+func (s *Server) handlePlainHTTP(clientConn net.Conn, req *http.Request) {
 	targetHost := req.URL.Host
 	if targetHost == "" {
 		targetHost = req.Host
@@ -200,6 +201,8 @@ func (s *Server) handlePlainHTTP(clientConn net.Conn, br *bufio.Reader, req *htt
 	}
 	defer upstream.Close()
 
+	setTCPOptions(upstream)
+
 	if err := req.Write(upstream); err != nil {
 		log.Printf("[vtunnel-proxy] HTTP write request to %s failed: %v", dialAddr, err)
 		fmt.Fprintf(clientConn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -223,12 +226,27 @@ func (s *Server) handlePlainHTTP(clientConn net.Conn, br *bufio.Reader, req *htt
 }
 
 func bridgeConns(client net.Conn, upstream net.Conn, clientReader *bufio.Reader) {
+	idle := proxyIdleTimeout
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		io.Copy(upstream, clientReader)
+		buf := make([]byte, 32*1024)
+		for {
+			client.SetReadDeadline(time.Now().Add(idle))
+			n, err := clientReader.Read(buf)
+			if n > 0 {
+				upstream.SetWriteDeadline(time.Now().Add(idle))
+				if _, wErr := upstream.Write(buf[:n]); wErr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
 		if tc, ok := upstream.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}
@@ -236,7 +254,20 @@ func bridgeConns(client net.Conn, upstream net.Conn, clientReader *bufio.Reader)
 
 	go func() {
 		defer wg.Done()
-		io.Copy(client, upstream)
+		buf := make([]byte, 32*1024)
+		for {
+			upstream.SetReadDeadline(time.Now().Add(idle))
+			n, err := upstream.Read(buf)
+			if n > 0 {
+				client.SetWriteDeadline(time.Now().Add(idle))
+				if _, wErr := client.Write(buf[:n]); wErr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
 		if tc, ok := client.(*net.TCPConn); ok {
 			tc.CloseWrite()
 		}

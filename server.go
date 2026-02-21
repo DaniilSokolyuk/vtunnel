@@ -1,300 +1,218 @@
 package vtunnel
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"io"
 	"log"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/ssh"
 )
 
-// Server handles reverse tunnel connections from clients
+const defaultKeepAlive = 30 * time.Second
+
+// Server handles reverse tunnel connections from clients over SSH-over-WebSocket.
 type Server struct {
-	conn          *websocket.Conn
-	listeners     map[int]net.Listener
-	streams       map[uint32]net.Conn
-	streamID      uint32
-	mu            sync.RWMutex
-	writeMu       sync.Mutex
-	done          chan struct{}
-	readDeadline  time.Duration
-	domainMap     map[string]string // host:port -> 127.0.0.1:tunnelPort for proxy
-	proxyListener net.Listener      // proxy listener (survives reconnections)
-	proxyDone     chan struct{}     // proxy shutdown signal
+	sshConfig *ssh.ServerConfig
+	keepAlive time.Duration
+
+	// Proxy state (survives reconnections)
+	domainMap     map[string]string
+	domainMu      sync.RWMutex
+	proxyListener net.Listener
+	proxyDone     chan struct{}
+	proxyOnce     sync.Once
 }
 
-// NewServer creates a new vtunnel server
-func NewServer() *Server {
-	return &Server{
-		listeners:    make(map[int]net.Listener),
-		streams:      make(map[uint32]net.Conn),
-		done:         make(chan struct{}),
-		readDeadline: defaultPingInterval * 2,
-		domainMap:    make(map[string]string),
+// ServerOption configures a Server.
+type ServerOption func(*Server)
+
+// WithKeepAlive sets the keepalive ping interval for the server.
+// Zero or negative disables keepalive.
+func WithServerKeepAlive(d time.Duration) ServerOption {
+	return func(s *Server) {
+		s.keepAlive = d
 	}
 }
 
-// HandleConn handles a WebSocket connection from a client
-func (s *Server) HandleConn(conn *websocket.Conn) {
-	// Reset connection-specific state for reuse
-	s.mu.Lock()
-	s.conn = conn
-	s.listeners = make(map[int]net.Listener)
-	s.streams = make(map[uint32]net.Conn)
-	s.done = make(chan struct{})
-	s.mu.Unlock()
+// NewServer creates a new vtunnel server.
+func NewServer(opts ...ServerOption) *Server {
+	hostKey, err := generateHostKey()
+	if err != nil {
+		panic("vtunnel: generate host key: " + err.Error())
+	}
 
-	reason := "shutdown"
-	defer func() { s.cleanup(reason) }()
+	sshConfig := &ssh.ServerConfig{NoClientAuth: true}
+	sshConfig.AddHostKey(hostKey)
+
+	s := &Server{
+		sshConfig: sshConfig,
+		keepAlive: defaultKeepAlive,
+		domainMap: make(map[string]string),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
+
+// HandleConn handles a WebSocket connection from a client.
+// All per-connection state is local; concurrent calls are safe.
+func (s *Server) HandleConn(wsConn *websocket.Conn) {
+	conn := newWSConn(wsConn)
+	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
+	if err != nil {
+		log.Printf("[vtunnel-server] SSH handshake failed: %v", err)
+		return
+	}
+	defer sshConn.Close()
 
 	log.Println("[vtunnel-server] Client connected")
 
-	// Set up keepalive read deadline
-	if s.readDeadline > 0 {
-		_ = s.conn.SetReadDeadline(time.Now().Add(s.readDeadline))
+	// Per-connection state — local, no shared mutable state
+	listeners := make(map[int]net.Listener)
+	var mu sync.Mutex
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer func() {
+		mu.Lock()
+		for port, ln := range listeners {
+			ln.Close()
+			log.Printf("[vtunnel-server] Closed listener on port %d", port)
+		}
+		mu.Unlock()
+		log.Println("[vtunnel-server] Client disconnected")
+	}()
+
+	go s.handleRequests(ctx, sshConn, reqs, listeners, &mu)
+	go rejectChannels(chans)
+	if s.keepAlive > 0 {
+		go keepAliveLoop(sshConn, s.keepAlive)
 	}
 
-	for {
-		select {
-		case <-s.done:
-			reason = "server_done"
-			return
+	// Block until SSH connection dies
+	sshConn.Wait()
+}
+
+// handleRequests processes SSH global requests from the client.
+func (s *Server) handleRequests(ctx context.Context, sshConn ssh.Conn, reqs <-chan *ssh.Request, listeners map[int]net.Listener, mu *sync.Mutex) {
+	for r := range reqs {
+		switch r.Type {
+		case "ping":
+			r.Reply(true, []byte("pong"))
+		case "listen":
+			s.handleListen(ctx, sshConn, r, listeners, mu)
 		default:
-		}
-
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			if closeErr, ok := err.(*websocket.CloseError); ok {
-				reason = fmt.Sprintf("peer_close code=%d text=%s", closeErr.Code, closeErr.Text)
-				log.Printf("[vtunnel-server] Close error: code=%d text=%q", closeErr.Code, closeErr.Text)
-			} else if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-				reason = fmt.Sprintf("read_error %v", err)
-				log.Printf("[vtunnel-server] Read error: %v", err)
-			} else {
-				reason = fmt.Sprintf("read_end %v", err)
+			if r.WantReply {
+				r.Reply(false, nil)
 			}
-			return
-		}
-		if s.readDeadline > 0 {
-			_ = s.conn.SetReadDeadline(time.Now().Add(s.readDeadline))
-		}
-
-		var msg Message
-		if err := json.Unmarshal(data, &msg); err != nil {
-			log.Printf("[vtunnel-server] Invalid message: %v", err)
-			continue
-		}
-
-		switch msg.Type {
-		case MsgPing:
-			s.sendMessage(Message{Type: MsgPong})
-		case MsgListen:
-			s.handleListen(msg.Port, msg.LocalAddr)
-		case MsgData:
-			s.handleData(msg.StreamID, msg.Data)
-		case MsgClose:
-			s.handleClose(msg.StreamID)
 		}
 	}
 }
 
-// handleListen starts listening on a port
-func (s *Server) handleListen(port int, localAddr string) {
-	s.mu.RLock()
-	_, exists := s.listeners[port]
-	s.mu.RUnlock()
-	if exists {
-		s.sendMessage(Message{Type: MsgListenOK, Port: port})
+// handleListen processes a listen request from the client.
+func (s *Server) handleListen(ctx context.Context, sshConn ssh.Conn, r *ssh.Request, listeners map[int]net.Listener, mu *sync.Mutex) {
+	var req listenRequest
+	if err := json.Unmarshal(r.Payload, &req); err != nil {
+		log.Printf("[vtunnel-server] Invalid listen request: %v", err)
+		r.Reply(false, []byte("invalid payload"))
 		return
 	}
 
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	mu.Lock()
+	if _, exists := listeners[req.Port]; exists {
+		mu.Unlock()
+		r.Reply(true, nil)
+		return
+	}
+	mu.Unlock()
+
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(req.Port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Printf("[vtunnel-server] Failed to listen on %s: %v", addr, err)
-		s.sendMessage(Message{Type: MsgListenErr, Port: port, Error: err.Error()})
+		r.Reply(false, []byte(err.Error()))
 		return
 	}
 
-	s.mu.Lock()
-	s.listeners[port] = ln
-	s.mu.Unlock()
+	mu.Lock()
+	listeners[req.Port] = ln
+	mu.Unlock()
 
 	log.Printf("[vtunnel-server] Listening on %s", addr)
-	s.sendMessage(Message{Type: MsgListenOK, Port: port})
+	r.Reply(true, nil)
 
 	// Register domain mapping for proxy if localAddr specifies a non-loopback host
-	if localAddr != "" {
-		host, _, err := net.SplitHostPort(localAddr)
+	if req.LocalAddr != "" {
+		host, _, err := net.SplitHostPort(req.LocalAddr)
 		if err == nil && host != "localhost" && host != "127.0.0.1" && host != "::1" {
-			target := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-			s.mu.Lock()
-			s.domainMap[localAddr] = target
-			s.mu.Unlock()
-			log.Printf("[vtunnel-server] Proxy mapping: %s -> %s", localAddr, target)
+			target := net.JoinHostPort("127.0.0.1", strconv.Itoa(req.Port))
+			s.domainMu.Lock()
+			s.domainMap[req.LocalAddr] = target
+			s.domainMu.Unlock()
+			log.Printf("[vtunnel-server] Proxy mapping: %s -> %s", req.LocalAddr, target)
 		}
 	}
 
-	go s.acceptLoop(ln, port)
+	go s.acceptLoop(ctx, sshConn, ln, req.Port)
 }
 
-// acceptLoop accepts connections on a listener
-func (s *Server) acceptLoop(ln net.Listener, port int) {
+// acceptLoop accepts TCP connections and tunnels them through SSH channels.
+func (s *Server) acceptLoop(ctx context.Context, sshConn ssh.Conn, ln net.Listener, port int) {
+	// Close listener when context is cancelled (HandleConn exiting)
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	var tempDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			select {
-			case <-s.done:
+			case <-ctx.Done():
 				return
 			default:
-				log.Printf("[vtunnel-server] Accept error on port %d: %v", port, err)
+			}
+			if tempDelay == 0 {
+				tempDelay = 5 * time.Millisecond
+			} else {
+				tempDelay *= 2
+			}
+			if tempDelay > 1*time.Second {
+				tempDelay = 1 * time.Second
+			}
+			log.Printf("[vtunnel-server] Accept error on port %d (retrying in %v): %v", port, tempDelay, err)
+			select {
+			case <-ctx.Done():
 				return
+			case <-time.After(tempDelay):
 			}
+			continue
 		}
+		tempDelay = 0
+		setTCPOptions(conn)
 
-		streamID := atomic.AddUint32(&s.streamID, 1)
-
-		s.mu.Lock()
-		s.streams[streamID] = conn
-		s.mu.Unlock()
-
-		log.Printf("[vtunnel-server] New connection: stream=%d, port=%d", streamID, port)
-
-		// Notify client about new connection
-		s.sendMessage(Message{
-			Type:     MsgConnect,
-			StreamID: streamID,
-			Port:     port,
-		})
-
-		// Start reading from TCP and forwarding to WebSocket
-		go s.forwardToClient(streamID, conn)
+		go s.handleTunnelConn(sshConn, conn, port)
 	}
 }
 
-// forwardToClient reads from TCP connection and sends to WebSocket
-func (s *Server) forwardToClient(streamID uint32, conn net.Conn) {
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("[vtunnel-server] Read error on stream %d: %v", streamID, err)
-			}
-			s.sendMessage(Message{Type: MsgClose, StreamID: streamID})
-			s.removeStream(streamID)
-			return
-		}
+// handleTunnelConn opens an SSH channel to the client and pipes data.
+func (s *Server) handleTunnelConn(sshConn ssh.Conn, tcpConn net.Conn, port int) {
+	defer tcpConn.Close()
 
-		s.sendMessage(Message{
-			Type:     MsgData,
-			StreamID: streamID,
-			Data:     buf[:n],
-		})
-	}
-}
-
-// handleData forwards data from client to TCP connection
-func (s *Server) handleData(streamID uint32, data []byte) {
-	s.mu.RLock()
-	conn, ok := s.streams[streamID]
-	s.mu.RUnlock()
-
-	if !ok {
-		return
-	}
-
-	if _, err := conn.Write(data); err != nil {
-		log.Printf("[vtunnel-server] Write error on stream %d: %v", streamID, err)
-		s.removeStream(streamID)
-	}
-}
-
-// handleClose closes a stream
-func (s *Server) handleClose(streamID uint32) {
-	s.removeStream(streamID)
-}
-
-// removeStream removes and closes a stream
-func (s *Server) removeStream(streamID uint32) {
-	s.mu.Lock()
-	conn, ok := s.streams[streamID]
-	if ok {
-		delete(s.streams, streamID)
-	}
-	s.mu.Unlock()
-
-	if ok && conn != nil {
-		conn.Close()
-	}
-}
-
-// sendMessage sends a message to the client
-func (s *Server) sendMessage(msg Message) {
-	data, err := json.Marshal(msg)
+	payload := marshalJSON(tunnelRequest{Port: port})
+	ch, reqs, err := sshConn.OpenChannel("tunnel", payload)
 	if err != nil {
-		log.Printf("[vtunnel-server] Marshal error: %v", err)
+		log.Printf("[vtunnel-server] OpenChannel failed for port %d: %v", port, err)
 		return
 	}
+	go ssh.DiscardRequests(reqs)
 
-	s.writeMu.Lock()
-	defer s.writeMu.Unlock()
-
-	if err := s.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		log.Printf("[vtunnel-server] Write error: %v", err)
-	}
-}
-
-// cleanup closes all resources
-func (s *Server) cleanup(reason string) {
-	select {
-	case <-s.done:
-		// already closed
-	default:
-		close(s.done)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	log.Printf("[vtunnel-server] Cleanup: reason=%s", reason)
-	s.closeConn(websocket.CloseGoingAway, wsCloseReason(reason))
-	for _, ln := range s.listeners {
-		ln.Close()
-	}
-	for _, conn := range s.streams {
-		conn.Close()
-	}
-
-	log.Println("[vtunnel-server] Cleanup complete")
-}
-
-func (s *Server) closeConn(code int, reason string) {
-	if s.conn == nil {
-		return
-	}
-	deadline := time.Now().Add(defaultCloseWriteWait)
-	s.writeMu.Lock()
-	err := s.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(code, reason), deadline)
-	s.writeMu.Unlock()
-	if err != nil {
-		log.Printf("[vtunnel-server] Close write error: %v", err)
-	}
-	_ = s.conn.Close()
-}
-
-func wsCloseReason(reason string) string {
-	reason = strings.ReplaceAll(reason, "\n", " ")
-	reason = strings.ReplaceAll(reason, "\r", " ")
-	if len(reason) > 120 {
-		reason = reason[:120]
-	}
-	return reason
+	log.Printf("[vtunnel-server] New tunnel: port=%d", port)
+	pipe(ch, tcpConn)
 }

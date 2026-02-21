@@ -10,18 +10,14 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/gorilla/websocket"
 
 	vtunnel "github.com/DaniilSokolyuk/vtunnel"
 )
 
-const defaultHandshakeTimeout = 60 * time.Second
-
 var upgrader = websocket.Upgrader{
-	HandshakeTimeout: defaultHandshakeTimeout,
-	CheckOrigin:      func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
 func usage() {
