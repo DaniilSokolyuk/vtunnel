@@ -1,7 +1,6 @@
 package vtunnel
 
 import (
-	"context"
 	"encoding/json"
 	"log"
 	"net"
@@ -13,12 +12,24 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-const defaultKeepAlive = 30 * time.Second
+const (
+	defaultKeepAlive = 30 * time.Second
+	sshWaitTimeout   = 35 * time.Second
+)
 
 // Server handles reverse tunnel connections from clients over SSH-over-WebSocket.
 type Server struct {
 	sshConfig *ssh.ServerConfig
 	keepAlive time.Duration
+
+	// Active SSH connection
+	activeConn   ssh.Conn
+	activeConnMu sync.RWMutex
+	connReady    chan struct{} // closed when activeConn becomes non-nil
+
+	// Persistent listeners (survive reconnections)
+	listeners   map[int]net.Listener
+	listenersMu sync.Mutex
 
 	// Proxy state (survives reconnections)
 	domainMap     map[string]string
@@ -31,8 +42,7 @@ type Server struct {
 // ServerOption configures a Server.
 type ServerOption func(*Server)
 
-// WithKeepAlive sets the keepalive ping interval for the server.
-// Zero or negative disables keepalive.
+// WithServerKeepAlive sets the keepalive ping interval for the server.
 func WithServerKeepAlive(d time.Duration) ServerOption {
 	return func(s *Server) {
 		s.keepAlive = d
@@ -52,6 +62,8 @@ func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
 		sshConfig: sshConfig,
 		keepAlive: defaultKeepAlive,
+		connReady: make(chan struct{}),
+		listeners: make(map[int]net.Listener),
 		domainMap: make(map[string]string),
 	}
 	for _, opt := range opts {
@@ -61,7 +73,8 @@ func NewServer(opts ...ServerOption) *Server {
 }
 
 // HandleConn handles a WebSocket connection from a client.
-// All per-connection state is local; concurrent calls are safe.
+// Listeners persist across reconnections; acceptLoops keep running and
+// use getSSH() to wait for the next connection.
 func (s *Server) HandleConn(wsConn *websocket.Conn) {
 	conn := newWSConn(wsConn)
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
@@ -73,22 +86,14 @@ func (s *Server) HandleConn(wsConn *websocket.Conn) {
 
 	log.Println("[vtunnel-server] Client connected")
 
-	// Per-connection state — local, no shared mutable state
-	listeners := make(map[int]net.Listener)
-	var mu sync.Mutex
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Publish this connection so acceptLoops (and new ones) can use it
+	s.setSSH(sshConn)
 	defer func() {
-		mu.Lock()
-		for port, ln := range listeners {
-			ln.Close()
-			log.Printf("[vtunnel-server] Closed listener on port %d", port)
-		}
-		mu.Unlock()
+		s.clearSSH(sshConn)
 		log.Println("[vtunnel-server] Client disconnected")
 	}()
 
-	go s.handleRequests(ctx, sshConn, reqs, listeners, &mu)
+	go s.handleRequests(sshConn, reqs)
 	go rejectChannels(chans)
 	if s.keepAlive > 0 {
 		go keepAliveLoop(sshConn, s.keepAlive)
@@ -98,14 +103,59 @@ func (s *Server) HandleConn(wsConn *websocket.Conn) {
 	sshConn.Wait()
 }
 
+// setSSH publishes a new SSH connection and unblocks anyone waiting in getSSH.
+func (s *Server) setSSH(conn ssh.Conn) {
+	s.activeConnMu.Lock()
+	s.activeConn = conn
+	ch := s.connReady
+	s.connReady = make(chan struct{}) // prepare for next wait cycle
+	s.activeConnMu.Unlock()
+	close(ch) // unblock all goroutines waiting in getSSH
+}
+
+// clearSSH marks the connection as dead and creates a new wait channel.
+func (s *Server) clearSSH(conn ssh.Conn) {
+	s.activeConnMu.Lock()
+	if s.activeConn == conn {
+		s.activeConn = nil
+		s.connReady = make(chan struct{}) // new channel for next wait
+	}
+	s.activeConnMu.Unlock()
+}
+
+// getSSH returns the current SSH connection. If none is active, it blocks
+// until one becomes available or the timeout expires.
+func (s *Server) getSSH() ssh.Conn {
+	s.activeConnMu.RLock()
+	c := s.activeConn
+	ready := s.connReady
+	s.activeConnMu.RUnlock()
+
+	if c != nil {
+		return c
+	}
+
+	// Wait for reconnect
+	select {
+	case <-ready:
+		s.activeConnMu.RLock()
+		c = s.activeConn
+		s.activeConnMu.RUnlock()
+		return c
+	case <-time.After(sshWaitTimeout):
+		log.Printf("[vtunnel-server] getSSH timeout (%v)", sshWaitTimeout)
+		return nil
+	}
+}
+
 // handleRequests processes SSH global requests from the client.
-func (s *Server) handleRequests(ctx context.Context, sshConn ssh.Conn, reqs <-chan *ssh.Request, listeners map[int]net.Listener, mu *sync.Mutex) {
+func (s *Server) handleRequests(sshConn ssh.Conn, reqs <-chan *ssh.Request) {
 	for r := range reqs {
 		switch r.Type {
 		case "ping":
 			r.Reply(true, []byte("pong"))
 		case "listen":
-			s.handleListen(ctx, sshConn, r, listeners, mu)
+			s.handleListen(sshConn, r)
 		default:
 			if r.WantReply {
 				r.Reply(false, nil)
@@ -115,7 +165,8 @@ func (s *Server) handleRequests(ctx context.Context, sshConn ssh.Conn, reqs <-ch
 }
 
 // handleListen processes a listen request from the client.
-func (s *Server) handleListen(ctx context.Context, sshConn ssh.Conn, r *ssh.Request, listeners map[int]net.Listener, mu *sync.Mutex) {
+// Listeners are persistent at the Server level and reused across reconnects.
+func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	var req listenRequest
 	if err := json.Unmarshal(r.Payload, &req); err != nil {
 		log.Printf("[vtunnel-server] Invalid listen request: %v", err)
@@ -123,25 +174,26 @@ func (s *Server) handleListen(ctx context.Context, sshConn ssh.Conn, r *ssh.Requ
 		return
 	}
 
-	mu.Lock()
-	if _, exists := listeners[req.Port]; exists {
-		mu.Unlock()
+	s.listenersMu.Lock()
+	_, exists := s.listeners[req.Port]
+	if exists {
+		s.listenersMu.Unlock()
+		log.Printf("[vtunnel-server] Reusing listener on port %d", req.Port)
 		r.Reply(true, nil)
 		return
 	}
-	mu.Unlock()
 
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(req.Port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
+		s.listenersMu.Unlock()
 		log.Printf("[vtunnel-server] Failed to listen on %s: %v", addr, err)
 		r.Reply(false, []byte(err.Error()))
 		return
 	}
 
-	mu.Lock()
-	listeners[req.Port] = ln
-	mu.Unlock()
+	s.listeners[req.Port] = ln
+	s.listenersMu.Unlock()
 
 	log.Printf("[vtunnel-server] Listening on %s", addr)
 	r.Reply(true, nil)
@@ -158,52 +210,40 @@ func (s *Server) handleListen(ctx context.Context, sshConn ssh.Conn, r *ssh.Requ
 		}
 	}
 
-	go s.acceptLoop(ctx, sshConn, ln, req.Port)
+	// Start persistent accept loop — runs forever, uses getSSH() to
+	// wait for reconnects
+	go s.acceptLoop(ln, req.Port)
 }
 
 // acceptLoop accepts TCP connections and tunnels them through SSH channels.
-func (s *Server) acceptLoop(ctx context.Context, sshConn ssh.Conn, ln net.Listener, port int) {
-	// Close listener when context is cancelled (HandleConn exiting)
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-
-	var tempDelay time.Duration
+// It NEVER stops — when SSH dies, handleTunnelConn calls getSSH() which
+// blocks until the client reconnects.
+func (s *Server) acceptLoop(ln net.Listener, port int) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			if tempDelay == 0 {
-				tempDelay = 5 * time.Millisecond
-			} else {
-				tempDelay *= 2
-			}
-			if tempDelay > 1*time.Second {
-				tempDelay = 1 * time.Second
-			}
-			log.Printf("[vtunnel-server] Accept error on port %d (retrying in %v): %v", port, tempDelay, err)
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(tempDelay):
-			}
-			continue
+			// Listener was closed (server shutdown)
+			log.Printf("[vtunnel-server] Accept error on port %d: %v", port, err)
+			s.listenersMu.Lock()
+			delete(s.listeners, port)
+			s.listenersMu.Unlock()
+			return
 		}
-		tempDelay = 0
 		setTCPOptions(conn)
-
-		go s.handleTunnelConn(sshConn, conn, port)
+		go s.handleTunnelConn(conn, port)
 	}
 }
 
-// handleTunnelConn opens an SSH channel to the client and pipes data.
-func (s *Server) handleTunnelConn(sshConn ssh.Conn, tcpConn net.Conn, port int) {
+// handleTunnelConn gets the current SSH connection (waiting for reconnect
+// if needed), then opens a channel and pipes data.
+func (s *Server) handleTunnelConn(tcpConn net.Conn, port int) {
 	defer tcpConn.Close()
+
+	sshConn := s.getSSH()
+	if sshConn == nil {
+		log.Printf("[vtunnel-server] No SSH connection for port %d (timeout)", port)
+		return
+	}
 
 	payload := marshalJSON(tunnelRequest{Port: port})
 	ch, reqs, err := sshConn.OpenChannel("tunnel", payload)
