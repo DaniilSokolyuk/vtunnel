@@ -34,10 +34,10 @@ Server flags:
 Client flags:
   -server string    WebSocket server URL (e.g. ws://example.com/)
   -key string       Private key for auth (vt-priv-...) [$VTUNNEL_KEY]
-  -forward value    Port forward: remotePort=localAddr (repeatable)
-                    Examples:
-                      -forward 8080=localhost:3000
-                      -forward 8085=tls://www.google.com:443
+  -forward value    Forward mapping (repeatable)
+                    Port:   -forward 8080=localhost:3000
+                    Domain: -forward llmproxy.local=localhost:8080
+                    TLS:    -forward 8085=tls://www.google.com:443
 `)
 	os.Exit(1)
 }
@@ -127,8 +127,14 @@ func runClient(args []string) {
 	defer client.Close()
 
 	for _, f := range forwards {
-		if err := client.Listen(f.remotePort, f.localAddr); err != nil {
-			log.Fatalf("[vtunnel] Listen error for port %d: %v", f.remotePort, err)
+		if f.domain != "" {
+			if err := client.Forward(f.domain, f.localAddr); err != nil {
+				log.Fatalf("[vtunnel] Forward error for %s: %v", f.domain, err)
+			}
+		} else {
+			if err := client.Listen(f.remotePort, f.localAddr); err != nil {
+				log.Fatalf("[vtunnel] Listen error for port %d: %v", f.remotePort, err)
+			}
 		}
 	}
 
@@ -139,9 +145,10 @@ func runClient(args []string) {
 	log.Println("[vtunnel] Shutting down")
 }
 
-// forward represents a single port forward mapping
+// forward represents a single forward mapping (port-based or domain-based)
 type forward struct {
-	remotePort int
+	remotePort int    // port-based forward (mutually exclusive with domain)
+	domain     string // domain-based forward (mutually exclusive with remotePort)
 	localAddr  string
 }
 
@@ -153,13 +160,14 @@ func (f *forwardList) String() string { return fmt.Sprintf("%v", *f) }
 func (f *forwardList) Set(val string) error {
 	parts := strings.SplitN(val, "=", 2)
 	if len(parts) != 2 {
-		return fmt.Errorf("invalid forward format %q, expected remotePort=localAddr", val)
+		return fmt.Errorf("invalid forward format %q, expected port=localAddr or domain=localAddr", val)
 	}
-	port, err := strconv.Atoi(parts[0])
-	if err != nil {
-		return fmt.Errorf("invalid port %q: %v", parts[0], err)
+	left, right := parts[0], parts[1]
+	if port, err := strconv.Atoi(left); err == nil {
+		*f = append(*f, forward{remotePort: port, localAddr: right})
+	} else {
+		*f = append(*f, forward{domain: left, localAddr: right})
 	}
-	*f = append(*f, forward{remotePort: port, localAddr: parts[1]})
 	return nil
 }
 

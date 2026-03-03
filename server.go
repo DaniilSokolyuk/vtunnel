@@ -214,16 +214,19 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 		return
 	}
 
+	port := req.Port
+
 	s.listenersMu.Lock()
-	_, exists := s.listeners[req.Port]
-	if exists {
-		s.listenersMu.Unlock()
-		log.Printf("[vtunnel-server] Reusing listener on port %d", req.Port)
-		r.Reply(true, nil)
-		return
+	if port != 0 {
+		if _, exists := s.listeners[port]; exists {
+			s.listenersMu.Unlock()
+			log.Printf("[vtunnel-server] Reusing listener on port %d", port)
+			r.Reply(true, nil)
+			return
+		}
 	}
 
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(req.Port))
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		s.listenersMu.Unlock()
@@ -232,27 +235,40 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 		return
 	}
 
-	s.listeners[req.Port] = ln
+	// For port 0, get the actual allocated port
+	if port == 0 {
+		port = ln.Addr().(*net.TCPAddr).Port
+	}
+
+	s.listeners[port] = ln
 	s.listenersMu.Unlock()
 
-	log.Printf("[vtunnel-server] Listening on %s", addr)
-	r.Reply(true, nil)
+	log.Printf("[vtunnel-server] Listening on %s", ln.Addr())
+	r.Reply(true, marshalJSON(listenRequest{Port: port}))
 
-	// Register domain mapping for proxy if localAddr specifies a non-loopback host
-	if req.LocalAddr != "" {
+	// Register domain mapping for proxy
+	target := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	if req.Domain != "" {
+		// Explicit domain from Forward()
+		_, _, err := net.SplitHostPort(req.Domain)
+		if err != nil {
+			// Domain without port — register for both :80 and :443
+			s.SetDomainMapping(net.JoinHostPort(req.Domain, "80"), target)
+			s.SetDomainMapping(net.JoinHostPort(req.Domain, "443"), target)
+		} else {
+			s.SetDomainMapping(req.Domain, target)
+		}
+	} else if req.LocalAddr != "" {
+		// Legacy auto-detection: non-loopback localAddr
 		host, _, err := net.SplitHostPort(req.LocalAddr)
 		if err == nil && host != "localhost" && host != "127.0.0.1" && host != "::1" {
-			target := net.JoinHostPort("127.0.0.1", strconv.Itoa(req.Port))
-			s.domainMu.Lock()
-			s.domainMap[req.LocalAddr] = target
-			s.domainMu.Unlock()
-			log.Printf("[vtunnel-server] Proxy mapping: %s -> %s", req.LocalAddr, target)
+			s.SetDomainMapping(req.LocalAddr, target)
 		}
 	}
 
 	// Start persistent accept loop — runs forever, uses getSSH() to
 	// wait for reconnects
-	go s.acceptLoop(ln, req.Port)
+	go s.acceptLoop(ln, port)
 }
 
 // acceptLoop accepts TCP connections and tunnels them through SSH channels.

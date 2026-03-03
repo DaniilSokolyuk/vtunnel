@@ -143,6 +143,7 @@ func generateHostKey() (ssh.Signer, error) {
 type listenRequest struct {
 	Port      int    `json:"port"`
 	LocalAddr string `json:"local_addr,omitempty"`
+	Domain    string `json:"domain,omitempty"` // proxy domain mapping (used by Forward)
 }
 
 // tunnelRequest is the extra data sent when opening a tunnel SSH channel.

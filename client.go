@@ -42,6 +42,9 @@ type Client struct {
 	reconnectMin time.Duration
 	reconnectMax time.Duration
 	authSigner   ssh.Signer // nil = no auth
+
+	// Domain-based forwards (Forward method)
+	domainForwards map[string]string // domain -> localAddr
 }
 
 // Option configures a Client.
@@ -91,14 +94,15 @@ func WithKey(privKey string) Option {
 func NewClient(wsURL string, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
-		wsURL:        wsURL,
-		forwards:     make(map[int]string),
-		done:         make(chan struct{}),
-		ctx:          ctx,
-		cancel:       cancel,
-		keepAlive:    defaultKeepAlive,
-		reconnectMin: defaultReconnectMin,
-		reconnectMax: defaultReconnectMax,
+		wsURL:          wsURL,
+		forwards:       make(map[int]string),
+		domainForwards: make(map[string]string),
+		done:           make(chan struct{}),
+		ctx:            ctx,
+		cancel:         cancel,
+		keepAlive:      defaultKeepAlive,
+		reconnectMin:   defaultReconnectMin,
+		reconnectMax:   defaultReconnectMax,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -133,6 +137,24 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 	}
 
 	return c.sendListen(sshConn, remotePort, localAddr)
+}
+
+// Forward registers a domain-based forward. The proxy on the server will route
+// requests for the given domain through the tunnel. The server auto-allocates
+// an internal port; the caller only deals with domain names.
+func (c *Client) Forward(domain, localAddr string) error {
+	c.mu.Lock()
+	c.domainForwards[domain] = localAddr
+	c.mu.Unlock()
+
+	log.Printf("[vtunnel-client] Requesting forward: %s -> %s", domain, localAddr)
+
+	sshConn := c.getSSH()
+	if sshConn == nil {
+		return nil // will be replayed on reconnect
+	}
+
+	return c.sendListenWithDomain(sshConn, localAddr, domain)
 }
 
 // Close closes the client and all connections.
@@ -315,6 +337,31 @@ func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error 
 	return nil
 }
 
+// sendListenWithDomain sends a listen request with port 0 (server auto-allocates)
+// and a domain hint for proxy mapping. It parses the reply to learn the actual
+// port and registers it in the forwards map.
+func (c *Client) sendListenWithDomain(sshConn ssh.Conn, localAddr, domain string) error {
+	payload := marshalJSON(listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain})
+	ok, resp, err := sshConn.SendRequest("listen", true, payload)
+	if err != nil {
+		return fmt.Errorf("forward request: %w", err)
+	}
+	if !ok {
+		return fmt.Errorf("forward rejected: %s", string(resp))
+	}
+
+	// Server replies with the actual allocated port
+	var reply listenRequest
+	if err := json.Unmarshal(resp, &reply); err == nil && reply.Port > 0 {
+		c.mu.Lock()
+		c.forwards[reply.Port] = localAddr
+		c.mu.Unlock()
+	}
+
+	log.Printf("[vtunnel-client] Forward OK: %s (port=%d)", domain, reply.Port)
+	return nil
+}
+
 func (c *Client) setSSH(conn ssh.Conn) {
 	c.connMu.Lock()
 	c.sshConn = conn
@@ -381,6 +428,10 @@ func (c *Client) replayForwards() {
 	for port, addr := range c.forwards {
 		fwds[port] = addr
 	}
+	domFwds := make(map[string]string, len(c.domainForwards))
+	for domain, addr := range c.domainForwards {
+		domFwds[domain] = addr
+	}
 	c.mu.RUnlock()
 
 	sshConn := c.getSSH()
@@ -391,6 +442,12 @@ func (c *Client) replayForwards() {
 	for port, addr := range fwds {
 		if err := c.sendListen(sshConn, port, addr); err != nil {
 			log.Printf("[vtunnel-client] Re-listen failed for port %d: %v", port, err)
+		}
+	}
+
+	for domain, addr := range domFwds {
+		if err := c.sendListenWithDomain(sshConn, addr, domain); err != nil {
+			log.Printf("[vtunnel-client] Re-forward failed for %s: %v", domain, err)
 		}
 	}
 }
