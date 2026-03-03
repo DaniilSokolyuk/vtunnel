@@ -258,12 +258,6 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 		} else {
 			s.SetDomainMapping(req.Domain, target)
 		}
-	} else if req.LocalAddr != "" {
-		// Legacy auto-detection: non-loopback localAddr
-		host, _, err := net.SplitHostPort(req.LocalAddr)
-		if err == nil && host != "localhost" && host != "127.0.0.1" && host != "::1" {
-			s.SetDomainMapping(req.LocalAddr, target)
-		}
 	}
 
 	// Start persistent accept loop — runs forever, uses getSSH() to

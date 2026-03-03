@@ -85,13 +85,11 @@ vtunnel client [flags]
 |------|-------------|---------|
 | `-server` | WebSocket server URL (required) | — |
 | `-key` | Private key (`vt-priv-...`). Also `$VTUNNEL_KEY`. | none |
-| `-forward` | Port forward `remotePort=localAddr` (repeatable, at least 1 required) | — |
+| `-forward` | Forward mapping (repeatable, at least 1 required) | — |
 
-The `-forward` format is `remotePort=localAddr`:
+The `-forward` flag supports two formats:
 
-- `remotePort` — port the server opens on `127.0.0.1`
-- `localAddr` — address the client connects to when traffic arrives
-- Prefix with `tls://` for client-side TLS termination
+**Port-based** (`remotePort=localAddr`) — server opens a TCP port:
 
 ```bash
 # Single forward
@@ -107,6 +105,29 @@ vtunnel client -server ws://tunnel.example.com/ \
   -forward 8085=tls://www.google.com:443
 # curl http://127.0.0.1:8085/ -> 200 OK from google
 ```
+
+**Domain-based** (`domain=localAddr`) — proxy routes by hostname, no manual port allocation:
+
+```bash
+# Route domain through tunnel to local service
+vtunnel client -server ws://tunnel.example.com/ \
+  -forward llmproxy.local=localhost:8080
+
+# Multiple domains to the same backend
+vtunnel client -server ws://tunnel.example.com/ \
+  -forward llmproxy.local=localhost:8080 \
+  -forward mcpproxy.local=localhost:8080
+
+# Passthrough: proxy routes through tunnel, client connects to the real host
+vtunnel client -server ws://tunnel.example.com/ \
+  -forward gitlab.example.com:443=gitlab.example.com:443
+
+# Domain with TLS termination
+vtunnel client -server ws://tunnel.example.com/ \
+  -forward myalias.local=tls://www.google.com:443
+```
+
+Domain forwards require the server to run with `-proxy`. A domain without a port (e.g. `llmproxy.local`) matches both `:80` and `:443`.
 
 ### Key Generation
 
@@ -132,21 +153,16 @@ The server includes an optional HTTP CONNECT proxy that intercepts HTTPS traffic
 
 ### How It Works
 
-When the server starts with `-proxy 9090`, it runs an HTTP CONNECT proxy on port 9090. The proxy automatically builds a routing table from `Listen` messages received from the client.
+When the server starts with `-proxy 9090`, it runs an HTTP CONNECT proxy on port 9090. The proxy routes domains registered via `Forward` (or `SetDomainMapping`) through the tunnel. Unknown domains pass through directly to the internet.
 
-When the client calls `Listen(8083, "gitlab.example.com:443")`, the server:
-1. Opens TCP port 8083 on localhost (normal tunnel behavior)
-2. Registers a proxy mapping: `gitlab.example.com:443` -> `127.0.0.1:8083`
-
-Any process that sets `HTTPS_PROXY=http://localhost:9090` will have its HTTPS `CONNECT` requests checked against this table. Known domains go through the tunnel; unknown domains pass through directly to the internet.
+When the client calls `Forward("gitlab.example.com:443", "gitlab.example.com:443")`, the server registers the domain in the proxy routing table. Any HTTPS `CONNECT` request for that domain is routed through the tunnel.
 
 ### Flow
 
 ```
 git clone https://gitlab.example.com/repo
   -> HTTPS_PROXY -> CONNECT gitlab.example.com:443
-    -> proxy lookup -> 127.0.0.1:8083 (vtunnel)
-      -> WebSocket -> client -> gitlab.example.com:443
+    -> proxy lookup -> vtunnel -> client -> gitlab.example.com:443
 ```
 
 ### Usage in Containers
@@ -157,7 +173,7 @@ export HTTPS_PROXY=http://localhost:9090
 
 | Domain | Behavior |
 |--------|----------|
-| Registered via `Listen` | Routed through vtunnel to client |
+| Registered via `Forward` | Routed through vtunnel to client |
 | Everything else | Direct connection (passthrough) |
 
 ## Go Library
@@ -191,7 +207,8 @@ func main() {
     defer client.Close()
 
     client.Listen(8081, "localhost:8081")
-    client.Listen(8083, "gitlab.example.com:443")
+    client.Forward("gitlab.example.com:443", "gitlab.example.com:443")
+    client.Forward("llmproxy.local", "localhost:8082")
 
     c := make(chan os.Signal, 1)
     signal.Notify(c, os.Interrupt)
@@ -208,7 +225,7 @@ func main() {
 | `WithHeaders(h)` | HTTP headers for the WebSocket handshake. | none |
 | `WithReconnectBackoff(min, max)` | Exponential backoff for reconnect attempts. | 1s–5s |
 
-Reconnection is always enabled. On disconnect, the client reconnects with exponential backoff and replays all `Listen` calls automatically.
+Reconnection is always enabled. On disconnect, the client reconnects with exponential backoff and replays all `Listen` and `Forward` calls automatically.
 
 ### Server
 
@@ -264,7 +281,7 @@ vtunnel runs the SSH protocol over WebSocket binary frames. This gives multiplex
 
 | Request | Payload | Description |
 |---------|---------|-------------|
-| `listen` | `{"port": N, "local_addr": "..."}` | Open a TCP listener on the server |
+| `listen` | `{"port": N, "local_addr": "...", "domain": "..."}` | Open a TCP listener on the server. Optional `domain` registers a proxy mapping. Port 0 = auto-allocate. |
 | `ping` | — | Keepalive probe (server replies with `pong`) |
 
 **Channels (server -> client):**
@@ -281,7 +298,8 @@ The client sends SSH `ping` requests at a configurable interval (default 30s). T
 
 - **SSH over WebSocket** — encrypted, multiplexed transport through firewalls and HTTP proxies
 - **Key-based authentication** — ed25519 keypair with automatic MITM protection
-- **Auto-reconnect** — exponential backoff with automatic `Listen` replay
+- **Domain forwarding** — route by hostname through the proxy, no manual port allocation
+- **Auto-reconnect** — exponential backoff with automatic `Listen`/`Forward` replay
 - **TLS termination** — client-side TLS for `tls://` targets, exposing plain TCP on the server
 - **HTTP CONNECT proxy** — route HTTPS traffic from containers through the tunnel by domain
 - **Persistent listeners** — server TCP listeners survive client reconnections
