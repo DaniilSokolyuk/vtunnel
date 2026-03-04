@@ -184,7 +184,8 @@ func (c *Client) dialOnce() (ssh.Conn, error) {
 
 	conn := NewWSConn(wsConn)
 	sshConfig := &ssh.ClientConfig{
-		User: "vtunnel",
+		User:    "vtunnel",
+		Timeout: defaultHandshakeTimeout,
 	}
 	if c.authSigner != nil {
 		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(c.authSigner)}

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -98,11 +99,26 @@ func setTCPOptions(conn net.Conn) {
 }
 
 // keepAliveLoop sends SSH ping requests until the connection dies.
+// If a ping doesn't get a response within 3x the interval, the connection
+// is considered dead and closed — this handles half-open connections where
+// the remote end has silently disappeared (no TCP RST/FIN).
 func keepAliveLoop(sshConn ssh.Conn, interval time.Duration) {
+	timeout := interval * 3
 	for {
 		time.Sleep(interval)
-		_, _, err := sshConn.SendRequest("ping", true, nil)
-		if err != nil {
+		errCh := make(chan error, 1)
+		go func() {
+			_, _, err := sshConn.SendRequest("ping", true, nil)
+			errCh <- err
+		}()
+		select {
+		case err := <-errCh:
+			if err != nil {
+				sshConn.Close()
+				return
+			}
+		case <-time.After(timeout):
+			log.Printf("[vtunnel] ping timeout (%v), closing connection", timeout)
 			sshConn.Close()
 			return
 		}

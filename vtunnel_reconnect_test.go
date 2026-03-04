@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -372,7 +373,126 @@ func TestReconnectCloseWhileReconnecting(t *testing.T) {
 	env.tunnelServer.Close()
 }
 
-// 8. Backoff timing is respected between reconnect attempts.
+// 8. Silent network partition: keepAliveLoop must detect and trigger reconnect.
+// Regression: SendRequest("ping") has no timeout → blocks forever on half-open connections.
+func TestKeepAliveDetectsSilentDrop(t *testing.T) {
+	server := vtunnel.NewServer()
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		server.HandleConn(conn)
+	}))
+	defer tunnelServer.Close()
+
+	u, _ := url.Parse(tunnelServer.URL)
+	proxy := newBlackholeProxy(t, u.Host)
+	defer proxy.close()
+
+	keepAlive := 500 * time.Millisecond
+
+	client := vtunnel.NewClient(
+		fmt.Sprintf("ws://%s", proxy.addr()),
+		vtunnel.WithKeepAlive(keepAlive),
+		vtunnel.WithReconnectBackoff(50*time.Millisecond, 200*time.Millisecond),
+	)
+	if err := client.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Verify initial connection
+	time.Sleep(100 * time.Millisecond)
+	initial := proxy.acceptCount.Load()
+	if initial != 1 {
+		t.Fatalf("expected 1 initial connection, got %d", initial)
+	}
+
+	// Freeze: simulate silent network partition (no TCP RST/FIN)
+	proxy.freeze()
+
+	// Wait 10x keepalive — with ping timeout, client should detect and attempt reconnect
+	time.Sleep(10 * keepAlive)
+
+	count := proxy.acceptCount.Load()
+	if count <= initial {
+		t.Fatalf("client did not attempt reconnect after %v of silence "+
+			"(acceptCount=%d, expected >%d). "+
+			"keepAliveLoop likely stuck on SendRequest without timeout.",
+			10*keepAlive, count, initial)
+	}
+	t.Logf("client detected silent drop and made %d reconnect attempt(s)", count-initial)
+}
+
+// --- blackholeProxy ---
+
+// blackholeProxy is a TCP proxy that can be "frozen" to simulate a silent
+// network partition. When frozen, data is read but not forwarded, and
+// connections stay open (no RST/FIN). Tracks accept count for assertions.
+type blackholeProxy struct {
+	ln          net.Listener
+	target      string
+	frozen      atomic.Bool
+	acceptCount atomic.Int32
+}
+
+func newBlackholeProxy(t *testing.T, targetAddr string) *blackholeProxy {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &blackholeProxy{ln: ln, target: targetAddr}
+	go p.acceptLoop()
+	return p
+}
+
+func (p *blackholeProxy) acceptLoop() {
+	for {
+		cc, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+		p.acceptCount.Add(1)
+		sc, err := net.DialTimeout("tcp", p.target, 5*time.Second)
+		if err != nil {
+			cc.Close()
+			continue
+		}
+		go p.pipeProxy(cc, sc)
+		go p.pipeProxy(sc, cc)
+	}
+}
+
+func (p *blackholeProxy) pipeProxy(dst, src net.Conn) {
+	buf := make([]byte, 32*1024)
+	for {
+		if p.frozen.Load() {
+			// Frozen: read and discard (keeps connection alive), don't forward
+			src.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			src.Read(buf)
+			continue
+		}
+		src.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		n, err := src.Read(buf)
+		if n > 0 && !p.frozen.Load() {
+			dst.Write(buf[:n])
+		}
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			return
+		}
+	}
+}
+
+func (p *blackholeProxy) freeze()      { p.frozen.Store(true) }
+func (p *blackholeProxy) addr() string { return p.ln.Addr().String() }
+func (p *blackholeProxy) close()       { p.ln.Close() }
+
+// 9. Backoff timing is respected between reconnect attempts.
 func TestReconnectBackoffRespected(t *testing.T) {
 	connTimes := make(chan time.Time, 10)
 	server := vtunnel.NewServer()

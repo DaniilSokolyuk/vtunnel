@@ -117,11 +117,13 @@ func NewServer(opts ...ServerOption) *Server {
 // use getSSH() to wait for the next connection.
 func (s *Server) HandleConn(wsConn *websocket.Conn) {
 	conn := NewWSConn(wsConn)
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
 	if err != nil {
 		log.Printf("[vtunnel-server] SSH handshake failed: %v", err)
 		return
 	}
+	conn.SetDeadline(time.Time{}) // clear deadline after handshake
 	defer sshConn.Close()
 
 	log.Println("[vtunnel-server] Client connected")
