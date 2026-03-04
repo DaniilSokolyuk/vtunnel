@@ -130,6 +130,47 @@ func TestDomainForwardCONNECT(t *testing.T) {
 	}
 }
 
+// TestDomainForwardSameDomainTarget tests forwarding where domain and target host match
+// (e.g. Forward("google.com:443", "google.com:443")) — real HTTPS request through the tunnel.
+func TestDomainForwardSameDomainTarget(t *testing.T) {
+	ts, server := startTunnelServer(t)
+	defer ts.Close()
+
+	proxyPort := freePort(t)
+	if err := server.StartProxy(fmt.Sprintf("127.0.0.1:%d", proxyPort)); err != nil {
+		t.Fatalf("StartProxy: %v", err)
+	}
+	defer server.CloseProxy()
+
+	client := vtunnel.NewClient(wsURL(ts))
+	if err := client.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Forward("google.com:443", "google.com:443"); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
+	httpClient := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+	}
+
+	resp, err := httpClient.Get("https://google.com/")
+	if err != nil {
+		t.Fatalf("GET https://google.com via tunnel: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+	t.Logf("https://google.com -> %d", resp.StatusCode)
+}
+
 // TestDomainForwardHostnameOnly tests that a domain without port matches both :80 and :443.
 func TestDomainForwardHostnameOnly(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
