@@ -132,6 +132,44 @@ func TestProxyConnectMapped(t *testing.T) {
 	}
 }
 
+func TestProxyHTTPSNoMitmFails(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "should-not-reach")
+	}))
+	defer backend.Close()
+
+	server := vtunnel.NewServer() // no MITM CA
+	proxyPort := freePort(t)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	if err := server.StartProxy(proxyAddr); err != nil {
+		t.Fatalf("StartProxy error: %v", err)
+	}
+	defer server.CloseProxy()
+
+	server.SetDomainMapping("example.test:443", backend.Listener.Addr().String())
+
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	if err != nil {
+		t.Fatalf("Proxy URL parse error: %v", err)
+	}
+
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	_, err = client.Get("https://example.test/")
+	if err == nil {
+		t.Fatal("Expected TLS handshake error, got nil")
+	}
+	t.Logf("Expected error: %v", err)
+}
+
 func TestProxyHTTPSMitm(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "mitm-ok")
