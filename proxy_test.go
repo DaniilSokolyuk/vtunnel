@@ -2,6 +2,7 @@ package vtunnel_test
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/elazarl/goproxy"
 )
 
 func TestProxyPlainHTTPMapped(t *testing.T) {
@@ -127,5 +129,48 @@ func TestProxyConnectMapped(t *testing.T) {
 	}
 	if string(buf) != string(payload) {
 		t.Fatalf("Unexpected echo: %q", string(buf))
+	}
+}
+
+func TestProxyHTTPSMitm(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "mitm-ok")
+	}))
+	defer backend.Close()
+
+	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(goproxy.GoproxyCa))
+	proxyPort := freePort(t)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	if err := server.StartProxy(proxyAddr); err != nil {
+		t.Fatalf("StartProxy error: %v", err)
+	}
+	defer server.CloseProxy()
+
+	server.SetDomainMapping("google.com:443", backend.Listener.Addr().String())
+
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	if err != nil {
+		t.Fatalf("Proxy URL parse error: %v", err)
+	}
+
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	resp, err := client.Get("https://google.com/")
+	if err != nil {
+		t.Fatalf("HTTPS GET through proxy error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "mitm-ok" {
+		t.Fatalf("Expected 'mitm-ok', got %q", string(body))
 	}
 }

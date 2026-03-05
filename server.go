@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -42,6 +43,9 @@ type Server struct {
 	proxyListener net.Listener
 	proxyDone     chan struct{}
 	proxyOnce     sync.Once
+
+	// MITM CA certificate for HTTPS interception (nil = transparent tunnel)
+	mitmCA *tls.Certificate
 }
 
 // ServerOption configures a Server.
@@ -51,6 +55,16 @@ type ServerOption func(*Server)
 func WithServerKeepAlive(d time.Duration) ServerOption {
 	return func(s *Server) {
 		s.keepAlive = d
+	}
+}
+
+// WithProxyMitmCA sets the CA certificate used for HTTPS MITM interception.
+// When set, the proxy will decrypt HTTPS traffic for mapped domains,
+// generating certificates on the fly signed by this CA.
+// Clients must trust this CA for HTTPS to work without errors.
+func WithProxyMitmCA(cert tls.Certificate) ServerOption {
+	return func(s *Server) {
+		s.mitmCA = &cert
 	}
 }
 
