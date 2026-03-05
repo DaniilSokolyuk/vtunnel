@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
@@ -29,6 +31,7 @@ func usage() {
 Server flags:
   -port int            WebSocket listen port (default 3001)
   -proxy int           HTTP CONNECT proxy port (0 = disabled, default 0)
+  -proxy-mitm-ca string PEM file with CA cert+key for HTTPS MITM (enables interception)
   -client-key string   Client public key for auth (vt-pub-...) [$VTUNNEL_CLIENT_KEY]
 
 Client flags:
@@ -74,6 +77,7 @@ func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	port := fs.Int("port", 3001, "WebSocket listen port")
 	proxyPort := fs.Int("proxy", 0, "HTTP CONNECT proxy port (0 = disabled)")
+	mitmCAFile := fs.String("proxy-mitm-ca", "", "PEM file with CA cert+key for HTTPS MITM")
 	clientKey := fs.String("client-key", os.Getenv("VTUNNEL_CLIENT_KEY"), "Client public key (vt-pub-...)")
 	fs.Parse(args)
 
@@ -81,6 +85,22 @@ func runServer(args []string) {
 	if *clientKey != "" {
 		opts = append(opts, vtunnel.WithClientKey(*clientKey))
 		log.Println("[vtunnel] Client key authentication enabled")
+	}
+	if *mitmCAFile != "" {
+		pem, err := os.ReadFile(*mitmCAFile)
+		if err != nil {
+			log.Fatalf("[vtunnel] Failed to read MITM CA file: %v", err)
+		}
+		cert, err := tls.X509KeyPair(pem, pem)
+		if err != nil {
+			log.Fatalf("[vtunnel] Failed to parse MITM CA cert+key: %v", err)
+		}
+		cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			log.Fatalf("[vtunnel] Failed to parse MITM CA leaf: %v", err)
+		}
+		opts = append(opts, vtunnel.WithProxyMitmCA(cert))
+		log.Println("[vtunnel] HTTPS MITM interception enabled")
 	}
 	srv = vtunnel.NewServer(opts...)
 

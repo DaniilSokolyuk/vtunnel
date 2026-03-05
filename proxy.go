@@ -34,27 +34,48 @@ func (s *Server) resolveDomain(host string) (string, bool) {
 func (s *Server) StartProxy(addr string) error {
 	proxy := goproxy.NewProxyHttpServer()
 
-	// CONNECT: known domains → tunnel port, unknown → passthrough
-	proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
-		func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-			if mapped, ok := s.resolveDomain(host); ok {
-				log.Printf("[vtunnel-proxy] CONNECT %s -> %s", host, mapped)
-				return goproxy.OkConnect, mapped
-			}
-			log.Printf("[vtunnel-proxy] CONNECT %s -> direct", host)
-			return goproxy.OkConnect, host
-		}))
+	if s.mitmCA != nil {
+		goproxy.GoproxyCa = *s.mitmCA
+		mitmConnect := &goproxy.ConnectAction{
+			Action:    goproxy.ConnectMitm,
+			TLSConfig: goproxy.TLSConfigFromCA(&goproxy.GoproxyCa),
+		}
 
-	// Plain HTTP: known domains → rewrite to tunnel port
+		proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
+			func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+				if _, ok := s.resolveDomain(host); ok {
+					log.Printf("[vtunnel-proxy] CONNECT MITM %s", host)
+					return mitmConnect, host
+				}
+				log.Printf("[vtunnel-proxy] CONNECT %s -> direct", host)
+				return goproxy.OkConnect, host
+			}))
+	} else {
+		proxy.OnRequest().HandleConnect(goproxy.FuncHttpsHandler(
+			func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+				if mapped, ok := s.resolveDomain(host); ok {
+					log.Printf("[vtunnel-proxy] CONNECT %s -> %s", host, mapped)
+					return goproxy.OkConnect, mapped
+				}
+				log.Printf("[vtunnel-proxy] CONNECT %s -> direct", host)
+				return goproxy.OkConnect, host
+			}))
+	}
+
 	proxy.OnRequest().DoFunc(
 		func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
 			hostPort := req.Host
 			if _, _, err := net.SplitHostPort(hostPort); err != nil {
-				hostPort = net.JoinHostPort(hostPort, "80")
+				port := "80"
+				if req.URL.Scheme == "https" {
+					port = "443"
+				}
+				hostPort = net.JoinHostPort(hostPort, port)
 			}
 			if mapped, ok := s.resolveDomain(hostPort); ok {
-				log.Printf("[vtunnel-proxy] HTTP %s %s -> %s", req.Method, hostPort, mapped)
+				log.Printf("[vtunnel-proxy] %s %s %s -> %s", req.URL.Scheme, req.Method, hostPort, mapped)
 				req.URL.Host = mapped
+				req.URL.Scheme = "http"
 			}
 			return req, nil
 		})
