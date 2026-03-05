@@ -73,6 +73,7 @@ vtunnel server [flags]
 |------|-------------|---------|
 | `-port` | WebSocket listen port | `3001` |
 | `-proxy` | HTTP CONNECT proxy port (0 = disabled) | `0` |
+| `-proxy-mitm-ca` | PEM file with CA cert+key for HTTPS MITM interception | none |
 | `-client-key` | Client public key (`vt-pub-...`). Also `$VTUNNEL_CLIENT_KEY`. | none |
 
 ### Client
@@ -164,6 +165,20 @@ git clone https://gitlab.example.com/repo
   -> HTTPS_PROXY -> CONNECT gitlab.example.com:443
     -> proxy lookup -> vtunnel -> client -> gitlab.example.com:443
 ```
+
+### HTTPS MITM Interception
+
+By default, the proxy creates a transparent TCP tunnel for HTTPS (CONNECT) — the TLS connection goes end-to-end between the client and the remote server. This works for passthrough where the backend speaks TLS too (e.g. `gitlab.example.com:443=gitlab.example.com:443`), but **fails** when the backend is plain HTTP (e.g. `gitlab.example.com=localhost:8080`) — the client tries TLS, but the backend doesn't speak it.
+
+To intercept HTTPS traffic and route it to plain HTTP backends, provide a CA certificate with `-proxy-mitm-ca`:
+
+```bash
+vtunnel server -port 3001 -proxy 9090 -proxy-mitm-ca ca.pem
+```
+
+The proxy will terminate TLS for mapped domains, generate certificates on the fly signed by the provided CA, and forward decrypted requests to the backend as plain HTTP. Clients must trust the CA certificate for HTTPS to work without errors.
+
+The PEM file should contain both the CA certificate and private key.
 
 ### Usage in Containers
 
@@ -270,6 +285,7 @@ func main() {
 |--------|-------------|---------|
 | `WithClientKey(pubKey)` | Authorized client public key (`vt-pub-...`). | none |
 | `WithServerKeepAlive(d)` | SSH keepalive ping interval. | 30s |
+| `WithProxyMitmCA(cert)` | CA certificate for HTTPS MITM interception. | none |
 
 The server also exposes `StartProxy(addr)`, `CloseProxy()`, `SetDomainMapping(domain, target)`, and `RemoveDomainMapping(domain)` for proxy control.
 
