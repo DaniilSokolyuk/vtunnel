@@ -76,6 +76,8 @@ vtunnel server [flags]
 | `-proxy-mitm-ca` | PEM file with CA cert+key for HTTPS MITM interception | none |
 | `-client-key` | Client public key (`vt-pub-...`). Also `$VTUNNEL_CLIENT_KEY`. | none |
 
+The server also exposes a `/health` endpoint that returns `ok` for health checks.
+
 ### Client
 
 ```bash
@@ -126,9 +128,14 @@ vtunnel client -server ws://tunnel.example.com/ \
 # Domain with TLS termination
 vtunnel client -server ws://tunnel.example.com/ \
   -forward myalias.local=tls://www.google.com:443
+
+# Multiple domains to the same local port (service must route by Host header)
+vtunnel client -server ws://tunnel.example.com/ \
+  -forward gitlab.mycompany.com=localhost:6060 \
+  -forward jira.mycompany.com=localhost:6060
 ```
 
-Domain forwards require the server to run with `-proxy`. A domain without a port (e.g. `llmproxy.local`) matches both `:80` and `:443`.
+Domain forwards require the server to run with `-proxy`. A domain without a port (e.g. `gitlab.mycompany.com`) registers on both `:80` and `:443` in the proxy routing table. When multiple domains point to the same local port, the local service must distinguish requests by the `Host` header.
 
 ### Key Generation
 
