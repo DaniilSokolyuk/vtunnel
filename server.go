@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -221,7 +222,25 @@ func (s *Server) handleRequests(sshConn ssh.Conn, reqs <-chan *ssh.Request) {
 }
 
 // handleListen processes a listen request from the client.
-// Listeners are persistent at the Server level and reused across reconnects.
+//
+// Two modes of operation:
+//
+//  1. Port-based (Listen): req.Port is set, req.Domain is empty.
+//     Server opens the requested TCP port and tunnels all connections.
+//
+//  2. Domain-based (Forward): req.Port is 0, req.Domain is set.
+//     Server auto-allocates a free port and registers a proxy domain mapping
+//     so the HTTP/CONNECT proxy routes traffic for that domain through the tunnel.
+//
+// Listeners are persistent — they survive client reconnects. On reconnect
+// the client replays its Listen/Forward calls; existing listeners are reused.
+//
+// MITM + TLS targets: when the MITM CA is configured and the client's target
+// address (LocalAddr) has port 443, the server rewrites LocalAddr in the reply
+// to add a "tls://" prefix. This tells the client to establish TLS to the target,
+// so the MITM proxy can send decrypted plain HTTP through the tunnel while the
+// client re-encrypts it for the upstream server. Without MITM, the proxy does
+// a raw TCP passthrough and the client dials plain TCP (browser TLS goes end-to-end).
 func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	var req listenRequest
 	if err := json.Unmarshal(r.Payload, &req); err != nil {
@@ -233,6 +252,7 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	port := req.Port
 
 	s.listenersMu.Lock()
+	// Reuse existing listener on reconnect (client replays its forwards).
 	if port != 0 {
 		if _, exists := s.listeners[port]; exists {
 			s.listenersMu.Unlock()
@@ -242,6 +262,7 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 		}
 	}
 
+	// Port 0 = auto-allocate (used by Forward).
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -251,7 +272,6 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 		return
 	}
 
-	// For port 0, get the actual allocated port
 	if port == 0 {
 		port = ln.Addr().(*net.TCPAddr).Port
 	}
@@ -260,15 +280,24 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	s.listenersMu.Unlock()
 
 	log.Printf("[vtunnel-server] Listening on %s", ln.Addr())
-	r.Reply(true, marshalJSON(listenRequest{Port: port}))
 
-	// Register domain mapping for proxy
+	// Reply with the allocated port. When MITM is active and the client's
+	// target is a TLS endpoint (:443), rewrite LocalAddr to "tls://..." so
+	// the client wraps the tunnel connection in TLS (client-side TLS termination).
+	reply := listenRequest{Port: port}
+	if req.Domain != "" && s.mitmCA != nil && !strings.HasPrefix(req.LocalAddr, "tls://") {
+		if _, p, _ := net.SplitHostPort(req.LocalAddr); p == "443" {
+			reply.LocalAddr = "tls://" + req.LocalAddr
+		}
+	}
+	r.Reply(true, marshalJSON(reply))
+
+	// Register domain mapping for proxy.
 	target := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	if req.Domain != "" {
-		// Explicit domain from Forward()
 		_, _, err := net.SplitHostPort(req.Domain)
 		if err != nil {
-			// Domain without port — register for both :80 and :443
+			// Domain without port — register for both :80 and :443.
 			s.SetDomainMapping(net.JoinHostPort(req.Domain, "80"), target)
 			s.SetDomainMapping(net.JoinHostPort(req.Domain, "443"), target)
 		} else {
@@ -277,7 +306,7 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	}
 
 	// Start persistent accept loop — runs forever, uses getSSH() to
-	// wait for reconnects
+	// wait for reconnects.
 	go s.acceptLoop(ln, port)
 }
 

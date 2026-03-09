@@ -341,6 +341,11 @@ func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error 
 // sendListenWithDomain sends a listen request with port 0 (server auto-allocates)
 // and a domain hint for proxy mapping. It parses the reply to learn the actual
 // port and registers it in the forwards map.
+//
+// The server may rewrite LocalAddr in the reply (e.g. adding "tls://" prefix
+// when MITM is active for :443 targets). If present, the rewritten address
+// is used instead of the original — this enables client-side TLS termination
+// so that MITM-decrypted plain HTTP is re-encrypted before reaching the target.
 func (c *Client) sendListenWithDomain(sshConn ssh.Conn, localAddr, domain string) error {
 	payload := marshalJSON(listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain})
 	ok, resp, err := sshConn.SendRequest("listen", true, payload)
@@ -351,11 +356,16 @@ func (c *Client) sendListenWithDomain(sshConn ssh.Conn, localAddr, domain string
 		return fmt.Errorf("forward rejected: %s", string(resp))
 	}
 
-	// Server replies with the actual allocated port
+	// Server replies with the allocated port and optionally a rewritten
+	// LocalAddr (e.g. "tls://host:443" when MITM requires TLS wrapping).
 	var reply listenRequest
 	if err := json.Unmarshal(resp, &reply); err == nil && reply.Port > 0 {
+		addr := localAddr
+		if reply.LocalAddr != "" {
+			addr = reply.LocalAddr
+		}
 		c.mu.Lock()
-		c.forwards[reply.Port] = localAddr
+		c.forwards[reply.Port] = addr
 		c.mu.Unlock()
 	}
 

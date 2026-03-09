@@ -2,6 +2,7 @@ package vtunnel_test
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/elazarl/goproxy"
 )
 
 // TestDomainForwardHTTP tests domain-based forwarding through the HTTP proxy.
@@ -131,7 +133,7 @@ func TestDomainForwardCONNECT(t *testing.T) {
 }
 
 // TestDomainForwardSameDomainTarget tests forwarding where domain and target host match
-// (e.g. Forward("google.com:443", "google.com:443")) — real HTTPS request through the tunnel.
+// (e.g. Forward("google.com:443", "google.com:443")) — passthrough without MITM.
 func TestDomainForwardSameDomainTarget(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
@@ -342,4 +344,60 @@ func TestDomainForwardReconnect(t *testing.T) {
 		t.Fatalf("expected 'reconnect-ok', got %q", body)
 	}
 	t.Log("Domain forward survived reconnect")
+}
+
+// TestDomainForwardSameDomainTargetWithMitm tests that when MITM CA is configured,
+// forwarding to a TLS target (e.g. google.com:443 → google.com:443) works via
+// MITM + auto tls:// on the client side.
+func TestDomainForwardSameDomainTargetWithMitm(t *testing.T) {
+	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(goproxy.GoproxyCa))
+
+	proxyPort := freePort(t)
+	if err := server.StartProxy(fmt.Sprintf("127.0.0.1:%d", proxyPort)); err != nil {
+		t.Fatalf("StartProxy: %v", err)
+	}
+	defer server.CloseProxy()
+
+	tunnelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		server.HandleConn(conn)
+	}))
+	defer tunnelServer.Close()
+
+	client := vtunnel.NewClient(wsURL(tunnelServer))
+	if err := client.Connect(); err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer client.Close()
+
+	if err := client.Forward("google.com:443", "google.com:443"); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
+	httpClient := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+	}
+
+	resp, err := httpClient.Get("https://google.com/")
+	if err != nil {
+		t.Fatalf("GET https://google.com via tunnel with MITM: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		t.Fatalf("unexpected status: %d", resp.StatusCode)
+	}
+	t.Logf("https://google.com with MITM CA -> %d (passthrough expected)", resp.StatusCode)
 }
