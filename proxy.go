@@ -83,6 +83,7 @@ type proxyHandler struct {
 	server    *Server
 	certCache *certCache // nil when no MITM CA
 	transport http.Transport
+	h2cProbed sync.Map // target → bool
 }
 
 func (h *proxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -175,13 +176,41 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	h.serveMITMH1(tlsConn, mappedTarget)
 }
 
+func (h *proxyHandler) probeH2C(target string) bool {
+	if v, ok := h.h2cProbed.Load(target); ok {
+		return v.(bool)
+	}
+	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
+	if err != nil {
+		h.h2cProbed.Store(target, false)
+		return false
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	// HTTP/2 connection preface
+	if _, err := conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
+		h.h2cProbed.Store(target, false)
+		return false
+	}
+	buf := make([]byte, 9) // h2 frame header
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		h.h2cProbed.Store(target, false)
+		return false
+	}
+	ok := buf[3] == 0x04 // SETTINGS frame type
+	h.h2cProbed.Store(target, ok)
+	return ok
+}
+
 func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
-	// h2c transport — backend confirmed to support HTTP/2 via client probe
-	h2transport := &http2.Transport{
-		AllowHTTP: true,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			return net.DialTimeout(network, addr, 10*time.Second)
-		},
+	var rt http.RoundTripper = &h.transport
+	if h.probeH2C(target) {
+		rt = &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				return net.DialTimeout(network, addr, 10*time.Second)
+			},
+		}
 	}
 
 	h2srv := &http2.Server{}
@@ -192,14 +221,10 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 			r.RequestURI = ""
 			removeHopByHop(r.Header)
 
-			// Try h2c first (for gRPC/h2c backends), fallback to HTTP/1.1
-			resp, err := h2transport.RoundTrip(r)
+			resp, err := rt.RoundTrip(r)
 			if err != nil {
-				resp, err = h.transport.RoundTrip(r)
-				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadGateway)
-					return
-				}
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
 			}
 			defer resp.Body.Close()
 
@@ -208,14 +233,12 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 					w.Header().Add(k, v)
 				}
 			}
-			// Declare trailers so HTTP/2 knows to expect them
 			for k := range resp.Trailer {
 				w.Header().Add("Trailer", k)
 			}
 			removeHopByHop(w.Header())
 			w.WriteHeader(resp.StatusCode)
 			flushingCopy(w, resp.Body)
-			// Forward trailers (populated after body is read)
 			for k, vv := range resp.Trailer {
 				for _, v := range vv {
 					w.Header().Set(http.TrailerPrefix+k, v)
