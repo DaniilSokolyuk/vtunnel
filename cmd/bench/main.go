@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"flag"
 	"fmt"
 	"io"
@@ -28,6 +29,7 @@ var wsUpgrader = websocket.Upgrader{
 func main() {
 	sizeStr := flag.String("size", "1GB", "data to transfer per connection (e.g. 100MB, 1GB, 10GB)")
 	numConns := flag.Int("c", 1, "number of parallel connections")
+	mode := flag.String("mode", "all", "benchmark mode: direct, proxy, all")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
@@ -61,7 +63,7 @@ func main() {
 		return
 	}
 
-	fmt.Printf("vtunnel bench\n")
+	fmt.Printf("vtunnel bench (mode=%s)\n", *mode)
 	fmt.Printf("  size: %s x %d conn\n", fmtSize(totalBytes), *numConns)
 	fmt.Printf("  auth: ed25519\n\n")
 
@@ -93,33 +95,13 @@ func main() {
 	}
 	defer client.Close()
 
-	// Setup tunnel ports
-	upPort := freePort()
-	downPort := freePort()
-	if err := client.Listen(upPort, sinkLn.Addr().String()); err != nil {
-		fmt.Printf("listen error: %v\n", err)
-		return
+	if *mode == "direct" || *mode == "all" {
+		runDirect(srv, client, sinkLn, sourceLn, totalBytes, *numConns)
 	}
-	if err := client.Listen(downPort, sourceLn.Addr().String()); err != nil {
-		fmt.Printf("listen error: %v\n", err)
-		return
+
+	if *mode == "proxy" || *mode == "all" {
+		runProxy(srv, client, sinkLn, sourceLn, totalBytes, *numConns)
 	}
-	time.Sleep(100 * time.Millisecond)
-
-	// 1. Upload only
-	bench("upload", totalBytes, *numConns, []stream{{port: upPort, upload: true}})
-
-	// 2. Download only
-	bench("download", totalBytes, *numConns, []stream{{port: downPort, upload: false}})
-
-	// 3. Both sequential (upload then download on each connection)
-	bench("upload+download", totalBytes, *numConns, []stream{
-		{port: upPort, upload: true},
-		{port: downPort, upload: false},
-	})
-
-	// 4. Both parallel (upload and download simultaneously)
-	benchParallel("upload+download parallel", totalBytes, *numConns, upPort, downPort)
 
 	// Memory profile
 	if *memprofile != "" {
@@ -134,8 +116,66 @@ func main() {
 	}
 }
 
+func runDirect(_ *vtunnel.Server, client *vtunnel.Client, sinkLn, sourceLn net.Listener, totalBytes int64, numConns int) {
+	fmt.Printf("=== direct (TCP) ===\n\n")
+
+	upPort := freePort()
+	downPort := freePort()
+	if err := client.Listen(upPort, sinkLn.Addr().String()); err != nil {
+		fmt.Printf("listen error: %v\n", err)
+		return
+	}
+	if err := client.Listen(downPort, sourceLn.Addr().String()); err != nil {
+		fmt.Printf("listen error: %v\n", err)
+		return
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	bench("upload", totalBytes, numConns, []stream{{port: upPort, upload: true}})
+	bench("download", totalBytes, numConns, []stream{{port: downPort, upload: false}})
+	bench("upload+download", totalBytes, numConns, []stream{
+		{port: upPort, upload: true},
+		{port: downPort, upload: false},
+	})
+	benchParallel("upload+download parallel", totalBytes, numConns, upPort, downPort)
+}
+
+func runProxy(srv *vtunnel.Server, client *vtunnel.Client, sinkLn, sourceLn net.Listener, totalBytes int64, numConns int) {
+	fmt.Printf("=== proxy (CONNECT) ===\n\n")
+
+	proxyPort := freePort()
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	if err := srv.StartProxy(proxyAddr); err != nil {
+		fmt.Printf("proxy error: %v\n", err)
+		return
+	}
+	defer srv.CloseProxy()
+
+	if err := client.Forward("sink.bench", sinkLn.Addr().String()); err != nil {
+		fmt.Printf("forward error: %v\n", err)
+		return
+	}
+	if err := client.Forward("source.bench", sourceLn.Addr().String()); err != nil {
+		fmt.Printf("forward error: %v\n", err)
+		return
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	benchProxy("upload", totalBytes, numConns, proxyAddr,
+		[]proxyStream{{host: "sink.bench:443", upload: true}})
+	benchProxy("download", totalBytes, numConns, proxyAddr,
+		[]proxyStream{{host: "source.bench:443", upload: false}})
+	benchProxyParallel("upload+download parallel", totalBytes, numConns, proxyAddr,
+		"sink.bench:443", "source.bench:443")
+}
+
 type stream struct {
 	port   int
+	upload bool
+}
+
+type proxyStream struct {
+	host   string
 	upload bool
 }
 
@@ -195,6 +235,60 @@ func benchParallel(name string, perConn int64, numConns int, upPort, downPort in
 	printResult(&transferred, start, numConns, 2)
 }
 
+func benchProxy(name string, perConn int64, numConns int, proxyAddr string, streams []proxyStream) {
+	total := perConn * int64(numConns) * int64(len(streams))
+	fmt.Printf("--- %s ---\n", name)
+
+	var transferred atomic.Int64
+	start := time.Now()
+
+	done := make(chan struct{})
+	go progress(&transferred, total, done)
+
+	var wg sync.WaitGroup
+	for range numConns {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, s := range streams {
+				transferViaProxy(proxyAddr, s.host, perConn, s.upload, &transferred)
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(done)
+	printResult(&transferred, start, numConns, len(streams))
+}
+
+func benchProxyParallel(name string, perConn int64, numConns int, proxyAddr, upHost, downHost string) {
+	total := perConn * int64(numConns) * 2
+	fmt.Printf("--- %s ---\n", name)
+
+	var transferred atomic.Int64
+	start := time.Now()
+
+	done := make(chan struct{})
+	go progress(&transferred, total, done)
+
+	var wg sync.WaitGroup
+	for range numConns {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			transferViaProxy(proxyAddr, upHost, perConn, true, &transferred)
+		}()
+		go func() {
+			defer wg.Done()
+			transferViaProxy(proxyAddr, downHost, perConn, false, &transferred)
+		}()
+	}
+
+	wg.Wait()
+	close(done)
+	printResult(&transferred, start, numConns, 2)
+}
+
 func transfer(port int, size int64, upload bool, counter *atomic.Int64) {
 	conn, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -202,7 +296,34 @@ func transfer(port int, size int64, upload bool, counter *atomic.Int64) {
 		return
 	}
 	defer conn.Close()
+	pipeData(conn, conn, size, upload, counter)
+}
 
+func transferViaProxy(proxyAddr, host string, size int64, upload bool, counter *atomic.Int64) {
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		fmt.Printf("dial proxy error: %v\n", err)
+		return
+	}
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", host, host)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		fmt.Printf("CONNECT error: %v\n", err)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("CONNECT status: %d\n", resp.StatusCode)
+		return
+	}
+
+	pipeData(br, conn, size, upload, counter)
+}
+
+func pipeData(r io.Reader, w io.Writer, size int64, upload bool, counter *atomic.Int64) {
 	buf := make([]byte, 64*1024)
 	var done int64
 
@@ -212,16 +333,16 @@ func transfer(port int, size int64, upload bool, counter *atomic.Int64) {
 			if rem := size - done; rem < n {
 				n = rem
 			}
-			w, err := conn.Write(buf[:n])
+			nw, err := w.Write(buf[:n])
 			if err != nil {
 				return
 			}
-			done += int64(w)
-			counter.Add(int64(w))
+			done += int64(nw)
+			counter.Add(int64(nw))
 		}
 	} else {
 		for done < size {
-			n, err := conn.Read(buf)
+			n, err := r.Read(buf)
 			if err != nil {
 				return
 			}
