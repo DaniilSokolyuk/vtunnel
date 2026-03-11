@@ -1,7 +1,6 @@
 package vtunnel
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -277,7 +276,7 @@ func (c *Client) dialTarget(addr string) (net.Conn, error) {
 			return nil, err
 		}
 		setTCPOptions(conn)
-		return newHostRewriteConn(conn, host), nil
+		return conn, nil
 	}
 	conn, err := net.DialTimeout("tcp", addr, defaultDialTimeout)
 	if err != nil {
@@ -285,43 +284,6 @@ func (c *Client) dialTarget(addr string) (net.Conn, error) {
 	}
 	setTCPOptions(conn)
 	return conn, nil
-}
-
-// hostRewriteConn wraps a net.Conn and rewrites the HTTP Host header.
-type hostRewriteConn struct {
-	net.Conn
-	host    string
-	hostBin []byte
-}
-
-func newHostRewriteConn(conn net.Conn, host string) *hostRewriteConn {
-	return &hostRewriteConn{
-		Conn:    conn,
-		host:    host,
-		hostBin: []byte("Host: " + host + "\r\n"),
-	}
-}
-
-func (c *hostRewriteConn) Write(p []byte) (int, error) {
-	const prefix = "\r\nHost: "
-	start := bytes.Index(p, []byte(prefix))
-	if start == -1 {
-		return c.Conn.Write(p)
-	}
-	valueStart := start + len(prefix)
-	end := bytes.Index(p[valueStart:], []byte("\r\n"))
-	if end == -1 {
-		return c.Conn.Write(p)
-	}
-	var rewritten []byte
-	rewritten = append(rewritten, p[:start+2]...)
-	rewritten = append(rewritten, c.hostBin...)
-	rewritten = append(rewritten, p[valueStart+end+2:]...)
-	_, err := c.Conn.Write(rewritten)
-	if err != nil {
-		return 0, err
-	}
-	return len(p), nil
 }
 
 // sendListen sends a listen request via SSH.

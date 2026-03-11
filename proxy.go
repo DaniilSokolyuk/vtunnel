@@ -203,20 +203,44 @@ func (h *proxyHandler) probeH2C(target string) bool {
 }
 
 func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
-	var rt http.RoundTripper = &h.transport
-	if h.probeH2C(target) {
+	var rt http.RoundTripper
+	scheme := "http"
+
+	if tlsHost, ok := h.server.tlsUpstreamHost(target); ok {
+		// Proxy-side TLS: connect to tunnel port, do TLS with real server's hostname.
+		scheme = "https"
+		rt = &http2.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+				conn, err := net.DialTimeout(network, target, 10*time.Second)
+				if err != nil {
+					return nil, err
+				}
+				tlsC := tls.Client(conn, &tls.Config{
+					ServerName: tlsHost,
+					NextProtos: []string{"h2"},
+				})
+				if err := tlsC.HandshakeContext(ctx); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				return tlsC, nil
+			},
+		}
+	} else if h.probeH2C(target) {
 		rt = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 				return net.DialTimeout(network, addr, 10*time.Second)
 			},
 		}
+	} else {
+		rt = &h.transport
 	}
 
 	h2srv := &http2.Server{}
 	h2srv.ServeConn(tlsConn, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r.URL.Scheme = "http"
+			r.URL.Scheme = scheme
 			r.URL.Host = target
 			r.RequestURI = ""
 			removeHopByHop(r.Header)
@@ -249,6 +273,31 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 }
 
 func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string) {
+	var transport *http.Transport
+
+	if tlsHost, ok := h.server.tlsUpstreamHost(target); ok {
+		// Proxy-side TLS: connect to tunnel port, do TLS with real server's hostname.
+		transport = &http.Transport{
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := net.DialTimeout(network, target, 10*time.Second)
+				if err != nil {
+					return nil, err
+				}
+				tlsC := tls.Client(conn, &tls.Config{
+					ServerName: tlsHost,
+					NextProtos: []string{"http/1.1"},
+				})
+				if err := tlsC.HandshakeContext(ctx); err != nil {
+					conn.Close()
+					return nil, err
+				}
+				return tlsC, nil
+			},
+		}
+	} else {
+		transport = &h.transport
+	}
+
 	br := bufio.NewReader(tlsConn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -256,12 +305,16 @@ func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string) {
 			return
 		}
 
-		req.URL.Scheme = "http"
+		if transport != &h.transport {
+			req.URL.Scheme = "https"
+		} else {
+			req.URL.Scheme = "http"
+		}
 		req.URL.Host = target
 		req.RequestURI = ""
 		removeHopByHop(req.Header)
 
-		resp, err := h.transport.RoundTrip(req)
+		resp, err := transport.RoundTrip(req)
 		if err != nil {
 			resp = &http.Response{
 				StatusCode: http.StatusBadGateway,
