@@ -399,6 +399,102 @@ func TestProxyHTTP2Mitm(t *testing.T) {
 	pw.Close()
 }
 
+// TestProxyMitmHTTP2Inner tests MITM where the client speaks HTTP/2 inside the
+// TLS tunnel (like gRPC does). The proxy must negotiate h2 via ALPN and serve
+// HTTP/2 on the decrypted connection, not just HTTP/1.1.
+func TestProxyMitmHTTP2Inner(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/grpc")
+		fmt.Fprint(w, "grpc-ok")
+	}))
+	defer backend.Close()
+
+	ca := generateTestCA(t)
+	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxyPort := freePort(t)
+	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
+	if err := server.StartProxy(proxyAddr); err != nil {
+		t.Fatalf("StartProxy error: %v", err)
+	}
+	defer server.CloseProxy()
+
+	server.SetDomainMapping("grpc.test:443", backend.Listener.Addr().String())
+
+	// Connect to proxy, send CONNECT, get a raw tunnel
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial proxy: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	fmt.Fprintf(conn, "CONNECT grpc.test:443 HTTP/1.1\r\nHost: grpc.test:443\r\n\r\n")
+	br := bufio.NewReader(conn)
+	status, _ := br.ReadString('\n')
+	if !strings.Contains(status, "200") {
+		t.Fatalf("CONNECT failed: %s", status)
+	}
+	for {
+		line, _ := br.ReadString('\n')
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	// Wrap buffered reader + conn as net.Conn for TLS
+	tunnelConn := newBufConn(conn, br)
+
+	// TLS handshake requesting h2 via ALPN
+	tlsConn := tls.Client(tunnelConn, &tls.Config{
+		InsecureSkipVerify: true,
+		ServerName:         "grpc.test",
+		NextProtos:         []string{"h2"},
+	})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatalf("TLS handshake: %v", err)
+	}
+
+	negotiated := tlsConn.ConnectionState().NegotiatedProtocol
+	if negotiated != "h2" {
+		t.Fatalf("Expected ALPN h2, got %q", negotiated)
+	}
+
+	// Use HTTP/2 client transport over the TLS connection
+	h2t := &http2.Transport{}
+	h2cc, err := h2t.NewClientConn(tlsConn)
+	if err != nil {
+		t.Fatalf("h2 client conn: %v", err)
+	}
+
+	req, _ := http.NewRequest("POST", "https://grpc.test/test.Service/Method", nil)
+	req.Header.Set("Content-Type", "application/grpc")
+	resp, err := h2cc.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("h2 RoundTrip: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "grpc-ok" {
+		t.Fatalf("Expected 'grpc-ok', got %q", body)
+	}
+	t.Logf("HTTP/2 inside MITM tunnel: OK (ALPN=%s)", negotiated)
+}
+
+// bufConn wraps a net.Conn with a bufio.Reader to drain buffered data first.
+type bufConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func newBufConn(c net.Conn, r *bufio.Reader) *bufConn {
+	return &bufConn{Conn: c, r: r}
+}
+
+func (c *bufConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
+
 // newHTTP2Conn wraps a pipe writer (request body) and response body into an io.ReadWriteCloser.
 type http2Conn struct {
 	w *io.PipeWriter

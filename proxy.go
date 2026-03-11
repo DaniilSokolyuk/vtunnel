@@ -156,9 +156,10 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 		defer rawConn.Close()
 	}
 
-	// TLS handshake as server with generated cert
+	// TLS handshake as server with generated cert, offering h2 and http/1.1
 	tlsConn := tls.Server(rawConn, &tls.Config{
 		GetCertificate: h.certCache.getCert,
+		NextProtos:     []string{"h2", "http/1.1"},
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		log.Printf("[vtunnel-proxy] MITM TLS handshake failed: %v", err)
@@ -166,7 +167,43 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	}
 	defer tlsConn.Close()
 
-	// Read HTTP requests from the decrypted TLS connection and forward to backend
+	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+		h.serveMITMH2(tlsConn, mappedTarget)
+		return
+	}
+
+	h.serveMITMH1(tlsConn, mappedTarget)
+}
+
+func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
+	h2srv := &http2.Server{}
+	h2srv.ServeConn(tlsConn, &http2.ServeConnOpts{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.URL.Scheme = "http"
+			r.URL.Host = target
+			r.RequestURI = ""
+			removeHopByHop(r.Header)
+
+			resp, err := h.transport.RoundTrip(r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer resp.Body.Close()
+
+			for k, vv := range resp.Header {
+				for _, v := range vv {
+					w.Header().Add(k, v)
+				}
+			}
+			removeHopByHop(w.Header())
+			w.WriteHeader(resp.StatusCode)
+			io.Copy(w, resp.Body)
+		}),
+	})
+}
+
+func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string) {
 	br := bufio.NewReader(tlsConn)
 	for {
 		req, err := http.ReadRequest(br)
@@ -175,7 +212,7 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 		}
 
 		req.URL.Scheme = "http"
-		req.URL.Host = mappedTarget
+		req.URL.Host = target
 		req.RequestURI = ""
 		removeHopByHop(req.Header)
 
