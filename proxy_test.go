@@ -16,6 +16,7 @@ import (
 
 	"github.com/DaniilSokolyuk/vtunnel"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 func TestProxyPlainHTTPMapped(t *testing.T) {
@@ -403,10 +404,12 @@ func TestProxyHTTP2Mitm(t *testing.T) {
 // TLS tunnel (like gRPC does). The proxy must negotiate h2 via ALPN and serve
 // HTTP/2 on the decrypted connection, not just HTTP/1.1.
 func TestProxyMitmHTTP2Inner(t *testing.T) {
-	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// h2c backend (HTTP/2 cleartext)
+	h2cHandler := h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/grpc")
 		fmt.Fprint(w, "grpc-ok")
-	}))
+	}), &http2.Server{})
+	backend := httptest.NewServer(h2cHandler)
 	defer backend.Close()
 
 	ca := generateTestCA(t)

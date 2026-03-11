@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -156,7 +157,6 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 		defer rawConn.Close()
 	}
 
-	// TLS handshake as server with generated cert, offering h2 and http/1.1
 	tlsConn := tls.Server(rawConn, &tls.Config{
 		GetCertificate: h.certCache.getCert,
 		NextProtos:     []string{"h2", "http/1.1"},
@@ -176,6 +176,14 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 }
 
 func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
+	// h2c transport — backend confirmed to support HTTP/2 via client probe
+	h2transport := &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+			return net.DialTimeout(network, addr, 10*time.Second)
+		},
+	}
+
 	h2srv := &http2.Server{}
 	h2srv.ServeConn(tlsConn, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -184,10 +192,14 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 			r.RequestURI = ""
 			removeHopByHop(r.Header)
 
-			resp, err := h.transport.RoundTrip(r)
+			// Try h2c first (for gRPC/h2c backends), fallback to HTTP/1.1
+			resp, err := h2transport.RoundTrip(r)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
+				resp, err = h.transport.RoundTrip(r)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadGateway)
+					return
+				}
 			}
 			defer resp.Body.Close()
 
@@ -196,9 +208,19 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 					w.Header().Add(k, v)
 				}
 			}
+			// Declare trailers so HTTP/2 knows to expect them
+			for k := range resp.Trailer {
+				w.Header().Add("Trailer", k)
+			}
 			removeHopByHop(w.Header())
 			w.WriteHeader(resp.StatusCode)
-			io.Copy(w, resp.Body)
+			flushingCopy(w, resp.Body)
+			// Forward trailers (populated after body is read)
+			for k, vv := range resp.Trailer {
+				for _, v := range vv {
+					w.Header().Set(http.TrailerPrefix+k, v)
+				}
+			}
 		}),
 	})
 }
