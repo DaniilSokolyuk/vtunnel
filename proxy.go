@@ -106,7 +106,7 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// MITM path: intercept TLS for mapped domains
 	if h.certCache != nil && isMapped {
 		log.Printf("[vtunnel-proxy] CONNECT MITM %s", hostPort)
-		h.handleConnectMITM(w, r, mapped)
+		h.handleConnectMITM(w, r, hostPort, mapped)
 		return
 	}
 
@@ -134,7 +134,7 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, mappedTarget string) {
+func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string) {
 	// Get a net.Conn to the client — works for both HTTP/1.x and HTTP/2
 	var rawConn net.Conn
 
@@ -160,9 +160,12 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 		defer rawConn.Close()
 	}
 
+	connectHost := hostFromAuthority(connectAuthority)
 	tlsConn := tls.Server(rawConn, &tls.Config{
-		GetCertificate: h.certCache.getCert,
-		NextProtos:     []string{"h2", "http/1.1"},
+		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			return h.certCache.getCert(hello, connectHost)
+		},
+		NextProtos: []string{"h2", "http/1.1"},
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		log.Printf("[vtunnel-proxy] MITM TLS handshake failed: %v", err)
@@ -245,7 +248,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 			r.URL.Scheme = scheme
 			r.URL.Host = target
 			r.RequestURI = ""
-			removeHopByHop(r.Header)
+			removeHopByHop(r.Header, true)
 
 			resp, err := rt.RoundTrip(r)
 			if err != nil {
@@ -262,7 +265,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 			for k := range resp.Trailer {
 				w.Header().Add("Trailer", k)
 			}
-			removeHopByHop(w.Header())
+			removeHopByHop(w.Header(), false)
 			w.WriteHeader(resp.StatusCode)
 			flushingCopy(w, resp.Body)
 			for k, vv := range resp.Trailer {
@@ -314,7 +317,7 @@ func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string) {
 		}
 		req.URL.Host = target
 		req.RequestURI = ""
-		removeHopByHop(req.Header)
+		removeHopByHop(req.Header, false)
 
 		resp, err := transport.RoundTrip(req)
 		if err != nil {
@@ -363,7 +366,7 @@ func (h *proxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	r.ProtoMajor = 1
 	r.ProtoMinor = 1
 	r.RequestURI = ""
-	removeHopByHop(r.Header)
+	removeHopByHop(r.Header, false)
 
 	resp, err := h.transport.RoundTrip(r)
 	if err != nil {
@@ -377,7 +380,7 @@ func (h *proxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
-	removeHopByHop(w.Header())
+	removeHopByHop(w.Header(), false)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
 }
@@ -540,23 +543,56 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
 }
 
+func hostFromAuthority(authority string) string {
+	if authority == "" {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(authority)
+	if err == nil {
+		return host
+	}
+	return strings.Trim(authority, "[]")
+}
+
 var hopByHopHeaders = []string{
 	"Connection",
 	"Keep-Alive",
 	"Proxy-Authenticate",
 	"Proxy-Authorization",
 	"Proxy-Connection",
-	"Te",
 	"Trailer",
 	"Transfer-Encoding",
 	"Upgrade",
 }
 
-func removeHopByHop(h http.Header) {
+func removeHopByHop(h http.Header, preserveTeTrailers bool) {
 	for _, key := range strings.Split(h.Get("Connection"), ",") {
 		h.Del(strings.TrimSpace(key))
 	}
 	for _, key := range hopByHopHeaders {
 		h.Del(key)
 	}
+
+	if preserveTeTrailers && hasOnlyTrailersToken(h.Values("Te")) {
+		h.Set("Te", "trailers")
+		return
+	}
+	h.Del("Te")
+}
+
+func hasOnlyTrailersToken(values []string) bool {
+	if len(values) == 0 {
+		return false
+	}
+
+	for _, v := range values {
+		for _, token := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "trailers") {
+				continue
+			}
+			return false
+		}
+	}
+
+	return true
 }

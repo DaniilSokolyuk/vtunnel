@@ -29,8 +29,12 @@ func newCertCache(ca tls.Certificate) (*certCache, error) {
 }
 
 // getCert returns a TLS certificate for the given ClientHello, generating one if needed.
-func (c *certCache) getCert(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+// If SNI is absent, fallbackHost is used (for CONNECT authorities like host:port).
+func (c *certCache) getCert(hello *tls.ClientHelloInfo, fallbackHost string) (*tls.Certificate, error) {
 	host := hello.ServerName
+	if host == "" {
+		host = fallbackHost
+	}
 	if host == "" {
 		host = "localhost"
 	}
