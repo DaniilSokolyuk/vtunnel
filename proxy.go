@@ -148,7 +148,9 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 		defer clientConn.Close()
 		brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 		brw.Flush()
-		rawConn = clientConn
+		// net/http may have already buffered tunneled bytes after CONNECT headers.
+		// Keep reading through that buffer so TLS handshake bytes are not dropped.
+		rawConn = newBufferedConn(clientConn, brw.Reader)
 	default: // HTTP/2+
 		w.WriteHeader(http.StatusOK)
 		if err := http.NewResponseController(w).Flush(); err != nil {
@@ -209,23 +211,23 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 	if tlsHost, ok := h.server.tlsUpstreamHost(target); ok {
 		// Proxy-side TLS: connect to tunnel port, do TLS with real server's hostname.
 		scheme = "https"
-		rt = &http2.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				conn, err := net.DialTimeout(network, target, 10*time.Second)
-				if err != nil {
-					return nil, err
-				}
-				tlsC := tls.Client(conn, &tls.Config{
-					ServerName: tlsHost,
-					NextProtos: []string{"h2"},
-				})
-				if err := tlsC.HandshakeContext(ctx); err != nil {
-					conn.Close()
-					return nil, err
-				}
-				return tlsC, nil
-			},
+		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		transport := h.transport.Clone()
+		transport.ForceAttemptHTTP2 = true
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, network, target)
 		}
+		transport.DialTLSContext = nil
+
+		if transport.TLSClientConfig == nil {
+			transport.TLSClientConfig = &tls.Config{}
+		} else {
+			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		}
+		transport.TLSClientConfig.ServerName = tlsHost
+		transport.TLSClientConfig.NextProtos = []string{"h2", "http/1.1"}
+
+		rt = transport
 	} else if h.probeH2C(target) {
 		rt = &http2.Transport{
 			AllowHTTP: true,
@@ -522,6 +524,21 @@ type h2Addr struct{}
 
 func (h2Addr) Network() string { return "h2" }
 func (h2Addr) String() string  { return "h2-stream" }
+
+// bufferedConn reads via a bufio.Reader first so bytes already buffered by
+// net/http are not lost when the connection is handed over.
+type bufferedConn struct {
+	net.Conn
+	r *bufio.Reader
+}
+
+func newBufferedConn(c net.Conn, r *bufio.Reader) *bufferedConn {
+	return &bufferedConn{Conn: c, r: r}
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.r.Read(p)
+}
 
 var hopByHopHeaders = []string{
 	"Connection",
