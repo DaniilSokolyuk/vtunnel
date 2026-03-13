@@ -47,6 +47,12 @@ type Server struct {
 
 	// MITM CA certificate for HTTPS interception (nil = transparent tunnel)
 	mitmCA *tls.Certificate
+
+	// tlsUpstream tracks tunnel targets that need proxy-side TLS.
+	// Key: "127.0.0.1:<tunnelPort>", Value: original hostname (for SNI).
+	// Populated by handleListen when MITM is active and target port is 443.
+	tlsUpstream   map[string]string
+	tlsUpstreamMu sync.RWMutex
 }
 
 // ServerOption configures a Server.
@@ -86,10 +92,11 @@ func WithClientKey(pubKey string) ServerOption {
 // NewServer creates a new vtunnel server.
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
-		keepAlive: defaultKeepAlive,
-		connReady: make(chan struct{}),
-		listeners: make(map[int]net.Listener),
-		domainMap: make(map[string]string),
+		keepAlive:   defaultKeepAlive,
+		connReady:   make(chan struct{}),
+		listeners:   make(map[int]net.Listener),
+		domainMap:   make(map[string]string),
+		tlsUpstream: make(map[string]string),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -281,19 +288,23 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 
 	log.Printf("[vtunnel-server] Listening on %s", ln.Addr())
 
-	// Reply with the allocated port. When MITM is active and the client's
-	// target is a TLS endpoint (:443), rewrite LocalAddr to "tls://..." so
-	// the client wraps the tunnel connection in TLS (client-side TLS termination).
+	// Reply with the allocated port (no LocalAddr rewrite — client dials plain TCP).
 	reply := listenRequest{Port: port}
-	if req.Domain != "" && s.mitmCA != nil && !strings.HasPrefix(req.LocalAddr, "tls://") {
-		if _, p, _ := net.SplitHostPort(req.LocalAddr); p == "443" {
-			reply.LocalAddr = "tls://" + req.LocalAddr
-		}
-	}
 	r.Reply(true, marshalJSON(reply))
 
 	// Register domain mapping for proxy.
 	target := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+
+	// When MITM is active and the client's target is a TLS endpoint (:443),
+	// record the hostname so the proxy can do TLS through the tunnel itself
+	// (controlling ALPN), instead of relying on client-side TLS.
+	if req.Domain != "" && s.mitmCA != nil && !strings.HasPrefix(req.LocalAddr, "tls://") {
+		if host, p, _ := net.SplitHostPort(req.LocalAddr); p == "443" {
+			s.tlsUpstreamMu.Lock()
+			s.tlsUpstream[target] = host
+			s.tlsUpstreamMu.Unlock()
+		}
+	}
 	if req.Domain != "" {
 		_, _, err := net.SplitHostPort(req.Domain)
 		if err != nil {
@@ -308,6 +319,15 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	// Start persistent accept loop — runs forever, uses getSSH() to
 	// wait for reconnects.
 	go s.acceptLoop(ln, port)
+}
+
+// tlsUpstreamHost returns the original hostname for a tunnel target
+// that needs proxy-side TLS (e.g. "google.com" for target "127.0.0.1:54321").
+func (s *Server) tlsUpstreamHost(target string) (string, bool) {
+	s.tlsUpstreamMu.RLock()
+	host, ok := s.tlsUpstream[target]
+	s.tlsUpstreamMu.RUnlock()
+	return host, ok
 }
 
 // acceptLoop accepts TCP connections and tunnels them through SSH channels.

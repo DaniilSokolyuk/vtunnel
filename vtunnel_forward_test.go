@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/DaniilSokolyuk/vtunnel"
-	"github.com/elazarl/goproxy"
 )
 
 // TestDomainForwardHTTP tests domain-based forwarding through the HTTP proxy.
@@ -350,7 +349,8 @@ func TestDomainForwardReconnect(t *testing.T) {
 // forwarding to a TLS target (e.g. google.com:443 → google.com:443) works via
 // MITM + auto tls:// on the client side.
 func TestDomainForwardSameDomainTargetWithMitm(t *testing.T) {
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(goproxy.GoproxyCa))
+	ca := generateTestCA(t)
+	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
 
 	proxyPort := freePort(t)
 	if err := server.StartProxy(fmt.Sprintf("127.0.0.1:%d", proxyPort)); err != nil {
