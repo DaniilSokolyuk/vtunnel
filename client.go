@@ -246,12 +246,6 @@ func (c *Client) dialOnce() error {
 	return nil
 }
 
-func (c *Client) setH2CC(cc *http2.ClientConn) {
-	c.connMu.Lock()
-	c.h2cc = cc
-	c.connMu.Unlock()
-}
-
 func (c *Client) getH2CC() *http2.ClientConn {
 	c.connMu.RLock()
 	cc := c.h2cc
@@ -298,27 +292,35 @@ func (c *Client) doRoundTrip(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-// sendListen sends a listen request to the server.
-func (c *Client) sendListen(port int, localAddr string) error {
-	body, _ := json.Marshal(listenRequest{Port: port, LocalAddr: localAddr})
-	req, _ := http.NewRequest("POST", "http://vtunnel/listen", bytes.NewReader(body))
+// sendControl sends a control request (listen/forward) to the server and returns the response.
+func (c *Client) sendControl(endpoint string, lr listenRequest) (listenResponse, error) {
+	body, _ := json.Marshal(lr)
+	req, _ := http.NewRequest("POST", "http://vtunnel/"+endpoint, bytes.NewReader(body))
 	c.setAuthHeader(req)
 
 	resp, err := c.doRoundTrip(req)
 	if err != nil {
-		return fmt.Errorf("listen request: %w", err)
+		return listenResponse{}, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("authentication failed")
+		return listenResponse{}, fmt.Errorf("authentication failed")
 	}
 
 	var result listenResponse
 	json.NewDecoder(resp.Body).Decode(&result)
-
 	if !result.OK {
-		return fmt.Errorf("listen rejected: %s", result.Error)
+		return result, fmt.Errorf("%s rejected: %s", endpoint, result.Error)
+	}
+	return result, nil
+}
+
+// sendListen sends a listen request to the server.
+func (c *Client) sendListen(port int, localAddr string) error {
+	_, err := c.sendControl("listen", listenRequest{Port: port, LocalAddr: localAddr})
+	if err != nil {
+		return err
 	}
 	log.Printf("[vtunnel-client] Listen OK: port=%d", port)
 	return nil
@@ -328,25 +330,9 @@ func (c *Client) sendListen(port int, localAddr string) error {
 // and a domain hint for proxy mapping. It parses the reply to learn the actual
 // port and registers it in the forwards map.
 func (c *Client) sendListenWithDomain(localAddr, domain string) error {
-	body, _ := json.Marshal(listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain})
-	req, _ := http.NewRequest("POST", "http://vtunnel/forward", bytes.NewReader(body))
-	c.setAuthHeader(req)
-
-	resp, err := c.doRoundTrip(req)
+	result, err := c.sendControl("forward", listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain})
 	if err != nil {
-		return fmt.Errorf("forward request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("authentication failed")
-	}
-
-	var result listenResponse
-	json.NewDecoder(resp.Body).Decode(&result)
-
-	if !result.OK {
-		return fmt.Errorf("forward rejected: %s", result.Error)
+		return err
 	}
 
 	// Server replies with the allocated port and optionally a rewritten LocalAddr.
@@ -382,31 +368,26 @@ func (c *Client) openTunnelStream(ctx context.Context) error {
 		c.signalDeath()
 		return err
 	}
+	defer resp.Body.Close()
+	defer pw.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		resp.Body.Close()
-		pw.Close()
 		return fmt.Errorf("authentication failed")
 	}
 
-	portStr := resp.Header.Get("X-Tunnel-Port")
-	port, _ := strconv.Atoi(portStr)
+	port, _ := strconv.Atoi(resp.Header.Get("X-Tunnel-Port"))
 
 	c.mu.RLock()
 	localAddr, ok := c.forwards[port]
 	c.mu.RUnlock()
 
 	if !ok {
-		resp.Body.Close()
-		pw.Close()
 		log.Printf("[vtunnel-client] No forward for port %d", port)
 		return fmt.Errorf("no forward for port %d", port)
 	}
 
 	localConn, err := c.dialTarget(localAddr)
 	if err != nil {
-		resp.Body.Close()
-		pw.Close()
 		log.Printf("[vtunnel-client] Failed to connect to %s: %v", localAddr, err)
 		return err
 	}
@@ -484,25 +465,31 @@ func (c *Client) connectOnce() error {
 	return nil
 }
 
-// connectionLoop waits for the current connection to die, then reconnects
-// with exponential backoff. Runs until the client is closed.
-func (c *Client) connectionLoop() {
-	// Wait for current connection to die
+// waitForDeath blocks until the h2 connection dies or the client is closed.
+// Returns false if the client is shutting down.
+func (c *Client) waitForDeath() bool {
 	c.connMu.RLock()
 	died := c.connDied
 	c.connMu.RUnlock()
 	select {
 	case <-died:
+		c.connMu.Lock()
+		if c.poolCancel != nil {
+			c.poolCancel()
+		}
+		c.connMu.Unlock()
+		return true
 	case <-c.done:
+		return false
+	}
+}
+
+// connectionLoop waits for the current connection to die, then reconnects
+// with exponential backoff. Runs until the client is closed.
+func (c *Client) connectionLoop() {
+	if !c.waitForDeath() {
 		return
 	}
-
-	// Cancel pool
-	c.connMu.Lock()
-	if c.poolCancel != nil {
-		c.poolCancel()
-	}
-	c.connMu.Unlock()
 
 	bo := c.newBackoff()
 	for {
@@ -525,22 +512,9 @@ func (c *Client) connectionLoop() {
 		bo.Reset()
 		log.Printf("[vtunnel-client] Reconnected to %s", c.wsURL)
 
-		// Wait for this connection to die
-		c.connMu.RLock()
-		died := c.connDied
-		c.connMu.RUnlock()
-		select {
-		case <-died:
-		case <-c.done:
+		if !c.waitForDeath() {
 			return
 		}
-
-		// Cancel pool for dead connection
-		c.connMu.Lock()
-		if c.poolCancel != nil {
-			c.poolCancel()
-		}
-		c.connMu.Unlock()
 	}
 }
 

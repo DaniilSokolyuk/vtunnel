@@ -116,7 +116,7 @@ func (s *Server) HandleConn(wsConn *websocket.Conn) {
 	log.Println("[vtunnel-server] Client connected")
 
 	h2s := &http2.Server{
-		IdleTimeout: 60 * time.Second,
+		IdleTimeout: s.keepAlive * 2,
 	}
 	h2s.ServeConn(conn, &http2.ServeConnOpts{
 		Handler: s.tunnelMux(),

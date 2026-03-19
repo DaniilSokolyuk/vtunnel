@@ -69,18 +69,24 @@ func pipe(a, b io.ReadWriteCloser) {
 		a.Close()
 		b.Close()
 	}
+	cp := func(dst, src io.ReadWriteCloser) {
+		defer wg.Done()
+		bufPtr := pipeBufPool.Get().(*[]byte)
+		io.CopyBuffer(dst, src, (*bufPtr)[:cap(*bufPtr)])
+		pipeBufPool.Put(bufPtr)
+		once.Do(closeBoth)
+	}
 	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(a, b)
-		once.Do(closeBoth)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(b, a)
-		once.Do(closeBoth)
-	}()
+	go cp(a, b)
+	go cp(b, a)
 	wg.Wait()
+}
+
+var pipeBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32*1024)
+		return &buf
+	},
 }
 
 // setTCPOptions enables keepalive and disables Nagle on TCP connections.
