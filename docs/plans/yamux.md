@@ -858,33 +858,33 @@ diff bench_ssh.txt bench_yamux.txt
 - [x] Add handshake unit tests (matching keys, wrong key, MITM detection, no-auth, timeout)
 
 ### Task 3: Rewrite server.go — yamux session, control stream, tunnel streams
-- [ ] Change Server struct: replace `ssh.Conn`/`ssh.ServerConfig` with `*yamux.Session`/`ed25519.PublicKey`
-- [ ] Rewrite `NewServer()` — remove SSH config setup
-- [ ] Rewrite `HandleConn()` — custom handshake + yamux server session + control stream accept
-- [ ] Add `yamuxConfig()` helper
-- [ ] Implement `handleControlStream()` replacing SSH `handleRequests()`
-- [ ] Refactor `handleListen()` to return `(listenRequest, error)` instead of using `ssh.Request.Reply()`
-- [ ] Rewrite `handleTunnelConn()` — use `session.Open()` + `writeMsg` tunnel header
-- [ ] Rename `setSSH`/`clearSSH`/`getSSH` to `setSession`/`clearSession`/`getSession`
-- [ ] Remove all `golang.org/x/crypto/ssh` imports from server.go
+- [x] Change Server struct: replace `ssh.Conn`/`ssh.ServerConfig` with `*yamux.Session`/`ed25519.PublicKey`
+- [x] Rewrite `NewServer()` — remove SSH config setup
+- [x] Rewrite `HandleConn()` — custom handshake + yamux server session + control stream accept
+- [x] Add `yamuxConfig()` helper
+- [x] Implement `handleControlStream()` replacing SSH `handleRequests()`
+- [x] Refactor `handleListen()` to return `(listenRequest, error)` instead of using `ssh.Request.Reply()`
+- [x] Rewrite `handleTunnelConn()` — use `session.Open()` + `writeMsg` tunnel header
+- [x] Rename `setSSH`/`clearSSH`/`getSSH` to `setSession`/`clearSession`/`getSession`
+- [x] Remove all `golang.org/x/crypto/ssh` imports from server.go
 
 ### Task 4: Rewrite client.go — yamux session, control stream, tunnel accept
-- [ ] Change Client struct: replace `ssh.Conn`/`ssh.Signer` with `*yamux.Session`/`ed25519.PrivateKey` + control stream state
-- [ ] Rewrite `WithKey()` option to use `ed25519.PrivateKey`
-- [ ] Rewrite `dialOnce()` — custom handshake + yamux client session + open control stream
-- [ ] Add `yamuxConfig()` helper
-- [ ] Implement `readControlResponses()` — background goroutine dispatching responses by ID
-- [ ] Implement `sendControl()` — request-reply over control stream with pending map
-- [ ] Rewrite `sendListen()`/`sendListenWithDomain()` to use `sendControl()`
-- [ ] Implement `acceptTunnelStreams()` replacing `handleChannels()`
-- [ ] Rewrite `handleTunnel()` — read tunnel header via `readMsg`, dial local target
-- [ ] Update `connectionLoop()` — use `session.CloseChan()` instead of `conn.Wait()`
-- [ ] Rewrite `Close()` to close yamux session
-- [ ] Rename `setSSH`/`getSSH` to `setSession`/`getSession`
-- [ ] Remove all `golang.org/x/crypto/ssh` imports from client.go
+- [x] Change Client struct: replace `ssh.Conn`/`ssh.Signer` with `*yamux.Session`/`ed25519.PrivateKey` + control stream state
+- [x] Rewrite `WithKey()` option to use `ed25519.PrivateKey`
+- [x] Rewrite `dialOnce()` — custom handshake + yamux client session + open control stream
+- [x] Add `yamuxConfig()` helper
+- [x] Implement `readControlResponses()` — background goroutine dispatching responses by ID
+- [x] Implement `sendControl()` — request-reply over control stream with pending map
+- [x] Rewrite `sendListen()`/`sendListenWithDomain()` to use `sendControl()`
+- [x] Implement `acceptTunnelStreams()` replacing `handleChannels()`
+- [x] Rewrite `handleTunnel()` — read tunnel header via `readMsg`, dial local target
+- [x] Update `connectionLoop()` — use `session.CloseChan()` instead of `conn.Wait()`
+- [x] Rewrite `Close()` to close yamux session
+- [x] Rename `setSSH`/`getSSH` to `setSession`/`getSession`
+- [x] Remove all `golang.org/x/crypto/ssh` imports from client.go
 
 ### Task 5: Update tests and clean up
-- [ ] Rewrite `TestAuthWrongPrivateKeyKnownPublic` in vtunnel_auth_test.go
+- [x] Rewrite `TestAuthWrongPrivateKeyKnownPublic` in vtunnel_auth_test.go
 - [ ] Remove deprecated SSH functions from wsconn.go: `keepAliveLoop`, `handleRequests`, `rejectChannels`, `generateHostKey`
 - [ ] Remove SSH imports from wsconn.go
 - [ ] Run `go mod tidy` to remove `golang.org/x/crypto`

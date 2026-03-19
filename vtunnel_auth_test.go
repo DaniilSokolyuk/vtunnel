@@ -1,6 +1,7 @@
 package vtunnel_test
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -12,7 +13,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
 
 	"github.com/DaniilSokolyuk/vtunnel"
 )
@@ -132,8 +132,8 @@ func TestAuthNoKeyOnClient(t *testing.T) {
 }
 
 // 4b. Attacker knows the public key (visible on server/Docker), derives
-// the correct host key, but authenticates with their own private key.
-// Must fail on "unable to authenticate", NOT "host key mismatch".
+// the correct server_pub_hash, but authenticates with their own private key.
+// Must fail on auth (unauthorized key), NOT MITM detection.
 func TestAuthWrongPrivateKeyKnownPublic(t *testing.T) {
 	_, pub, err := vtunnel.GenerateKeyPair()
 	if err != nil {
@@ -148,48 +148,77 @@ func TestAuthWrongPrivateKeyKnownPublic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attackerSigner, err := ssh.NewSignerFromKey(attackerPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	// Derive the correct server host key from the known public key
-	// (replicating what deriveHostKey does internally)
+	// Derive the correct server_pub_hash from the known public key
+	// (same as deriveServerIdentity does internally: SHA256 of raw pubkey bytes)
 	pubBytes, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(pub, "vt-pub-"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	sshPubKey, err := ssh.NewPublicKey(ed25519.PublicKey(pubBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := sha256.Sum256(sshPubKey.Marshal())
-	hostPriv := ed25519.NewKeyFromSeed(h[:])
-	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
+	expectedHash := sha256.Sum256(pubBytes)
 
-	// Connect with correct host key but wrong auth key
+	// Connect via WebSocket and perform custom handshake manually
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	wsConn, _, err := dialer.Dial(wsURL(ts), nil)
 	if err != nil {
 		t.Fatalf("WS dial: %v", err)
 	}
+	defer wsConn.Close()
+	conn := vtunnel.NewWSConn(wsConn)
 
-	sshConfig := &ssh.ClientConfig{
-		User:            "vtunnel",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(attackerSigner)},
-		HostKeyCallback: ssh.FixedHostKey(hostSigner.PublicKey()),
+	// Read challenge from server
+	var challenge struct {
+		Challenge     string `json:"challenge"`
+		ServerPubHash string `json:"server_pub_hash"`
 	}
-	_, _, _, err = ssh.NewClientConn(vtunnel.NewWSConn(wsConn), "", sshConfig)
-	if err == nil {
-		t.Fatal("expected auth failure, but connection succeeded")
+	if err := vtunnel.ReadMsg(conn, &challenge); err != nil {
+		t.Fatalf("read challenge: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unable to authenticate") {
-		t.Fatalf("expected 'unable to authenticate', got: %v", err)
+
+	// Verify server_pub_hash matches what we expect from the known public key
+	serverHash, err := base64.StdEncoding.DecodeString(challenge.ServerPubHash)
+	if err != nil {
+		t.Fatalf("decode server_pub_hash: %v", err)
 	}
-	t.Logf("Correctly rejected at auth (not host key): %v", err)
+	if !bytes.Equal(serverHash, expectedHash[:]) {
+		t.Fatal("server_pub_hash does not match expected — test setup error")
+	}
+
+	// Sign the challenge with the attacker's key (wrong key)
+	challengeBytes, err := base64.StdEncoding.DecodeString(challenge.Challenge)
+	if err != nil {
+		t.Fatalf("decode challenge: %v", err)
+	}
+	sig := ed25519.Sign(attackerPriv, challengeBytes)
+	attackerPub := attackerPriv.Public().(ed25519.PublicKey)
+
+	// Send response with attacker's public key and signature
+	resp := struct {
+		Signature string `json:"signature"`
+		ClientPub string `json:"client_pub"`
+	}{
+		Signature: base64.StdEncoding.EncodeToString(sig),
+		ClientPub: base64.StdEncoding.EncodeToString(attackerPub),
+	}
+	if err := vtunnel.WriteMsg(conn, resp); err != nil {
+		t.Fatalf("send response: %v", err)
+	}
+
+	// Read result — should be rejected
+	var result struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := vtunnel.ReadMsg(conn, &result); err != nil {
+		t.Fatalf("read result: %v", err)
+	}
+	if result.OK {
+		t.Fatal("expected auth failure, but handshake succeeded")
+	}
+	if !strings.Contains(result.Error, "unauthorized key") {
+		t.Fatalf("expected 'unauthorized key', got: %q", result.Error)
+	}
+	t.Logf("Correctly rejected at auth (not MITM): %v", result.Error)
 }
 
 // 5. No keys on either side — works as before.
