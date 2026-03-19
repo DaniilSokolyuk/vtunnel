@@ -2,11 +2,15 @@
 
 ## Context
 
-SSH (`golang.org/x/crypto/ssh`) is the performance bottleneck in vtunnel. SSH adds per-packet encryption, MAC computation, and framing overhead unnecessary for this use case — vtunnel runs over WebSocket which can already be secured via TLS (`wss://`). The project only needs: stream multiplexing, keepalive, and simple auth.
+SSH (`golang.org/x/crypto/ssh`) is the performance bottleneck in vtunnel. SSH adds per-packet encryption, MAC
+computation, and framing overhead unnecessary for this use case — vtunnel runs over WebSocket which can already be
+secured via TLS (`wss://`). The project only needs: stream multiplexing, keepalive, and simple auth.
 
-Replacing SSH with `hashicorp/yamux` for stream multiplexing and a lightweight custom ed25519 challenge-response handshake will significantly reduce per-byte CPU overhead and improve throughput.
+Replacing SSH with `hashicorp/yamux` for stream multiplexing and a lightweight custom ed25519 challenge-response
+handshake will significantly reduce per-byte CPU overhead and improve throughput.
 
-**Breaking wire protocol change.** Matched client/server pairs required after migration. Key format (`vt-priv-`/`vt-pub-`) and public Go API preserved — existing keys and deployment configs continue to work.
+**Breaking wire protocol change.** Matched client/server pairs required after migration. Key format (`vt-priv-`/
+`vt-pub-`) and public Go API preserved — existing keys and deployment configs continue to work.
 
 ---
 
@@ -21,22 +25,24 @@ AFTER:
 ```
 
 ### What yamux replaces
-| SSH feature | yamux replacement |
-|---|---|
-| Stream multiplexing (SSH channels) | yamux streams |
-| Keepalive (SSH ping/pong global requests) | yamux built-in keepalive |
-| Encryption | Not needed (use `wss://` for TLS) |
-| Auth (public key challenge-response) | Custom ed25519 handshake (Section 2) |
-| Global requests (`"listen"`, `"ping"`) | Control stream protocol (Section 3) |
-| `sshConn.Wait()` (death detection) | `<-session.CloseChan()` |
-| `sshConn.OpenChannel()` | `session.Open()` |
-| Channel accept/reject | `session.AcceptStream()` |
+
+| SSH feature                               | yamux replacement                    |
+|-------------------------------------------|--------------------------------------|
+| Stream multiplexing (SSH channels)        | yamux streams                        |
+| Keepalive (SSH ping/pong global requests) | yamux built-in keepalive             |
+| Encryption                                | Not needed (use `wss://` for TLS)    |
+| Auth (public key challenge-response)      | Custom ed25519 handshake (Section 2) |
+| Global requests (`"listen"`, `"ping"`)    | Control stream protocol (Section 3)  |
+| `sshConn.Wait()` (death detection)        | `<-session.CloseChan()`              |
+| `sshConn.OpenChannel()`                   | `session.Open()`                     |
+| Channel accept/reject                     | `session.AcceptStream()`             |
 
 ---
 
 ## 2. Custom Auth Handshake Protocol
 
-Runs on raw `net.Conn` (the `wsConn`) **before** yamux session creation. Rejects unauthorized connections before allocating any session resources.
+Runs on raw `net.Conn` (the `wsConn`) **before** yamux session creation. Rejects unauthorized connections before
+allocating any session resources.
 
 ### Wire format
 
@@ -76,7 +82,9 @@ Both sides proceed to create yamux session
 
 ### MITM protection
 
-The `server_pub_hash` field is `SHA256(client_public_key_bytes)` — the same value both sides can compute independently from the client's public key. This replaces SSH's deterministic host key derivation (`deriveHostKey`). The client verifies the server knows the correct public key before revealing its signature.
+The `server_pub_hash` field is `SHA256(client_public_key_bytes)` — the same value both sides can compute independently
+from the client's public key. This replaces SSH's deterministic host key derivation (`deriveHostKey`). The client
+verifies the server knows the correct public key before revealing its signature.
 
 ### No-auth flow
 
@@ -96,18 +104,18 @@ Both sides log `WARNING: Authentication is DISABLED`.
 
 ```go
 type authChallenge struct {
-    Challenge     string `json:"challenge"`       // base64, 32 random bytes
-    ServerPubHash string `json:"server_pub_hash"` // base64, SHA256(client_pubkey_bytes)
+Challenge     string `json:"challenge"`       // base64, 32 random bytes
+ServerPubHash string `json:"server_pub_hash"` // base64, SHA256(client_pubkey_bytes)
 }
 
 type authResponse struct {
-    Signature string `json:"signature"`  // base64, ed25519 signature over raw challenge
-    ClientPub string `json:"client_pub"` // base64, ed25519 public key (32 bytes)
+Signature string `json:"signature"`  // base64, ed25519 signature over raw challenge
+ClientPub string `json:"client_pub"` // base64, ed25519 public key (32 bytes)
 }
 
 type authResult struct {
-    OK    bool   `json:"ok"`
-    Error string `json:"error,omitempty"`
+OK    bool   `json:"ok"`
+Error string `json:"error,omitempty"`
 }
 ```
 
@@ -127,7 +135,8 @@ func clientHandshake(conn net.Conn, privKey ed25519.PrivateKey) error
 
 ## 3. Control Stream Protocol
 
-After yamux session is created, the **client** immediately opens the first stream = **control stream**. This replaces SSH global requests (`"listen"`, `"ping"`).
+After yamux session is created, the **client** immediately opens the first stream = **control stream**. This replaces
+SSH global requests (`"listen"`, `"ping"`).
 
 ### Wire format
 
@@ -137,16 +146,16 @@ Same as handshake: `[4 bytes big-endian uint32: length][JSON payload]`
 
 ```go
 type controlRequest struct {
-    ID   uint32 `json:"id"`
-    Type string `json:"type"` // "listen"
-    listenRequest              // embedded: Port, LocalAddr, Domain
+ID   uint32 `json:"id"`
+Type string `json:"type"` // "listen"
+listenRequest             // embedded: Port, LocalAddr, Domain
 }
 
 type controlResponse struct {
-    ID    uint32 `json:"id"`
-    OK    bool   `json:"ok"`
-    Error string `json:"error,omitempty"`
-    listenRequest               // embedded: reply payload (Port, LocalAddr)
+ID    uint32 `json:"id"`
+OK    bool   `json:"ok"`
+Error string `json:"error,omitempty"`
+listenRequest // embedded: reply payload (Port, LocalAddr)
 }
 ```
 
@@ -191,6 +200,7 @@ All yamux streams **other than the control stream** carry tunnel data.
 ### Stream disambiguation
 
 No ambiguity between control and tunnel streams:
+
 - **Client opens**: control stream (first and only `session.Open()`)
 - **Server opens**: tunnel streams (`session.Open()` per TCP connection)
 - **Server accepts**: control stream (first `session.AcceptStream()`)
@@ -202,16 +212,17 @@ No ambiguity between control and tunnel streams:
 
 ```go
 cfg := yamux.DefaultConfig()
-cfg.MaxStreamWindowSize = 16 * 1024 * 1024  // 16 MB (default 256 KB is too small for high-throughput tunnels)
+cfg.MaxStreamWindowSize = 16 * 1024 * 1024 // 16 MB (default 256 KB is too small for high-throughput tunnels)
 cfg.EnableKeepAlive = true
-cfg.KeepAliveInterval = keepAlive            // default 30s, configurable via WithKeepAlive/WithServerKeepAlive
+cfg.KeepAliveInterval = keepAlive // default 30s, configurable via WithKeepAlive/WithServerKeepAlive
 cfg.ConnectionWriteTimeout = 10 * time.Second
 cfg.StreamOpenTimeout = 10 * time.Second
 cfg.LogOutput = io.Discard
 ```
 
 - Negative `keepAlive` value -> `cfg.EnableKeepAlive = false`
-- `MaxStreamWindowSize = 16 MB` — critical for throughput. The default 256 KB window causes frequent stalls on high-bandwidth links. 16 MB allows streams to sustain high throughput without waiting for window updates.
+- `MaxStreamWindowSize = 16 MB` — critical for throughput. The default 256 KB window causes frequent stalls on
+  high-bandwidth links. 16 MB allows streams to sustain high throughput without waiting for window updates.
 
 ---
 
@@ -231,6 +242,7 @@ Keep: `gorilla/websocket`, `cenkalti/backoff/v4`, `golang.org/x/net` (used by pr
 **Remove all `ssh.*` imports and types.**
 
 **Keep unchanged:**
+
 - `GenerateKeyPair()` — key format and encoding are independent of SSH
 - Key prefix constants (`vt-priv-`, `vt-pub-`)
 
@@ -245,25 +257,30 @@ func deriveHostKey(clientPubKey ssh.PublicKey) (ssh.Signer, error)
 // AFTER:
 func parsePrivateKey(encoded string) (ed25519.PrivateKey, error)
 func parsePublicKey(encoded string) (ed25519.PublicKey, error)
-func deriveServerIdentity(clientPubKey ed25519.PublicKey) []byte  // returns SHA256(pubkey_bytes)
+func deriveServerIdentity(clientPubKey ed25519.PublicKey) []byte // returns SHA256(pubkey_bytes)
 ```
 
 **Add:**
+
 - Handshake types: `authChallenge`, `authResponse`, `authResult` (see Section 2)
 - `serverHandshake(conn net.Conn, clientPubKey ed25519.PublicKey) error`
 - `clientHandshake(conn net.Conn, privKey ed25519.PrivateKey) error`
 
 **`deriveServerIdentity` change:**
+
 ```go
 // BEFORE: SHA256(ssh_pubkey.Marshal()) -> ed25519 seed -> ssh.Signer
 // AFTER:  SHA256(raw_ed25519_pubkey_bytes) -> []byte (hash used directly for comparison)
 ```
 
-The previous implementation marshalled the key via `ssh.PublicKey.Marshal()` which includes SSH wire format headers. The new implementation hashes the raw 32-byte ed25519 public key directly. **This means existing keys produce different identity hashes** — acceptable because the wire protocol is breaking anyway.
+The previous implementation marshalled the key via `ssh.PublicKey.Marshal()` which includes SSH wire format headers. The
+new implementation hashes the raw 32-byte ed25519 public key directly. **This means existing keys produce different
+identity hashes** — acceptable because the wire protocol is breaking anyway.
 
 ### 6.3 `wsconn.go` — Moderate changes
 
 **Keep unchanged:**
+
 - `wsConn` struct + `Read`/`Write`/`SetDeadline` methods
 - `NewWSConn()` function
 - `pipe()` function
@@ -273,172 +290,180 @@ The previous implementation marshalled the key via `ssh.PublicKey.Marshal()` whi
 - `marshalJSON()` helper
 
 **Remove:**
+
 - `keepAliveLoop()` — yamux has built-in keepalive
 - `handleRequests()` — SSH ping handler, no longer needed
 - `rejectChannels()` — SSH-specific
 - `generateHostKey()` — ephemeral SSH ECDSA host key, no longer needed
 
 **Add:**
+
 ```go
 // Length-prefixed JSON wire helpers
-func writeMsg(w io.Writer, v any) error     // write [4-byte len][JSON]
-func readMsg(r io.Reader, v any) error       // read [4-byte len][JSON], with max size guard
+func writeMsg(w io.Writer, v any) error // write [4-byte len][JSON]
+func readMsg(r io.Reader, v any) error // read [4-byte len][JSON], with max size guard
 
 // Control stream message types
 type controlRequest struct {
-    ID   uint32 `json:"id"`
-    Type string `json:"type"`
-    listenRequest
+ID   uint32 `json:"id"`
+Type string `json:"type"`
+listenRequest
 }
 
 type controlResponse struct {
-    ID    uint32 `json:"id"`
-    OK    bool   `json:"ok"`
-    Error string `json:"error,omitempty"`
-    listenRequest
+ID    uint32 `json:"id"`
+OK    bool   `json:"ok"`
+Error string `json:"error,omitempty"`
+listenRequest
 }
 ```
 
 ### 6.4 `server.go` — Major rewrite
 
 **Struct changes:**
+
 ```go
 type Server struct {
-    // REMOVED:
-    //   sshConfig    *ssh.ServerConfig
-    //   clientPubKey ssh.PublicKey
-    //   activeConn   ssh.Conn
+// REMOVED:
+//   sshConfig    *ssh.ServerConfig
+//   clientPubKey ssh.PublicKey
+//   activeConn   ssh.Conn
 
-    // CHANGED:
-    clientPubKey  ed25519.PublicKey  // nil = no auth
-    activeSession *yamux.Session
+// CHANGED:
+clientPubKey  ed25519.PublicKey // nil = no auth
+activeSession *yamux.Session
 
-    // UNCHANGED:
-    keepAlive     time.Duration
-    activeConnMu  sync.RWMutex
-    connReady     chan struct{}
-    listeners     map[int]net.Listener
-    listenersMu   sync.Mutex
-    domainMap     map[string]string
-    domainMu      sync.RWMutex
-    proxyListener net.Listener
-    proxyDone     chan struct{}
-    proxyOnce     sync.Once
-    mitmCA        *tls.Certificate
-    tlsUpstream   map[string]string
-    tlsUpstreamMu sync.RWMutex
+// UNCHANGED:
+keepAlive     time.Duration
+activeConnMu  sync.RWMutex
+connReady     chan struct{}
+listeners     map[int]net.Listener
+listenersMu   sync.Mutex
+domainMap     map[string]string
+domainMu      sync.RWMutex
+proxyListener net.Listener
+proxyDone     chan struct{}
+proxyOnce     sync.Once
+mitmCA        *tls.Certificate
+tlsUpstream   map[string]string
+tlsUpstreamMu sync.RWMutex
 }
 ```
 
 **`NewServer()` rewrite:**
+
 ```go
 func NewServer(opts ...ServerOption) *Server {
-    s := &Server{
-        keepAlive:   defaultKeepAlive,
-        connReady:   make(chan struct{}),
-        listeners:   make(map[int]net.Listener),
-        domainMap:   make(map[string]string),
-        tlsUpstream: make(map[string]string),
-    }
-    for _, opt := range opts {
-        opt(s)
-    }
-    if s.clientPubKey == nil {
-        log.Println("[vtunnel-server] WARNING: No client key configured. Authentication is DISABLED.")
-    }
-    return s
+s := &Server{
+keepAlive:   defaultKeepAlive,
+connReady:   make(chan struct{}),
+listeners:   make(map[int]net.Listener),
+domainMap:   make(map[string]string),
+tlsUpstream: make(map[string]string),
+}
+for _, opt := range opts {
+opt(s)
+}
+if s.clientPubKey == nil {
+log.Println("[vtunnel-server] WARNING: No client key configured. Authentication is DISABLED.")
+}
+return s
 }
 ```
 
 No more SSH config, host key generation, or `PublicKeyCallback` setup.
 
 **`HandleConn()` rewrite:**
+
 ```go
 func (s *Server) HandleConn(wsConn *websocket.Conn) {
-    conn := NewWSConn(wsConn)
-    conn.SetDeadline(time.Now().Add(30 * time.Second))
+conn := NewWSConn(wsConn)
+conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-    // 1. Custom auth handshake
-    if err := serverHandshake(conn, s.clientPubKey); err != nil {
-        log.Printf("[vtunnel-server] Handshake failed: %v", err)
-        return
-    }
-    conn.SetDeadline(time.Time{})
+// 1. Custom auth handshake
+if err := serverHandshake(conn, s.clientPubKey); err != nil {
+log.Printf("[vtunnel-server] Handshake failed: %v", err)
+return
+}
+conn.SetDeadline(time.Time{})
 
-    // 2. Create yamux server session
-    cfg := s.yamuxConfig()
-    session, err := yamux.Server(conn, cfg)
-    if err != nil {
-        log.Printf("[vtunnel-server] yamux session failed: %v", err)
-        return
-    }
-    defer session.Close()
+// 2. Create yamux server session
+cfg := s.yamuxConfig()
+session, err := yamux.Server(conn, cfg)
+if err != nil {
+log.Printf("[vtunnel-server] yamux session failed: %v", err)
+return
+}
+defer session.Close()
 
-    log.Println("[vtunnel-server] Client connected")
-    s.setSession(session)
-    defer func() {
-        s.clearSession(session)
-        log.Println("[vtunnel-server] Client disconnected")
-    }()
+log.Println("[vtunnel-server] Client connected")
+s.setSession(session)
+defer func () {
+s.clearSession(session)
+log.Println("[vtunnel-server] Client disconnected")
+}()
 
-    // 3. Accept control stream (first stream from client)
-    ctrlStream, err := session.AcceptStream()
-    if err != nil {
-        log.Printf("[vtunnel-server] Accept control stream failed: %v", err)
-        return
-    }
-    go s.handleControlStream(ctrlStream)
+// 3. Accept control stream (first stream from client)
+ctrlStream, err := session.AcceptStream()
+if err != nil {
+log.Printf("[vtunnel-server] Accept control stream failed: %v", err)
+return
+}
+go s.handleControlStream(ctrlStream)
 
-    // 4. Block until session dies
-    <-session.CloseChan()
+// 4. Block until session dies
+<-session.CloseChan()
 }
 ```
 
 **`yamuxConfig()` helper:**
+
 ```go
 func (s *Server) yamuxConfig() *yamux.Config {
-    cfg := yamux.DefaultConfig()
-    cfg.MaxStreamWindowSize = 16 * 1024 * 1024
-    cfg.ConnectionWriteTimeout = 10 * time.Second
-    cfg.StreamOpenTimeout = 10 * time.Second
-    cfg.LogOutput = io.Discard
-    if s.keepAlive > 0 {
-        cfg.EnableKeepAlive = true
-        cfg.KeepAliveInterval = s.keepAlive
-    } else {
-        cfg.EnableKeepAlive = false
-    }
-    return cfg
+cfg := yamux.DefaultConfig()
+cfg.MaxStreamWindowSize = 16 * 1024 * 1024
+cfg.ConnectionWriteTimeout = 10 * time.Second
+cfg.StreamOpenTimeout = 10 * time.Second
+cfg.LogOutput = io.Discard
+if s.keepAlive > 0 {
+cfg.EnableKeepAlive = true
+cfg.KeepAliveInterval = s.keepAlive
+} else {
+cfg.EnableKeepAlive = false
+}
+return cfg
 }
 ```
 
 **`handleControlStream()` — new, replaces `handleRequests()`:**
+
 ```go
 func (s *Server) handleControlStream(stream *yamux.Stream) {
-    defer stream.Close()
-    for {
-        var req controlRequest
-        if err := readMsg(stream, &req); err != nil {
-            return // stream/session closed
-        }
-        switch req.Type {
-        case "listen":
-            reply, err := s.handleListen(req.listenRequest)
-            resp := controlResponse{ID: req.ID, OK: err == nil, listenRequest: reply}
-            if err != nil {
-                resp.Error = err.Error()
-            }
-            if err := writeMsg(stream, resp); err != nil {
-                return
-            }
-        default:
-            writeMsg(stream, controlResponse{ID: req.ID, OK: false, Error: "unknown request type"})
-        }
-    }
+defer stream.Close()
+for {
+var req controlRequest
+if err := readMsg(stream, &req); err != nil {
+return // stream/session closed
+}
+switch req.Type {
+case "listen":
+reply, err := s.handleListen(req.listenRequest)
+resp := controlResponse{ID: req.ID, OK: err == nil, listenRequest: reply}
+if err != nil {
+resp.Error = err.Error()
+}
+if err := writeMsg(stream, resp); err != nil {
+return
+}
+default:
+writeMsg(stream, controlResponse{ID: req.ID, OK: false, Error: "unknown request type"})
+}
+}
 }
 ```
 
 **`handleListen()` signature change:**
+
 ```go
 // BEFORE:
 func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request)
@@ -447,38 +472,41 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request)
 func (s *Server) handleListen(req listenRequest) (listenRequest, error)
 ```
 
-Returns the reply payload instead of calling `r.Reply()`. Internal logic (listener creation, domain mapping, accept loop spawn) unchanged.
+Returns the reply payload instead of calling `r.Reply()`. Internal logic (listener creation, domain mapping, accept loop
+spawn) unchanged.
 
 **`handleTunnelConn()` rewrite:**
+
 ```go
 func (s *Server) handleTunnelConn(tcpConn net.Conn, port int) {
-    defer tcpConn.Close()
+defer tcpConn.Close()
 
-    session := s.getSession()
-    if session == nil {
-        log.Printf("[vtunnel-server] No session for port %d (timeout)", port)
-        return
-    }
+session := s.getSession()
+if session == nil {
+log.Printf("[vtunnel-server] No session for port %d (timeout)", port)
+return
+}
 
-    stream, err := session.Open()
-    if err != nil {
-        log.Printf("[vtunnel-server] Open stream failed for port %d: %v", port, err)
-        return
-    }
-    defer stream.Close()
+stream, err := session.Open()
+if err != nil {
+log.Printf("[vtunnel-server] Open stream failed for port %d: %v", port, err)
+return
+}
+defer stream.Close()
 
-    // Write tunnel header
-    if err := writeMsg(stream, tunnelRequest{Port: port}); err != nil {
-        log.Printf("[vtunnel-server] Write tunnel header failed: %v", err)
-        return
-    }
+// Write tunnel header
+if err := writeMsg(stream, tunnelRequest{Port: port}); err != nil {
+log.Printf("[vtunnel-server] Write tunnel header failed: %v", err)
+return
+}
 
-    log.Printf("[vtunnel-server] New tunnel: port=%d", port)
-    pipe(stream, tcpConn)
+log.Printf("[vtunnel-server] New tunnel: port=%d", port)
+pipe(stream, tcpConn)
 }
 ```
 
 **Renames:**
+
 - `setSSH(conn ssh.Conn)` -> `setSession(session *yamux.Session)`
 - `clearSSH(conn ssh.Conn)` -> `clearSession(session *yamux.Session)`
 - `getSSH() ssh.Conn` -> `getSession() *yamux.Session`
@@ -488,275 +516,286 @@ Logic unchanged (connReady channel pattern, RWMutex, timeout wait).
 ### 6.5 `client.go` — Major rewrite
 
 **Struct changes:**
+
 ```go
 type Client struct {
-    // REMOVED:
-    //   sshConn    ssh.Conn
-    //   authSigner ssh.Signer
+// REMOVED:
+//   sshConn    ssh.Conn
+//   authSigner ssh.Signer
 
-    // CHANGED/ADDED:
-    session    *yamux.Session
-    privKey    ed25519.PrivateKey      // nil = no auth
+// CHANGED/ADDED:
+session    *yamux.Session
+privKey    ed25519.PrivateKey      // nil = no auth
 
-    // Control stream state:
-    ctrlStream *yamux.Stream
-    ctrlMu     sync.Mutex              // serialize writes to control stream
-    pending    map[uint32]chan controlResponse
-    pendingMu  sync.Mutex
-    nextID     atomic.Uint32
+// Control stream state:
+ctrlStream *yamux.Stream
+ctrlMu     sync.Mutex // serialize writes to control stream
+pending    map[uint32]chan controlResponse
+pendingMu  sync.Mutex
+nextID     atomic.Uint32
 
-    // UNCHANGED:
-    wsURL          string
-    headers        http.Header
-    connMu         sync.RWMutex
-    forwards       map[int]string
-    mu             sync.RWMutex
-    done           chan struct{}
-    closeOnce      sync.Once
-    ctx            context.Context
-    cancel         context.CancelFunc
-    keepAlive      time.Duration
-    reconnectMin   time.Duration
-    reconnectMax   time.Duration
-    domainForwards map[string]string
+// UNCHANGED:
+wsURL          string
+headers        http.Header
+connMu         sync.RWMutex
+forwards       map[int]string
+mu             sync.RWMutex
+done           chan struct{}
+closeOnce      sync.Once
+ctx            context.Context
+cancel         context.CancelFunc
+keepAlive      time.Duration
+reconnectMin   time.Duration
+reconnectMax   time.Duration
+domainForwards map[string]string
 }
 ```
 
 **`WithKey()` change:**
+
 ```go
 // BEFORE:
 func WithKey(privKey string) Option {
-    return func(c *Client) {
-        signer, err := parsePrivateKey(privKey)  // returns ssh.Signer
-        c.authSigner = signer
-    }
+return func (c *Client) {
+signer, err := parsePrivateKey(privKey) // returns ssh.Signer
+c.authSigner = signer
+}
 }
 
 // AFTER:
 func WithKey(privKey string) Option {
-    return func(c *Client) {
-        key, err := parsePrivateKey(privKey)  // returns ed25519.PrivateKey
-        c.privKey = key
-    }
+return func (c *Client) {
+key, err := parsePrivateKey(privKey) // returns ed25519.PrivateKey
+c.privKey = key
+}
 }
 ```
 
 **`dialOnce()` rewrite:**
+
 ```go
 func (c *Client) dialOnce() (*yamux.Session, error) {
-    // 1. WebSocket dial (unchanged)
-    dialer := websocket.Dialer{HandshakeTimeout: defaultHandshakeTimeout}
-    wsConn, _, err := dialer.DialContext(c.ctx, c.wsURL, c.headers)
-    if err != nil {
-        return nil, err
-    }
-    conn := NewWSConn(wsConn)
+// 1. WebSocket dial (unchanged)
+dialer := websocket.Dialer{HandshakeTimeout: defaultHandshakeTimeout}
+wsConn, _, err := dialer.DialContext(c.ctx, c.wsURL, c.headers)
+if err != nil {
+return nil, err
+}
+conn := NewWSConn(wsConn)
 
-    // 2. Custom auth handshake
-    conn.SetDeadline(time.Now().Add(defaultHandshakeTimeout))
-    if err := clientHandshake(conn, c.privKey); err != nil {
-        wsConn.Close()
-        return nil, fmt.Errorf("handshake: %w", err)
-    }
-    conn.SetDeadline(time.Time{})
+// 2. Custom auth handshake
+conn.SetDeadline(time.Now().Add(defaultHandshakeTimeout))
+if err := clientHandshake(conn, c.privKey); err != nil {
+wsConn.Close()
+return nil, fmt.Errorf("handshake: %w", err)
+}
+conn.SetDeadline(time.Time{})
 
-    // 3. Create yamux client session
-    cfg := c.yamuxConfig()
-    session, err := yamux.Client(conn, cfg)
-    if err != nil {
-        wsConn.Close()
-        return nil, fmt.Errorf("yamux session: %w", err)
-    }
+// 3. Create yamux client session
+cfg := c.yamuxConfig()
+session, err := yamux.Client(conn, cfg)
+if err != nil {
+wsConn.Close()
+return nil, fmt.Errorf("yamux session: %w", err)
+}
 
-    // 4. Open control stream (first stream)
-    ctrlStream, err := session.Open()
-    if err != nil {
-        session.Close()
-        return nil, fmt.Errorf("open control stream: %w", err)
-    }
-    c.ctrlStream = ctrlStream
-    c.pending = make(map[uint32]chan controlResponse)
+// 4. Open control stream (first stream)
+ctrlStream, err := session.Open()
+if err != nil {
+session.Close()
+return nil, fmt.Errorf("open control stream: %w", err)
+}
+c.ctrlStream = ctrlStream
+c.pending = make(map[uint32]chan controlResponse)
 
-    // 5. Start background goroutines
-    go c.readControlResponses(ctrlStream)
-    go c.acceptTunnelStreams(session)
+// 5. Start background goroutines
+go c.readControlResponses(ctrlStream)
+go c.acceptTunnelStreams(session)
 
-    return session, nil
+return session, nil
 }
 ```
 
 **`yamuxConfig()` helper:**
+
 ```go
 func (c *Client) yamuxConfig() *yamux.Config {
-    cfg := yamux.DefaultConfig()
-    cfg.MaxStreamWindowSize = 16 * 1024 * 1024
-    cfg.ConnectionWriteTimeout = 10 * time.Second
-    cfg.StreamOpenTimeout = 10 * time.Second
-    cfg.LogOutput = io.Discard
-    if c.keepAlive > 0 {
-        cfg.EnableKeepAlive = true
-        cfg.KeepAliveInterval = c.keepAlive
-    } else {
-        cfg.EnableKeepAlive = false
-    }
-    return cfg
+cfg := yamux.DefaultConfig()
+cfg.MaxStreamWindowSize = 16 * 1024 * 1024
+cfg.ConnectionWriteTimeout = 10 * time.Second
+cfg.StreamOpenTimeout = 10 * time.Second
+cfg.LogOutput = io.Discard
+if c.keepAlive > 0 {
+cfg.EnableKeepAlive = true
+cfg.KeepAliveInterval = c.keepAlive
+} else {
+cfg.EnableKeepAlive = false
+}
+return cfg
 }
 ```
 
 **`readControlResponses()` — new:**
+
 ```go
 func (c *Client) readControlResponses(stream *yamux.Stream) {
-    for {
-        var resp controlResponse
-        if err := readMsg(stream, &resp); err != nil {
-            // Session dying, clean up all pending
-            c.pendingMu.Lock()
-            for id, ch := range c.pending {
-                close(ch)
-                delete(c.pending, id)
-            }
-            c.pendingMu.Unlock()
-            return
-        }
-        c.pendingMu.Lock()
-        if ch, ok := c.pending[resp.ID]; ok {
-            ch <- resp
-            delete(c.pending, resp.ID)
-        }
-        c.pendingMu.Unlock()
-    }
+for {
+var resp controlResponse
+if err := readMsg(stream, &resp); err != nil {
+// Session dying, clean up all pending
+c.pendingMu.Lock()
+for id, ch := range c.pending {
+close(ch)
+delete(c.pending, id)
+}
+c.pendingMu.Unlock()
+return
+}
+c.pendingMu.Lock()
+if ch, ok := c.pending[resp.ID]; ok {
+ch <- resp
+delete(c.pending, resp.ID)
+}
+c.pendingMu.Unlock()
+}
 }
 ```
 
 **`sendControl()` — new, replaces `sshConn.SendRequest()`:**
+
 ```go
 func (c *Client) sendControl(req controlRequest) (controlResponse, error) {
-    id := c.nextID.Add(1)
-    req.ID = id
+id := c.nextID.Add(1)
+req.ID = id
 
-    ch := make(chan controlResponse, 1)
-    c.pendingMu.Lock()
-    c.pending[id] = ch
-    c.pendingMu.Unlock()
+ch := make(chan controlResponse, 1)
+c.pendingMu.Lock()
+c.pending[id] = ch
+c.pendingMu.Unlock()
 
-    c.ctrlMu.Lock()
-    err := writeMsg(c.ctrlStream, req)
-    c.ctrlMu.Unlock()
-    if err != nil {
-        c.pendingMu.Lock()
-        delete(c.pending, id)
-        c.pendingMu.Unlock()
-        return controlResponse{}, err
-    }
+c.ctrlMu.Lock()
+err := writeMsg(c.ctrlStream, req)
+c.ctrlMu.Unlock()
+if err != nil {
+c.pendingMu.Lock()
+delete(c.pending, id)
+c.pendingMu.Unlock()
+return controlResponse{}, err
+}
 
-    select {
-    case resp, ok := <-ch:
-        if !ok {
-            return controlResponse{}, fmt.Errorf("connection closed")
-        }
-        return resp, nil
-    case <-c.ctx.Done():
-        c.pendingMu.Lock()
-        delete(c.pending, id)
-        c.pendingMu.Unlock()
-        return controlResponse{}, c.ctx.Err()
-    }
+select {
+case resp, ok := <-ch:
+if !ok {
+return controlResponse{}, fmt.Errorf("connection closed")
+}
+return resp, nil
+case <-c.ctx.Done():
+c.pendingMu.Lock()
+delete(c.pending, id)
+c.pendingMu.Unlock()
+return controlResponse{}, c.ctx.Err()
+}
 }
 ```
 
 **`sendListen()` rewrite:**
+
 ```go
 func (c *Client) sendListen(session *yamux.Session, port int, localAddr string) error {
-    resp, err := c.sendControl(controlRequest{
-        Type:          "listen",
-        listenRequest: listenRequest{Port: port, LocalAddr: localAddr},
-    })
-    if err != nil {
-        return fmt.Errorf("listen request: %w", err)
-    }
-    if !resp.OK {
-        return fmt.Errorf("listen rejected: %s", resp.Error)
-    }
-    log.Printf("[vtunnel-client] Listen OK: port=%d", port)
-    return nil
+resp, err := c.sendControl(controlRequest{
+Type:          "listen",
+listenRequest: listenRequest{Port: port, LocalAddr: localAddr},
+})
+if err != nil {
+return fmt.Errorf("listen request: %w", err)
+}
+if !resp.OK {
+return fmt.Errorf("listen rejected: %s", resp.Error)
+}
+log.Printf("[vtunnel-client] Listen OK: port=%d", port)
+return nil
 }
 ```
 
 **`sendListenWithDomain()` — same pattern, parses `resp.Port` for domain forwards.**
 
 **`acceptTunnelStreams()` — replaces `handleChannels()`:**
+
 ```go
 func (c *Client) acceptTunnelStreams(session *yamux.Session) {
-    for {
-        stream, err := session.AcceptStream()
-        if err != nil {
-            return // session closed
-        }
-        go c.handleTunnel(stream)
-    }
+for {
+stream, err := session.AcceptStream()
+if err != nil {
+return // session closed
+}
+go c.handleTunnel(stream)
+}
 }
 ```
 
 **`handleTunnel()` rewrite:**
+
 ```go
 func (c *Client) handleTunnel(stream *yamux.Stream) {
-    defer stream.Close()
+defer stream.Close()
 
-    var req tunnelRequest
-    if err := readMsg(stream, &req); err != nil {
-        log.Printf("[vtunnel-client] Read tunnel header failed: %v", err)
-        return
-    }
+var req tunnelRequest
+if err := readMsg(stream, &req); err != nil {
+log.Printf("[vtunnel-client] Read tunnel header failed: %v", err)
+return
+}
 
-    c.mu.RLock()
-    localAddr, ok := c.forwards[req.Port]
-    c.mu.RUnlock()
-    if !ok {
-        log.Printf("[vtunnel-client] No forward for port %d", req.Port)
-        return
-    }
+c.mu.RLock()
+localAddr, ok := c.forwards[req.Port]
+c.mu.RUnlock()
+if !ok {
+log.Printf("[vtunnel-client] No forward for port %d", req.Port)
+return
+}
 
-    localConn, err := c.dialTarget(localAddr)
-    if err != nil {
-        log.Printf("[vtunnel-client] Failed to connect to %s: %v", localAddr, err)
-        return
-    }
+localConn, err := c.dialTarget(localAddr)
+if err != nil {
+log.Printf("[vtunnel-client] Failed to connect to %s: %v", localAddr, err)
+return
+}
 
-    log.Printf("[vtunnel-client] New tunnel: port=%d -> %s", req.Port, localAddr)
-    pipe(stream, localConn)
+log.Printf("[vtunnel-client] New tunnel: port=%d -> %s", req.Port, localAddr)
+pipe(stream, localConn)
 }
 ```
 
 No more `ch.Accept()`/`ch.Reject()` dance — stream is already open.
 
 **`connectionLoop()` change:**
+
 ```go
 // BEFORE:
 if conn := c.getSSH(); conn != nil {
-    conn.Wait()
+conn.Wait()
 }
 
 // AFTER:
 if session := c.getSession(); session != nil {
-    <-session.CloseChan()
+<-session.CloseChan()
 }
 ```
 
 **`setSSH`/`getSSH` -> `setSession`/`getSession` (type `*yamux.Session`).**
 
 **`Close()`:**
+
 ```go
 func (c *Client) Close() error {
-    c.closeOnce.Do(func() {
-        c.cancel()
-        close(c.done)
-    })
-    session := c.getSession()
-    if session != nil {
-        session.Close()
-        c.setSession(nil)
-    }
-    return nil
+c.closeOnce.Do(func () {
+c.cancel()
+close(c.done)
+})
+session := c.getSession()
+if session != nil {
+session.Close()
+c.setSession(nil)
+}
+return nil
 }
 ```
 
@@ -780,15 +819,15 @@ Uses only public API.
 
 ## 7. Implementation Order
 
-| Step | File | Description |
-|------|------|-------------|
-| 1 | `go.mod` | `go get github.com/hashicorp/yamux` |
-| 2 | `auth.go` | Rewrite: remove ssh types, return raw ed25519 types. Add `deriveServerIdentity()`. Add handshake types + `serverHandshake()`/`clientHandshake()`. Add `writeMsg()`/`readMsg()` wire helpers. |
-| 3 | `wsconn.go` | Remove: `keepAliveLoop`, `handleRequests`, `rejectChannels`, `generateHostKey`. Add: control message types (`controlRequest`, `controlResponse`). |
-| 4 | `server.go` | Rewrite: yamux session, custom handshake, control stream handler, tunnel stream open. Rename setSSH/getSSH/clearSSH. |
-| 5 | `client.go` | Rewrite: yamux session, custom handshake, control stream send/receive, tunnel stream accept. Add sendControl() + pending map. |
-| 6 | `vtunnel_auth_test.go` | Rewrite `TestAuthWrongPrivateKeyKnownPublic` to use custom handshake instead of raw SSH `NewClientConn`. |
-| 7 | `go.mod` | `go mod tidy` — removes `golang.org/x/crypto` |
+| Step | File                   | Description                                                                                                                                                                                  |
+|------|------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1    | `go.mod`               | `go get github.com/hashicorp/yamux`                                                                                                                                                          |
+| 2    | `auth.go`              | Rewrite: remove ssh types, return raw ed25519 types. Add `deriveServerIdentity()`. Add handshake types + `serverHandshake()`/`clientHandshake()`. Add `writeMsg()`/`readMsg()` wire helpers. |
+| 3    | `wsconn.go`            | Remove: `keepAliveLoop`, `handleRequests`, `rejectChannels`, `generateHostKey`. Add: control message types (`controlRequest`, `controlResponse`).                                            |
+| 4    | `server.go`            | Rewrite: yamux session, custom handshake, control stream handler, tunnel stream open. Rename setSSH/getSSH/clearSSH.                                                                         |
+| 5    | `client.go`            | Rewrite: yamux session, custom handshake, control stream send/receive, tunnel stream accept. Add sendControl() + pending map.                                                                |
+| 6    | `vtunnel_auth_test.go` | Rewrite `TestAuthWrongPrivateKeyKnownPublic` to use custom handshake instead of raw SSH `NewClientConn`.                                                                                     |
+| 7    | `go.mod`               | `go mod tidy` — removes `golang.org/x/crypto`                                                                                                                                                |
 
 ---
 
@@ -796,9 +835,11 @@ Uses only public API.
 
 ### Tests requiring NO changes (use only public API):
 
-All these tests call `NewClient`, `NewServer`, `Connect`, `Listen`, `Forward`, `HandleConn` — the public API is unchanged:
+All these tests call `NewClient`, `NewServer`, `Connect`, `Listen`, `Forward`, `HandleConn` — the public API is
+unchanged:
 
-- `vtunnel_test.go` — `TestBasicTunnel`, `TestMultiplePorts`, `TestMultipleConnections`, `TestLargePayload`, `TestTCPStream`, `TestKeepAlive`, `TestHandleConnReplace`, `TestTLSTermination`
+- `vtunnel_test.go` — `TestBasicTunnel`, `TestMultiplePorts`, `TestMultipleConnections`, `TestLargePayload`,
+  `TestTCPStream`, `TestKeepAlive`, `TestHandleConnReplace`, `TestTLSTermination`
 - `vtunnel_reconnect_test.go` — all 9 tests including `TestKeepAliveDetectsSilentDrop`
 - `vtunnel_forward_test.go` — all 6 tests including `TestDomainForwardSameDomainTargetWithMitm`
 - `proxy_test.go` — all tests (HTTP/1.1, HTTP/2, CONNECT, MITM)
@@ -811,18 +852,21 @@ All these tests call `NewClient`, `NewServer`, `Connect`, `Listen`, `Forward`, `
 ### Tests requiring changes:
 
 - `vtunnel_auth_test.go`:
-  - `TestAuthWrongPrivateKeyKnownPublic` — **must rewrite**. Currently constructs raw `ssh.NewClientConn` with attacker's key. New version: open WebSocket, perform custom handshake manually with wrong private key, verify handshake fails with auth error (not MITM detection).
-  - All other auth tests (`TestAuthKeyPairGeneration`, `TestAuthValidKey`, `TestAuthWrongKey`, `TestAuthNoKeyOnClient`, `TestAuthNoKeyOnServer`, `TestAuthReconnectWithKey`) — unchanged, use public API only.
+    - `TestAuthWrongPrivateKeyKnownPublic` — **must rewrite**. Currently constructs raw `ssh.NewClientConn` with
+      attacker's key. New version: open WebSocket, perform custom handshake manually with wrong private key, verify
+      handshake fails with auth error (not MITM detection).
+    - All other auth tests (`TestAuthKeyPairGeneration`, `TestAuthValidKey`, `TestAuthWrongKey`,
+      `TestAuthNoKeyOnClient`, `TestAuthNoKeyOnServer`, `TestAuthReconnectWithKey`) — unchanged, use public API only.
 
 ### New tests to add:
 
 - `writeMsg`/`readMsg` round-trip unit test
 - `serverHandshake`/`clientHandshake` unit tests:
-  - Matching keys -> success
-  - Wrong key -> auth failure
-  - MITM (wrong `server_pub_hash`) -> client-side rejection
-  - No-auth mode -> success with empty fields
-  - Timeout (stalled peer) -> deadline error
+    - Matching keys -> success
+    - Wrong key -> auth failure
+    - MITM (wrong `server_pub_hash`) -> client-side rejection
+    - No-auth mode -> success with empty fields
+    - Timeout (stalled peer) -> deadline error
 
 ### Performance verification:
 
@@ -842,12 +886,14 @@ diff bench_ssh.txt bench_yamux.txt
 ## 10. Tasks
 
 ### Task 1: Add yamux dependency and wire protocol helpers
+
 - [x] Add `github.com/hashicorp/yamux` to go.mod
 - [x] Add `writeMsg()`/`readMsg()` length-prefixed JSON wire helpers to wsconn.go
 - [x] Add control stream message types (`controlRequest`, `controlResponse`) to wsconn.go
 - [x] Add unit tests for `writeMsg`/`readMsg` round-trip
 
 ### Task 2: Rewrite auth.go — remove SSH types, add custom handshake
+
 - [x] Change `parsePrivateKey` to return `ed25519.PrivateKey`
 - [x] Change `parsePublicKey` to return `ed25519.PublicKey`
 - [x] Replace `deriveHostKey` with `deriveServerIdentity` returning `[]byte` (SHA256 hash)
@@ -858,6 +904,7 @@ diff bench_ssh.txt bench_yamux.txt
 - [x] Add handshake unit tests (matching keys, wrong key, MITM detection, no-auth, timeout)
 
 ### Task 3: Rewrite server.go — yamux session, control stream, tunnel streams
+
 - [x] Change Server struct: replace `ssh.Conn`/`ssh.ServerConfig` with `*yamux.Session`/`ed25519.PublicKey`
 - [x] Rewrite `NewServer()` — remove SSH config setup
 - [x] Rewrite `HandleConn()` — custom handshake + yamux server session + control stream accept
@@ -869,7 +916,9 @@ diff bench_ssh.txt bench_yamux.txt
 - [x] Remove all `golang.org/x/crypto/ssh` imports from server.go
 
 ### Task 4: Rewrite client.go — yamux session, control stream, tunnel accept
-- [x] Change Client struct: replace `ssh.Conn`/`ssh.Signer` with `*yamux.Session`/`ed25519.PrivateKey` + control stream state
+
+- [x] Change Client struct: replace `ssh.Conn`/`ssh.Signer` with `*yamux.Session`/`ed25519.PrivateKey` + control stream
+  state
 - [x] Rewrite `WithKey()` option to use `ed25519.PrivateKey`
 - [x] Rewrite `dialOnce()` — custom handshake + yamux client session + open control stream
 - [x] Add `yamuxConfig()` helper
@@ -884,14 +933,17 @@ diff bench_ssh.txt bench_yamux.txt
 - [x] Remove all `golang.org/x/crypto/ssh` imports from client.go
 
 ### Task 5: Update tests and clean up
+
 - [x] Rewrite `TestAuthWrongPrivateKeyKnownPublic` in vtunnel_auth_test.go
-- [x] Remove deprecated SSH functions from wsconn.go: `keepAliveLoop`, `handleRequests`, `rejectChannels`, `generateHostKey`
+- [x] Remove deprecated SSH functions from wsconn.go: `keepAliveLoop`, `handleRequests`, `rejectChannels`,
+  `generateHostKey`
 - [x] Remove SSH imports from wsconn.go
 - [x] Run `go mod tidy` to remove `golang.org/x/crypto`
 - [x] Run full test suite and fix any failures
 - [x] Verify no `golang.org/x/crypto/ssh` imports remain (except in tests if needed)
 
 ### Success criteria
+
 - [x] All existing tests pass (public API unchanged)
 - [x] No `golang.org/x/crypto/ssh` imports in non-test code
 - [x] yamux used for all stream multiplexing
@@ -902,10 +954,10 @@ diff bench_ssh.txt bench_yamux.txt
 
 ## 9. Risks and Mitigations
 
-| Risk | Mitigation |
-|------|------------|
-| yamux keepalive semantics differ from SSH ping | yamux keepalive is similar: periodic ping, closes session on timeout. `TestKeepAliveDetectsSilentDrop` validates this. |
-| Control stream closed unexpectedly | `readControlResponses()` cleans up all pending requests. Reconnect loop recreates everything. |
-| `MaxStreamWindowSize = 16 MB` memory usage | 16 MB is per-stream send window. With N concurrent streams, memory is ~16 MB * N. Acceptable for tunnel use case (typically <100 concurrent streams). |
-| No encryption without TLS | Document that `wss://` should be used in production. Same as current recommendation. |
-| Breaking wire protocol | Acceptable: vtunnel is deployed as matched pairs. Keys and CLI flags preserved. |
+| Risk                                           | Mitigation                                                                                                                                            |
+|------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------|
+| yamux keepalive semantics differ from SSH ping | yamux keepalive is similar: periodic ping, closes session on timeout. `TestKeepAliveDetectsSilentDrop` validates this.                                |
+| Control stream closed unexpectedly             | `readControlResponses()` cleans up all pending requests. Reconnect loop recreates everything.                                                         |
+| `MaxStreamWindowSize = 16 MB` memory usage     | 16 MB is per-stream send window. With N concurrent streams, memory is ~16 MB * N. Acceptable for tunnel use case (typically <100 concurrent streams). |
+| No encryption without TLS                      | Document that `wss://` should be used in production. Same as current recommendation.                                                                  |
+| Breaking wire protocol                         | Acceptable: vtunnel is deployed as matched pairs. Keys and CLI flags preserved.                                                                       |
