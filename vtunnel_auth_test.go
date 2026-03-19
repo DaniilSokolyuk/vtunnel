@@ -3,8 +3,6 @@ package vtunnel_test
 import (
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,7 +10,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
+	"golang.org/x/net/http2"
 
 	"github.com/DaniilSokolyuk/vtunnel"
 )
@@ -106,10 +104,16 @@ func TestAuthWrongKey(t *testing.T) {
 	client := vtunnel.NewClient(wsURL(ts), vtunnel.WithKey(wrongPriv))
 	err = client.Connect()
 	if err == nil {
+		// Connect succeeds (WS+h2 connect fine), but control requests fail.
+		// Try to listen — should fail with auth error.
+		port := freePort(t)
+		err = client.Listen(port, "localhost:1234")
 		client.Close()
-		t.Fatal("expected Connect to fail with wrong key, but it succeeded")
+		if err == nil {
+			t.Fatal("expected Listen to fail with wrong key, but it succeeded")
+		}
 	}
-	t.Logf("Connect correctly rejected: %v", err)
+	t.Logf("Correctly rejected: %v", err)
 }
 
 // 4. Server with key, client without key — rejected.
@@ -125,15 +129,19 @@ func TestAuthNoKeyOnClient(t *testing.T) {
 	client := vtunnel.NewClient(wsURL(ts))
 	err = client.Connect()
 	if err == nil {
+		// Connect succeeds (WS+h2 connect fine), but control requests fail.
+		port := freePort(t)
+		err = client.Listen(port, "localhost:1234")
 		client.Close()
-		t.Fatal("expected Connect to fail without key, but it succeeded")
+		if err == nil {
+			t.Fatal("expected Listen to fail without key, but it succeeded")
+		}
 	}
-	t.Logf("Connect correctly rejected: %v", err)
+	t.Logf("Correctly rejected: %v", err)
 }
 
-// 4b. Attacker knows the public key (visible on server/Docker), derives
-// the correct host key, but authenticates with their own private key.
-// Must fail on "unable to authenticate", NOT "host key mismatch".
+// 4b. Attacker knows the public key, derives a valid-looking token but with
+// their own private key. Must fail with "authentication failed".
 func TestAuthWrongPrivateKeyKnownPublic(t *testing.T) {
 	_, pub, err := vtunnel.GenerateKeyPair()
 	if err != nil {
@@ -148,48 +156,37 @@ func TestAuthWrongPrivateKeyKnownPublic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attackerSigner, err := ssh.NewSignerFromKey(attackerPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	// Derive the correct server host key from the known public key
-	// (replicating what deriveHostKey does internally)
-	pubBytes, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(pub, "vt-pub-"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	sshPubKey, err := ssh.NewPublicKey(ed25519.PublicKey(pubBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := sha256.Sum256(sshPubKey.Marshal())
-	hostPriv := ed25519.NewKeyFromSeed(h[:])
-	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Connect with correct host key but wrong auth key
+	// Connect via WebSocket and create h2 client
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	wsConn, _, err := dialer.Dial(wsURL(ts), nil)
 	if err != nil {
 		t.Fatalf("WS dial: %v", err)
 	}
+	defer wsConn.Close()
 
-	sshConfig := &ssh.ClientConfig{
-		User:            "vtunnel",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(attackerSigner)},
-		HostKeyCallback: ssh.FixedHostKey(hostSigner.PublicKey()),
+	conn := vtunnel.NewWSConn(wsConn)
+	h2t := &http2.Transport{}
+	h2cc, err := h2t.NewClientConn(conn)
+	if err != nil {
+		t.Fatalf("h2 client conn: %v", err)
 	}
-	_, _, _, err = ssh.NewClientConn(vtunnel.NewWSConn(wsConn), "", sshConfig)
-	if err == nil {
-		t.Fatal("expected auth failure, but connection succeeded")
+
+	// Send a request with attacker's token
+	token := vtunnel.GenerateAuthToken(attackerPriv)
+	req, _ := http.NewRequest("POST", "http://vtunnel/listen", strings.NewReader(`{"port":9999}`))
+	req.Header.Set("Authorization", token)
+
+	resp, err := h2cc.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unable to authenticate") {
-		t.Fatalf("expected 'unable to authenticate', got: %v", err)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 Unauthorized, got %d", resp.StatusCode)
 	}
-	t.Logf("Correctly rejected at auth (not host key): %v", err)
+	t.Logf("Correctly rejected with status %d", resp.StatusCode)
 }
 
 // 5. No keys on either side — works as before.

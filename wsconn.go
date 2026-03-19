@@ -1,21 +1,15 @@
 package vtunnel
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"encoding/json"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
 )
 
-// wsConn wraps a *websocket.Conn as a net.Conn for use with SSH.
+// wsConn wraps a *websocket.Conn as a net.Conn for use with h2mux.
 // Reads stream directly from the WS message reader to avoid allocations.
 // Writes send each call as a single binary WS message.
 type wsConn struct {
@@ -23,7 +17,7 @@ type wsConn struct {
 	reader io.Reader
 }
 
-// NewWSConn wraps a *websocket.Conn as a net.Conn suitable for SSH.
+// NewWSConn wraps a *websocket.Conn as a net.Conn suitable for h2mux.
 func NewWSConn(ws *websocket.Conn) net.Conn {
 	return &wsConn{Conn: ws}
 }
@@ -98,76 +92,17 @@ func setTCPOptions(conn net.Conn) {
 	}
 }
 
-// keepAliveLoop sends SSH ping requests until the connection dies.
-// If a ping doesn't get a response within 3x the interval, the connection
-// is considered dead and closed — this handles half-open connections where
-// the remote end has silently disappeared (no TCP RST/FIN).
-func keepAliveLoop(sshConn ssh.Conn, interval time.Duration) {
-	timeout := interval * 3
-	for {
-		time.Sleep(interval)
-		errCh := make(chan error, 1)
-		go func() {
-			_, _, err := sshConn.SendRequest("ping", true, nil)
-			errCh <- err
-		}()
-		select {
-		case err := <-errCh:
-			if err != nil {
-				sshConn.Close()
-				return
-			}
-		case <-time.After(timeout):
-			log.Printf("[vtunnel] ping timeout (%v), closing connection", timeout)
-			sshConn.Close()
-			return
-		}
-	}
-}
-
-// handleRequests replies to SSH ping requests (keepalive).
-func handleRequests(reqs <-chan *ssh.Request) {
-	for r := range reqs {
-		switch r.Type {
-		case "ping":
-			r.Reply(true, []byte("pong"))
-		default:
-			if r.WantReply {
-				r.Reply(false, nil)
-			}
-		}
-	}
-}
-
-// rejectChannels rejects all incoming SSH channels.
-func rejectChannels(chans <-chan ssh.NewChannel) {
-	for ch := range chans {
-		ch.Reject(ssh.Prohibited, "not supported")
-	}
-}
-
-// generateHostKey creates an ephemeral ECDSA P-256 key for SSH.
-func generateHostKey() (ssh.Signer, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.NewSignerFromKey(key)
-}
-
-// listenRequest is sent by the client to request the server to listen on a port.
+// listenRequest is the JSON body for listen/forward control requests.
 type listenRequest struct {
 	Port      int    `json:"port"`
 	LocalAddr string `json:"local_addr,omitempty"`
 	Domain    string `json:"domain,omitempty"` // proxy domain mapping (used by Forward)
 }
 
-// tunnelRequest is the extra data sent when opening a tunnel SSH channel.
-type tunnelRequest struct {
-	Port int `json:"port"`
-}
-
-func marshalJSON(v any) []byte {
-	b, _ := json.Marshal(v)
-	return b
+// listenResponse is the JSON response for listen/forward control requests.
+type listenResponse struct {
+	OK        bool   `json:"ok"`
+	Error     string `json:"error,omitempty"`
+	Port      int    `json:"port,omitempty"`
+	LocalAddr string `json:"local_addr,omitempty"`
 }
