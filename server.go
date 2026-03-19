@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -27,7 +28,7 @@ type Server struct {
 	keepAlive time.Duration
 
 	// Client authentication
-	clientPubKey ssh.PublicKey // nil = no auth
+	clientPubKey ed25519.PublicKey // nil = no auth
 
 	// Active SSH connection
 	activeConn   ssh.Conn
@@ -106,7 +107,7 @@ func NewServer(opts ...ServerOption) *Server {
 	var hostKey ssh.Signer
 	var err error
 	if s.clientPubKey != nil {
-		hostKey, err = deriveHostKey(s.clientPubKey)
+		hostKey, err = deriveSSHHostKey(s.clientPubKey)
 	} else {
 		hostKey, err = generateHostKey()
 	}
@@ -118,7 +119,11 @@ func NewServer(opts ...ServerOption) *Server {
 	sshConfig.AddHostKey(hostKey)
 
 	if s.clientPubKey != nil {
-		expected := s.clientPubKey.Marshal()
+		sshPubKey, err := ssh.NewPublicKey(s.clientPubKey)
+		if err != nil {
+			panic("vtunnel: convert public key: " + err.Error())
+		}
+		expected := sshPubKey.Marshal()
 		sshConfig.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if bytes.Equal(key.Marshal(), expected) {
 				return &ssh.Permissions{}, nil

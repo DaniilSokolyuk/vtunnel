@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -40,7 +41,7 @@ type Client struct {
 	keepAlive    time.Duration
 	reconnectMin time.Duration
 	reconnectMax time.Duration
-	authSigner   ssh.Signer // nil = no auth
+	privKey      ed25519.PrivateKey // nil = no auth
 
 	// Domain-based forwards (Forward method)
 	domainForwards map[string]string // domain -> localAddr
@@ -81,11 +82,11 @@ func WithReconnectBackoff(min, max time.Duration) Option {
 // verifies the server's identity using a derived host key.
 func WithKey(privKey string) Option {
 	return func(c *Client) {
-		signer, err := parsePrivateKey(privKey)
+		key, err := parsePrivateKey(privKey)
 		if err != nil {
 			panic(fmt.Sprintf("vtunnel: invalid key: %v", err))
 		}
-		c.authSigner = signer
+		c.privKey = key
 	}
 }
 
@@ -106,7 +107,7 @@ func NewClient(wsURL string, opts ...Option) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
-	if c.authSigner == nil {
+	if c.privKey == nil {
 		log.Println("[vtunnel-client] WARNING: No key configured. Authentication is DISABLED. Do NOT use in production! Use --key or VTUNNEL_KEY.")
 	}
 	return c
@@ -186,9 +187,14 @@ func (c *Client) dialOnce() (ssh.Conn, error) {
 		User:    "vtunnel",
 		Timeout: defaultHandshakeTimeout,
 	}
-	if c.authSigner != nil {
-		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(c.authSigner)}
-		hostSigner, err := deriveHostKey(c.authSigner.PublicKey())
+	if c.privKey != nil {
+		signer, err := ssh.NewSignerFromKey(c.privKey)
+		if err != nil {
+			wsConn.Close()
+			return nil, fmt.Errorf("create signer: %w", err)
+		}
+		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(signer)}
+		hostSigner, err := deriveSSHHostKey(c.privKey.Public().(ed25519.PublicKey))
 		if err != nil {
 			wsConn.Close()
 			return nil, fmt.Errorf("derive host key: %w", err)

@@ -848,14 +848,14 @@ diff bench_ssh.txt bench_yamux.txt
 - [x] Add unit tests for `writeMsg`/`readMsg` round-trip
 
 ### Task 2: Rewrite auth.go — remove SSH types, add custom handshake
-- [ ] Change `parsePrivateKey` to return `ed25519.PrivateKey`
-- [ ] Change `parsePublicKey` to return `ed25519.PublicKey`
-- [ ] Replace `deriveHostKey` with `deriveServerIdentity` returning `[]byte` (SHA256 hash)
-- [ ] Remove all `golang.org/x/crypto/ssh` imports from auth.go
-- [ ] Add handshake types: `authChallenge`, `authResponse`, `authResult`
-- [ ] Implement `serverHandshake(conn net.Conn, clientPubKey ed25519.PublicKey) error`
-- [ ] Implement `clientHandshake(conn net.Conn, privKey ed25519.PrivateKey) error`
-- [ ] Add handshake unit tests (matching keys, wrong key, MITM detection, no-auth, timeout)
+- [x] Change `parsePrivateKey` to return `ed25519.PrivateKey`
+- [x] Change `parsePublicKey` to return `ed25519.PublicKey`
+- [x] Replace `deriveHostKey` with `deriveServerIdentity` returning `[]byte` (SHA256 hash)
+- [x] Remove all `golang.org/x/crypto/ssh` imports from auth.go
+- [x] Add handshake types: `authChallenge`, `authResponse`, `authResult`
+- [x] Implement `serverHandshake(conn net.Conn, clientPubKey ed25519.PublicKey) error`
+- [x] Implement `clientHandshake(conn net.Conn, privKey ed25519.PrivateKey) error`
+- [x] Add handshake unit tests (matching keys, wrong key, MITM detection, no-auth, timeout)
 
 ### Task 3: Rewrite server.go — yamux session, control stream, tunnel streams
 - [ ] Change Server struct: replace `ssh.Conn`/`ssh.ServerConfig` with `*yamux.Session`/`ed25519.PublicKey`

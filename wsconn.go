@@ -2,8 +2,10 @@ package vtunnel
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -156,6 +158,19 @@ func generateHostKey() (ssh.Signer, error) {
 		return nil, err
 	}
 	return ssh.NewSignerFromKey(key)
+}
+
+// deriveSSHHostKey derives a deterministic SSH host key from an ed25519 public key.
+// Uses the same algorithm as the former deriveHostKey: SHA256(ssh_wire_format) -> seed.
+// Deprecated: temporary bridge for SSH transport; will be removed in yamux migration.
+func deriveSSHHostKey(pubKey ed25519.PublicKey) (ssh.Signer, error) {
+	sshPub, err := ssh.NewPublicKey(pubKey)
+	if err != nil {
+		return nil, err
+	}
+	h := sha256.Sum256(sshPub.Marshal())
+	priv := ed25519.NewKeyFromSeed(h[:])
+	return ssh.NewSignerFromKey(priv)
 }
 
 // maxMsgSize is the maximum allowed message size for length-prefixed JSON messages (1 MB).
