@@ -885,17 +885,17 @@ diff bench_ssh.txt bench_yamux.txt
 
 ### Task 5: Update tests and clean up
 - [x] Rewrite `TestAuthWrongPrivateKeyKnownPublic` in vtunnel_auth_test.go
-- [ ] Remove deprecated SSH functions from wsconn.go: `keepAliveLoop`, `handleRequests`, `rejectChannels`, `generateHostKey`
-- [ ] Remove SSH imports from wsconn.go
-- [ ] Run `go mod tidy` to remove `golang.org/x/crypto`
-- [ ] Run full test suite and fix any failures
-- [ ] Verify no `golang.org/x/crypto/ssh` imports remain (except in tests if needed)
+- [x] Remove deprecated SSH functions from wsconn.go: `keepAliveLoop`, `handleRequests`, `rejectChannels`, `generateHostKey`
+- [x] Remove SSH imports from wsconn.go
+- [x] Run `go mod tidy` to remove `golang.org/x/crypto`
+- [x] Run full test suite and fix any failures
+- [x] Verify no `golang.org/x/crypto/ssh` imports remain (except in tests if needed)
 
 ### Success criteria
-- [ ] All existing tests pass (public API unchanged)
-- [ ] No `golang.org/x/crypto/ssh` imports in non-test code
-- [ ] yamux used for all stream multiplexing
-- [ ] Custom ed25519 handshake replaces SSH auth
+- [x] All existing tests pass (public API unchanged)
+- [x] No `golang.org/x/crypto/ssh` imports in non-test code
+- [x] yamux used for all stream multiplexing
+- [x] Custom ed25519 handshake replaces SSH auth
 - [ ] Performance verification via bench tool (manual)
 
 ---

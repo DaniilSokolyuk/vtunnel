@@ -1,22 +1,15 @@
 package vtunnel
 
 import (
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
 )
 
 // wsConn wraps a *websocket.Conn as a net.Conn for use with yamux.
@@ -100,77 +93,6 @@ func setTCPOptions(conn net.Conn) {
 		tc.SetKeepAlivePeriod(60 * time.Second)
 		tc.SetNoDelay(true)
 	}
-}
-
-// keepAliveLoop sends SSH ping requests until the connection dies.
-// Deprecated: will be removed when server.go/client.go are migrated to yamux.
-func keepAliveLoop(sshConn ssh.Conn, interval time.Duration) {
-	timeout := interval * 3
-	for {
-		time.Sleep(interval)
-		errCh := make(chan error, 1)
-		go func() {
-			_, _, err := sshConn.SendRequest("ping", true, nil)
-			errCh <- err
-		}()
-		select {
-		case err := <-errCh:
-			if err != nil {
-				sshConn.Close()
-				return
-			}
-		case <-time.After(timeout):
-			log.Printf("[vtunnel] ping timeout (%v), closing connection", timeout)
-			sshConn.Close()
-			return
-		}
-	}
-}
-
-// handleRequests replies to SSH ping requests (keepalive).
-// Deprecated: will be removed when server.go/client.go are migrated to yamux.
-func handleRequests(reqs <-chan *ssh.Request) {
-	for r := range reqs {
-		switch r.Type {
-		case "ping":
-			r.Reply(true, []byte("pong"))
-		default:
-			if r.WantReply {
-				r.Reply(false, nil)
-			}
-		}
-	}
-}
-
-// rejectChannels rejects all incoming SSH channels.
-// Deprecated: will be removed when server.go/client.go are migrated to yamux.
-func rejectChannels(chans <-chan ssh.NewChannel) {
-	for ch := range chans {
-		ch.Reject(ssh.Prohibited, "not supported")
-	}
-}
-
-// generateHostKey creates an ephemeral ECDSA P-256 key for SSH.
-// Deprecated: will be removed when server.go/client.go are migrated to yamux.
-func generateHostKey() (ssh.Signer, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.NewSignerFromKey(key)
-}
-
-// deriveSSHHostKey derives a deterministic SSH host key from an ed25519 public key.
-// Uses the same algorithm as the former deriveHostKey: SHA256(ssh_wire_format) -> seed.
-// Deprecated: temporary bridge for SSH transport; will be removed in yamux migration.
-func deriveSSHHostKey(pubKey ed25519.PublicKey) (ssh.Signer, error) {
-	sshPub, err := ssh.NewPublicKey(pubKey)
-	if err != nil {
-		return nil, err
-	}
-	h := sha256.Sum256(sshPub.Marshal())
-	priv := ed25519.NewKeyFromSeed(h[:])
-	return ssh.NewSignerFromKey(priv)
 }
 
 // maxMsgSize is the maximum allowed message size for length-prefixed JSON messages (1 MB).
