@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	defaultKeepAlive = 30 * time.Second
+	defaultKeepAlive = 15 * time.Second
 	sessionWaitTimeout = 35 * time.Second
 )
 
