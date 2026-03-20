@@ -1,21 +1,18 @@
 package vtunnel
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
 )
 
-// wsConn wraps a *websocket.Conn as a net.Conn for use with SSH.
+// wsConn wraps a *websocket.Conn as a net.Conn for use with yamux.
 // Reads stream directly from the WS message reader to avoid allocations.
 // Writes send each call as a single binary WS message.
 type wsConn struct {
@@ -23,7 +20,7 @@ type wsConn struct {
 	reader io.Reader
 }
 
-// NewWSConn wraps a *websocket.Conn as a net.Conn suitable for SSH.
+// NewWSConn wraps a *websocket.Conn as a net.Conn suitable for yamux.
 func NewWSConn(ws *websocket.Conn) net.Conn {
 	return &wsConn{Conn: ws}
 }
@@ -98,61 +95,54 @@ func setTCPOptions(conn net.Conn) {
 	}
 }
 
-// keepAliveLoop sends SSH ping requests until the connection dies.
-// If a ping doesn't get a response within 3x the interval, the connection
-// is considered dead and closed — this handles half-open connections where
-// the remote end has silently disappeared (no TCP RST/FIN).
-func keepAliveLoop(sshConn ssh.Conn, interval time.Duration) {
-	timeout := interval * 3
-	for {
-		time.Sleep(interval)
-		errCh := make(chan error, 1)
-		go func() {
-			_, _, err := sshConn.SendRequest("ping", true, nil)
-			errCh <- err
-		}()
-		select {
-		case err := <-errCh:
-			if err != nil {
-				sshConn.Close()
-				return
-			}
-		case <-time.After(timeout):
-			log.Printf("[vtunnel] ping timeout (%v), closing connection", timeout)
-			sshConn.Close()
-			return
-		}
-	}
-}
+// maxMsgSize is the maximum allowed message size for length-prefixed JSON messages (1 MB).
+const maxMsgSize = 1 << 20
 
-// handleRequests replies to SSH ping requests (keepalive).
-func handleRequests(reqs <-chan *ssh.Request) {
-	for r := range reqs {
-		switch r.Type {
-		case "ping":
-			r.Reply(true, []byte("pong"))
-		default:
-			if r.WantReply {
-				r.Reply(false, nil)
-			}
-		}
-	}
-}
-
-// rejectChannels rejects all incoming SSH channels.
-func rejectChannels(chans <-chan ssh.NewChannel) {
-	for ch := range chans {
-		ch.Reject(ssh.Prohibited, "not supported")
-	}
-}
-
-// generateHostKey creates an ephemeral ECDSA P-256 key for SSH.
-func generateHostKey() (ssh.Signer, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// writeMsg writes a length-prefixed JSON message: [4-byte big-endian uint32 length][JSON payload].
+func writeMsg(w io.Writer, v any) error {
+	data, err := json.Marshal(v)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("marshal: %w", err)
 	}
-	return ssh.NewSignerFromKey(key)
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(len(data)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
+}
+
+// readMsg reads a length-prefixed JSON message: [4-byte big-endian uint32 length][JSON payload].
+func readMsg(r io.Reader, v any) error {
+	var hdr [4]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return err
+	}
+	n := binary.BigEndian.Uint32(hdr[:])
+	if n > maxMsgSize {
+		return fmt.Errorf("message too large: %d bytes (max %d)", n, maxMsgSize)
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return err
+	}
+	return json.Unmarshal(buf, v)
+}
+
+// controlRequest is sent by the client on the control stream.
+type controlRequest struct {
+	ID   uint32 `json:"id"`
+	Type string `json:"type"` // "listen"
+	listenRequest
+}
+
+// controlResponse is sent by the server on the control stream.
+type controlResponse struct {
+	ID    uint32 `json:"id"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	listenRequest
 }
 
 // listenRequest is sent by the client to request the server to listen on a port.
@@ -162,7 +152,7 @@ type listenRequest struct {
 	Domain    string `json:"domain,omitempty"` // proxy domain mapping (used by Forward)
 }
 
-// tunnelRequest is the extra data sent when opening a tunnel SSH channel.
+// tunnelRequest is the header sent when opening a tunnel stream.
 type tunnelRequest struct {
 	Port int `json:"port"`
 }
