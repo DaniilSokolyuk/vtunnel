@@ -68,11 +68,6 @@ func WithKeepAlive(d time.Duration) Option {
 	}
 }
 
-// WithPingInterval is an alias for WithKeepAlive for backward compatibility.
-func WithPingInterval(d time.Duration) Option {
-	return WithKeepAlive(d)
-}
-
 // WithHeaders sets HTTP headers for the WebSocket handshake.
 func WithHeaders(h http.Header) Option {
 	return func(c *Client) {
