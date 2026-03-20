@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	defaultKeepAlive   = 30 * time.Second
+	defaultKeepAlive   = 15 * time.Second
 	streamWaitTimeout  = 35 * time.Second
 )
 
@@ -131,9 +131,6 @@ func (s *Server) tunnelMux() http.Handler {
 	mux.HandleFunc("POST /listen", s.handleListenHTTP)
 	mux.HandleFunc("POST /forward", s.handleForwardHTTP)
 	mux.HandleFunc("POST /tunnel", s.handleTunnelHTTP)
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
 	return s.authMiddleware(mux)
 }
 
