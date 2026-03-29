@@ -2,19 +2,21 @@ package vtunnel
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
+	"github.com/hashicorp/yamux"
 )
 
 const (
@@ -28,7 +30,7 @@ const (
 type Client struct {
 	wsURL     string
 	headers   http.Header
-	sshConn   ssh.Conn
+	session   *yamux.Session
 	connMu    sync.RWMutex
 	forwards  map[int]string // remotePort -> localAddr
 	mu        sync.RWMutex
@@ -40,7 +42,14 @@ type Client struct {
 	keepAlive    time.Duration
 	reconnectMin time.Duration
 	reconnectMax time.Duration
-	authSigner   ssh.Signer // nil = no auth
+	privKey      ed25519.PrivateKey // nil = no auth
+
+	// Control stream state
+	ctrlStream *yamux.Stream
+	ctrlMu     sync.Mutex // serialize writes to control stream
+	pending    map[uint32]chan controlResponse
+	pendingMu  sync.Mutex
+	nextID     atomic.Uint32
 
 	// Domain-based forwards (Forward method)
 	domainForwards map[string]string // domain -> localAddr
@@ -54,11 +63,6 @@ func WithKeepAlive(d time.Duration) Option {
 	return func(c *Client) {
 		c.keepAlive = d
 	}
-}
-
-// WithPingInterval is an alias for WithKeepAlive for backward compatibility.
-func WithPingInterval(d time.Duration) Option {
-	return WithKeepAlive(d)
 }
 
 // WithHeaders sets HTTP headers for the WebSocket handshake.
@@ -77,15 +81,15 @@ func WithReconnectBackoff(min, max time.Duration) Option {
 }
 
 // WithKey sets the client private key for authentication ("vt-priv-...").
-// When set, the client authenticates via SSH public key auth and
-// verifies the server's identity using a derived host key.
+// When set, the client authenticates via ed25519 challenge-response handshake
+// and verifies the server's identity using a derived hash.
 func WithKey(privKey string) Option {
 	return func(c *Client) {
-		signer, err := parsePrivateKey(privKey)
+		key, err := parsePrivateKey(privKey)
 		if err != nil {
 			panic(fmt.Sprintf("vtunnel: invalid key: %v", err))
 		}
-		c.authSigner = signer
+		c.privKey = key
 	}
 }
 
@@ -106,13 +110,13 @@ func NewClient(wsURL string, opts ...Option) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
-	if c.authSigner == nil {
+	if c.privKey == nil {
 		log.Println("[vtunnel-client] WARNING: No key configured. Authentication is DISABLED. Do NOT use in production! Use --key or VTUNNEL_KEY.")
 	}
 	return c
 }
 
-// Connect establishes a WebSocket+SSH connection to the server.
+// Connect establishes a WebSocket+yamux connection to the server.
 func (c *Client) Connect() error {
 	if err := c.connectOnce(); err != nil {
 		return err
@@ -130,12 +134,12 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 
 	log.Printf("[vtunnel-client] Requesting listen: remote=%d -> local=%s", remotePort, localAddr)
 
-	sshConn := c.getSSH()
-	if sshConn == nil {
+	session := c.getSession()
+	if session == nil {
 		return nil // will be replayed on reconnect
 	}
 
-	return c.sendListen(sshConn, remotePort, localAddr)
+	return c.sendListen(remotePort, localAddr)
 }
 
 // Forward registers a domain-based forward. The proxy on the server will route
@@ -148,12 +152,12 @@ func (c *Client) Forward(domain, localAddr string) error {
 
 	log.Printf("[vtunnel-client] Requesting forward: %s -> %s", domain, localAddr)
 
-	sshConn := c.getSSH()
-	if sshConn == nil {
+	session := c.getSession()
+	if session == nil {
 		return nil // will be replayed on reconnect
 	}
 
-	return c.sendListenWithDomain(sshConn, localAddr, domain)
+	return c.sendListenWithDomain(localAddr, domain)
 }
 
 // Close closes the client and all connections.
@@ -163,16 +167,16 @@ func (c *Client) Close() error {
 		close(c.done)
 	})
 
-	sshConn := c.getSSH()
-	if sshConn != nil {
-		sshConn.Close()
-		c.setSSH(nil)
+	session := c.getSession()
+	if session != nil {
+		session.Close()
+		c.setSession(nil)
 	}
 	return nil
 }
 
-// dialOnce establishes a single WS+SSH connection.
-func (c *Client) dialOnce() (ssh.Conn, error) {
+// dialOnce establishes a single WS+yamux connection.
+func (c *Client) dialOnce() (*yamux.Session, error) {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: defaultHandshakeTimeout,
 	}
@@ -182,55 +186,142 @@ func (c *Client) dialOnce() (ssh.Conn, error) {
 	}
 
 	conn := NewWSConn(wsConn)
-	sshConfig := &ssh.ClientConfig{
-		User:    "vtunnel",
-		Timeout: defaultHandshakeTimeout,
+
+	// Custom auth handshake
+	conn.SetDeadline(time.Now().Add(defaultHandshakeTimeout))
+	if err := clientHandshake(conn, c.privKey); err != nil {
+		wsConn.Close()
+		return nil, fmt.Errorf("handshake: %w", err)
 	}
-	if c.authSigner != nil {
-		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(c.authSigner)}
-		hostSigner, err := deriveHostKey(c.authSigner.PublicKey())
-		if err != nil {
-			wsConn.Close()
-			return nil, fmt.Errorf("derive host key: %w", err)
-		}
-		sshConfig.HostKeyCallback = ssh.FixedHostKey(hostSigner.PublicKey())
-	} else {
-		sshConfig.HostKeyCallback = ssh.InsecureIgnoreHostKey()
-	}
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, "", sshConfig)
+	conn.SetDeadline(time.Time{})
+
+	// Create yamux client session
+	cfg := c.yamuxConfig()
+	session, err := yamux.Client(conn, cfg)
 	if err != nil {
 		wsConn.Close()
-		return nil, fmt.Errorf("SSH handshake: %w", err)
+		return nil, fmt.Errorf("yamux session: %w", err)
 	}
 
-	// Accept tunnel channels from server
-	go c.handleChannels(chans)
-	// Handle server-initiated requests (ping/pong)
-	go handleRequests(reqs)
-	// Keepalive
+	// Open control stream (first stream)
+	ctrlStream, err := session.OpenStream()
+	if err != nil {
+		session.Close()
+		return nil, fmt.Errorf("open control stream: %w", err)
+	}
+	// Reset control stream state (under locks to avoid racing with
+	// readControlResponses from the previous session).
+	c.ctrlMu.Lock()
+	c.ctrlStream = ctrlStream
+	c.ctrlMu.Unlock()
+
+	c.pendingMu.Lock()
+	c.pending = make(map[uint32]chan controlResponse)
+	c.pendingMu.Unlock()
+
+	// Start background goroutines
+	go c.readControlResponses(ctrlStream)
+	go c.acceptTunnelStreams(session)
+
+	return session, nil
+}
+
+// yamuxConfig returns the yamux configuration for the client.
+func (c *Client) yamuxConfig() *yamux.Config {
+	cfg := yamux.DefaultConfig()
+	cfg.MaxStreamWindowSize = 16 * 1024 * 1024
+	cfg.ConnectionWriteTimeout = 10 * time.Second
+	cfg.StreamOpenTimeout = 10 * time.Second
+	cfg.LogOutput = io.Discard
 	if c.keepAlive > 0 {
-		go keepAliveLoop(sshConn, c.keepAlive)
-	}
-
-	return sshConn, nil
-}
-
-// handleChannels accepts incoming SSH channels of type "tunnel" from the server.
-func (c *Client) handleChannels(chans <-chan ssh.NewChannel) {
-	for ch := range chans {
-		if ch.ChannelType() != "tunnel" {
-			ch.Reject(ssh.UnknownChannelType, "unknown channel type")
-			continue
+		cfg.EnableKeepAlive = true
+		cfg.KeepAliveInterval = c.keepAlive
+		// Adapt write timeout so keepalive pings time out promptly
+		if t := c.keepAlive * 3; t < cfg.ConnectionWriteTimeout {
+			cfg.ConnectionWriteTimeout = t
 		}
-		go c.handleTunnel(ch)
+	} else {
+		cfg.EnableKeepAlive = false
+	}
+	return cfg
+}
+
+// readControlResponses reads responses from the control stream and dispatches
+// them to the appropriate pending request channel by ID.
+func (c *Client) readControlResponses(stream *yamux.Stream) {
+	for {
+		var resp controlResponse
+		if err := readMsg(stream, &resp); err != nil {
+			// Session dying, clean up all pending
+			c.pendingMu.Lock()
+			for id, ch := range c.pending {
+				close(ch)
+				delete(c.pending, id)
+			}
+			c.pendingMu.Unlock()
+			return
+		}
+		c.pendingMu.Lock()
+		if ch, ok := c.pending[resp.ID]; ok {
+			ch <- resp
+			delete(c.pending, resp.ID)
+		}
+		c.pendingMu.Unlock()
 	}
 }
 
-// handleTunnel accepts a tunnel channel and pipes to the local target.
-func (c *Client) handleTunnel(ch ssh.NewChannel) {
+// sendControl sends a control request and waits for the response.
+func (c *Client) sendControl(req controlRequest) (controlResponse, error) {
+	id := c.nextID.Add(1)
+	req.ID = id
+
+	ch := make(chan controlResponse, 1)
+	c.pendingMu.Lock()
+	c.pending[id] = ch
+	c.pendingMu.Unlock()
+
+	c.ctrlMu.Lock()
+	err := writeMsg(c.ctrlStream, req)
+	c.ctrlMu.Unlock()
+	if err != nil {
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+		return controlResponse{}, err
+	}
+
+	select {
+	case resp, ok := <-ch:
+		if !ok {
+			return controlResponse{}, fmt.Errorf("connection closed")
+		}
+		return resp, nil
+	case <-c.ctx.Done():
+		c.pendingMu.Lock()
+		delete(c.pending, id)
+		c.pendingMu.Unlock()
+		return controlResponse{}, c.ctx.Err()
+	}
+}
+
+// acceptTunnelStreams accepts incoming yamux streams from the server (tunnel data).
+func (c *Client) acceptTunnelStreams(session *yamux.Session) {
+	for {
+		stream, err := session.AcceptStream()
+		if err != nil {
+			return // session closed
+		}
+		go c.handleTunnel(stream)
+	}
+}
+
+// handleTunnel reads the tunnel header from a stream and pipes to the local target.
+func (c *Client) handleTunnel(stream *yamux.Stream) {
+	defer stream.Close()
+
 	var req tunnelRequest
-	if err := json.Unmarshal(ch.ExtraData(), &req); err != nil {
-		ch.Reject(ssh.ConnectionFailed, "invalid tunnel request")
+	if err := readMsg(stream, &req); err != nil {
+		log.Printf("[vtunnel-client] Read tunnel header failed: %v", err)
 		return
 	}
 
@@ -240,21 +331,12 @@ func (c *Client) handleTunnel(ch ssh.NewChannel) {
 
 	if !ok {
 		log.Printf("[vtunnel-client] No forward for port %d", req.Port)
-		ch.Reject(ssh.ConnectionFailed, "no forward for port")
 		return
 	}
-
-	stream, reqs, err := ch.Accept()
-	if err != nil {
-		log.Printf("[vtunnel-client] Accept channel failed: %v", err)
-		return
-	}
-	go ssh.DiscardRequests(reqs)
 
 	localConn, err := c.dialTarget(localAddr)
 	if err != nil {
 		log.Printf("[vtunnel-client] Failed to connect to %s: %v", localAddr, err)
-		stream.Close()
 		return
 	}
 
@@ -286,15 +368,17 @@ func (c *Client) dialTarget(addr string) (net.Conn, error) {
 	return conn, nil
 }
 
-// sendListen sends a listen request via SSH.
-func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error {
-	payload := marshalJSON(listenRequest{Port: port, LocalAddr: localAddr})
-	ok, resp, err := sshConn.SendRequest("listen", true, payload)
+// sendListen sends a listen request via the control stream.
+func (c *Client) sendListen(port int, localAddr string) error {
+	resp, err := c.sendControl(controlRequest{
+		Type:          "listen",
+		listenRequest: listenRequest{Port: port, LocalAddr: localAddr},
+	})
 	if err != nil {
 		return fmt.Errorf("listen request: %w", err)
 	}
-	if !ok {
-		return fmt.Errorf("listen rejected: %s", string(resp))
+	if !resp.OK {
+		return fmt.Errorf("listen rejected: %s", resp.Error)
 	}
 	log.Printf("[vtunnel-client] Listen OK: port=%d", port)
 	return nil
@@ -308,53 +392,54 @@ func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error 
 // when MITM is active for :443 targets). If present, the rewritten address
 // is used instead of the original — this enables client-side TLS termination
 // so that MITM-decrypted plain HTTP is re-encrypted before reaching the target.
-func (c *Client) sendListenWithDomain(sshConn ssh.Conn, localAddr, domain string) error {
-	payload := marshalJSON(listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain})
-	ok, resp, err := sshConn.SendRequest("listen", true, payload)
+func (c *Client) sendListenWithDomain(localAddr, domain string) error {
+	resp, err := c.sendControl(controlRequest{
+		Type:          "listen",
+		listenRequest: listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain},
+	})
 	if err != nil {
 		return fmt.Errorf("forward request: %w", err)
 	}
-	if !ok {
-		return fmt.Errorf("forward rejected: %s", string(resp))
+	if !resp.OK {
+		return fmt.Errorf("forward rejected: %s", resp.Error)
 	}
 
 	// Server replies with the allocated port and optionally a rewritten
 	// LocalAddr (e.g. "tls://host:443" when MITM requires TLS wrapping).
-	var reply listenRequest
-	if err := json.Unmarshal(resp, &reply); err == nil && reply.Port > 0 {
+	if resp.Port > 0 {
 		addr := localAddr
-		if reply.LocalAddr != "" {
-			addr = reply.LocalAddr
+		if resp.LocalAddr != "" {
+			addr = resp.LocalAddr
 		}
 		c.mu.Lock()
-		c.forwards[reply.Port] = addr
+		c.forwards[resp.Port] = addr
 		c.mu.Unlock()
 	}
 
-	log.Printf("[vtunnel-client] Forward OK: %s (port=%d)", domain, reply.Port)
+	log.Printf("[vtunnel-client] Forward OK: %s (port=%d)", domain, resp.Port)
 	return nil
 }
 
-func (c *Client) setSSH(conn ssh.Conn) {
+func (c *Client) setSession(session *yamux.Session) {
 	c.connMu.Lock()
-	c.sshConn = conn
+	c.session = session
 	c.connMu.Unlock()
 }
 
-func (c *Client) getSSH() ssh.Conn {
+func (c *Client) getSession() *yamux.Session {
 	c.connMu.RLock()
-	conn := c.sshConn
+	session := c.session
 	c.connMu.RUnlock()
-	return conn
+	return session
 }
 
-// connectOnce dials, sets the SSH connection, and replays forwards.
+// connectOnce dials, sets the session, and replays forwards.
 func (c *Client) connectOnce() error {
-	conn, err := c.dialOnce()
+	session, err := c.dialOnce()
 	if err != nil {
 		return err
 	}
-	c.setSSH(conn)
+	c.setSession(session)
 	c.replayForwards()
 	return nil
 }
@@ -363,8 +448,8 @@ func (c *Client) connectOnce() error {
 // with exponential backoff. Runs until the client is closed.
 func (c *Client) connectionLoop() {
 	// Wait for current connection to die
-	if conn := c.getSSH(); conn != nil {
-		conn.Wait()
+	if session := c.getSession(); session != nil {
+		<-session.CloseChan()
 	}
 
 	bo := c.newBackoff()
@@ -389,8 +474,8 @@ func (c *Client) connectionLoop() {
 		log.Printf("[vtunnel-client] Reconnected to %s", c.wsURL)
 
 		// Block until this connection dies
-		if conn := c.getSSH(); conn != nil {
-			conn.Wait()
+		if session := c.getSession(); session != nil {
+			<-session.CloseChan()
 		}
 	}
 }
@@ -407,19 +492,19 @@ func (c *Client) replayForwards() {
 	}
 	c.mu.RUnlock()
 
-	sshConn := c.getSSH()
-	if sshConn == nil {
+	session := c.getSession()
+	if session == nil {
 		return
 	}
 
 	for port, addr := range fwds {
-		if err := c.sendListen(sshConn, port, addr); err != nil {
+		if err := c.sendListen(port, addr); err != nil {
 			log.Printf("[vtunnel-client] Re-listen failed for port %d: %v", port, err)
 		}
 	}
 
 	for domain, addr := range domFwds {
-		if err := c.sendListenWithDomain(sshConn, addr, domain); err != nil {
+		if err := c.sendListenWithDomain(addr, domain); err != nil {
 			log.Printf("[vtunnel-client] Re-forward failed for %s: %v", domain, err)
 		}
 	}
