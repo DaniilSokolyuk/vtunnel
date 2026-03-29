@@ -209,8 +209,15 @@ func (c *Client) dialOnce() (*yamux.Session, error) {
 		session.Close()
 		return nil, fmt.Errorf("open control stream: %w", err)
 	}
+	// Reset control stream state (under locks to avoid racing with
+	// readControlResponses from the previous session).
+	c.ctrlMu.Lock()
 	c.ctrlStream = ctrlStream
+	c.ctrlMu.Unlock()
+
+	c.pendingMu.Lock()
 	c.pending = make(map[uint32]chan controlResponse)
+	c.pendingMu.Unlock()
 
 	// Start background goroutines
 	go c.readControlResponses(ctrlStream)
