@@ -27,16 +27,32 @@ func (s *Server) SetDomainMapping(domain, target string) {
 func (s *Server) RemoveDomainMapping(domain string) {
 	s.domainMu.Lock()
 	delete(s.domainMap, domain)
+	delete(s.domainHeaders, domain)
 	s.domainMu.Unlock()
 	log.Printf("[vtunnel-proxy] Domain mapping removed: %s", domain)
 }
 
-func (s *Server) resolveDomain(host string) (string, bool) {
+// SetDomainHeaders registers headers that the MITM proxy injects into every
+// request routed to the given domain mapping. The key must match a key already
+// (or later) passed to SetDomainMapping — typically "host:port" including
+// wildcard forms (e.g. "*.example.test:443").
+func (s *Server) SetDomainHeaders(domain string, headers http.Header) {
+	s.domainMu.Lock()
+	if headers == nil {
+		delete(s.domainHeaders, domain)
+	} else {
+		s.domainHeaders[domain] = headers.Clone()
+	}
+	s.domainMu.Unlock()
+	log.Printf("[vtunnel-proxy] Domain headers set: %s (%d)", domain, len(headers))
+}
+
+func (s *Server) resolveDomain(host string) (string, http.Header, bool) {
 	s.domainMu.RLock()
 	defer s.domainMu.RUnlock()
 
 	if target, ok := s.domainMap[host]; ok {
-		return target, true
+		return target, s.domainHeaders[host], true
 	}
 
 	// Wildcard fallback — nginx-style semantics:
@@ -47,7 +63,7 @@ func (s *Server) resolveDomain(host string) (string, bool) {
 	// the longest pattern wins.
 	hostOnly, port, err := net.SplitHostPort(host)
 	if err != nil {
-		return "", false
+		return "", nil, false
 	}
 
 	var bestPattern, bestTarget string
@@ -66,9 +82,9 @@ func (s *Server) resolveDomain(host string) (string, bool) {
 		}
 	}
 	if bestPattern != "" {
-		return bestTarget, true
+		return bestTarget, s.domainHeaders[bestPattern], true
 	}
-	return "", false
+	return "", nil, false
 }
 
 // wildcardMatches reports whether a `domainMap` key is a wildcard pattern
@@ -160,12 +176,12 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check domain mapping
-	mapped, isMapped := h.server.resolveDomain(hostPort)
+	mapped, injectHeaders, isMapped := h.server.resolveDomain(hostPort)
 
 	// MITM path: intercept TLS for mapped domains
 	if h.certCache != nil && isMapped {
 		log.Printf("[vtunnel-proxy] CONNECT MITM %s", hostPort)
-		h.handleConnectMITM(w, r, hostPort, mapped)
+		h.handleConnectMITM(w, r, hostPort, mapped, injectHeaders)
 		return
 	}
 
@@ -193,7 +209,7 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string) {
+func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string, injectHeaders http.Header) {
 	// Get a net.Conn to the client — works for both HTTP/1.x and HTTP/2
 	var rawConn net.Conn
 
@@ -233,11 +249,11 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	defer tlsConn.Close()
 
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		h.serveMITMH2(tlsConn, mappedTarget)
+		h.serveMITMH2(tlsConn, mappedTarget, injectHeaders)
 		return
 	}
 
-	h.serveMITMH1(tlsConn, mappedTarget)
+	h.serveMITMH1(tlsConn, mappedTarget, injectHeaders)
 }
 
 func (h *proxyHandler) probeH2C(target string) bool {
@@ -266,7 +282,7 @@ func (h *proxyHandler) probeH2C(target string) bool {
 	return ok
 }
 
-func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
+func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string, injectHeaders http.Header) {
 	var rt http.RoundTripper
 	scheme := "http"
 
@@ -308,6 +324,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 			r.URL.Host = target
 			r.RequestURI = ""
 			removeHopByHop(r.Header, true)
+			injectConfiguredHeaders(r.Header, injectHeaders)
 
 			resp, err := rt.RoundTrip(r)
 			if err != nil {
@@ -336,7 +353,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string) {
 	})
 }
 
-func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string) {
+func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string, injectHeaders http.Header) {
 	var transport *http.Transport
 
 	if tlsHost, ok := h.server.tlsUpstreamHost(target); ok {
@@ -377,6 +394,7 @@ func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string) {
 		req.URL.Host = target
 		req.RequestURI = ""
 		removeHopByHop(req.Header, false)
+		injectConfiguredHeaders(req.Header, injectHeaders)
 
 		resp, err := transport.RoundTrip(req)
 		if err != nil {
@@ -409,10 +427,11 @@ func (h *proxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		hostPort = net.JoinHostPort(hostPort, port)
 	}
 
-	if mapped, ok := h.server.resolveDomain(hostPort); ok {
+	if mapped, injectHeaders, ok := h.server.resolveDomain(hostPort); ok {
 		log.Printf("[vtunnel-proxy] %s %s %s -> %s", r.URL.Scheme, r.Method, hostPort, mapped)
 		r.URL.Host = mapped
 		r.URL.Scheme = "http"
+		injectConfiguredHeaders(r.Header, injectHeaders)
 	}
 
 	if r.URL.Scheme == "" {
@@ -622,6 +641,16 @@ var hopByHopHeaders = []string{
 	"Trailer",
 	"Transfer-Encoding",
 	"Upgrade",
+}
+
+// injectConfiguredHeaders overwrites headers on the forwarded request using
+// values configured on the corresponding domain forward. Set-not-Add: the
+// controlplane is authoritative, so any value the sandbox application sent
+// for the same name is replaced. A nil inject map is a no-op.
+func injectConfiguredHeaders(dst, inject http.Header) {
+	for name, values := range inject {
+		dst[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+	}
 }
 
 func removeHopByHop(h http.Header, preserveTeTrailers bool) {

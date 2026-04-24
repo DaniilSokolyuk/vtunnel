@@ -89,6 +89,7 @@ vtunnel client [flags]
 | `-server` | WebSocket URL (required) | — |
 | `-key` | Private key (`vt-priv-...`) | `$VTUNNEL_KEY` |
 | `-forward` | Forward mapping (repeatable, at least 1) | — |
+| `-H` / `-header` | Header injected into MITM-proxied requests for the preceding `-forward` (repeatable) | — |
 
 ### Forward formats
 
@@ -132,6 +133,36 @@ Rules:
 
 # Same client-side TLS, but port-based
 -forward 8085=tls://www.google.com:443
+```
+
+### Inject headers
+
+The MITM proxy can inject HTTP headers into requests forwarded for a specific domain — useful when the controlplane holds credentials that the sandbox application shouldn't see:
+
+```bash
+vtunnel client -server ws://... \
+  -forward api.example.test=localhost:8081 \
+    -H 'Authorization: Bearer sk-ant-xxx' \
+    -H 'X-Env: preview' \
+  -forward auth.example.test=localhost:8082 \
+    -H 'Authorization: Basic <token>' \
+  -forward plain.example.test=plain.example.test:443
+```
+
+Rules:
+
+- Each `-H` attaches to the **most recent** `-forward`. Order matters.
+- Only domain-flavored forwards (not port-flavored) accept `-H`.
+- Injection happens inside the MITM path — the server needs `-proxy-mitm-ca` for headers to take effect.
+- Values overwrite any same-named header the sandbox application sent (Set, not Add).
+
+The Go library mirrors the CLI with `vtunnel.WithHeader`:
+
+```go
+client.Forward("api.example.test:443", "localhost:8081",
+    vtunnel.WithHeader("Authorization", "Bearer sk-ant-xxx"),
+    vtunnel.WithHeader("X-Env", "preview"),
+)
 ```
 
 ## Authentication
