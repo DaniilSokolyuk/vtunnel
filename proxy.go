@@ -33,9 +33,68 @@ func (s *Server) RemoveDomainMapping(domain string) {
 
 func (s *Server) resolveDomain(host string) (string, bool) {
 	s.domainMu.RLock()
-	target, ok := s.domainMap[host]
-	s.domainMu.RUnlock()
-	return target, ok
+	defer s.domainMu.RUnlock()
+
+	if target, ok := s.domainMap[host]; ok {
+		return target, true
+	}
+
+	// Wildcard fallback — nginx-style semantics:
+	//   - `*.suffix:port`  (leftmost wildcard) matches one or more extra labels.
+	//   - `prefix.*:port`  (rightmost wildcard) matches one or more extra labels.
+	//   - `*` must be a complete label on a dot border; no `*` in the middle.
+	// Priority: exact (above) > leftmost > rightmost; within a group,
+	// the longest pattern wins.
+	hostOnly, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return "", false
+	}
+
+	var bestPattern, bestTarget string
+	var bestLeft bool
+	for pattern, target := range s.domainMap {
+		isLeft, ok := wildcardMatches(pattern, hostOnly, port)
+		if !ok {
+			continue
+		}
+		if bestPattern == "" ||
+			(isLeft && !bestLeft) ||
+			(isLeft == bestLeft && len(pattern) > len(bestPattern)) {
+			bestPattern = pattern
+			bestTarget = target
+			bestLeft = isLeft
+		}
+	}
+	if bestPattern != "" {
+		return bestTarget, true
+	}
+	return "", false
+}
+
+// wildcardMatches reports whether a `domainMap` key is a wildcard pattern
+// that matches `host:port`. Returns (isLeftmost, matched).
+func wildcardMatches(pattern, host, port string) (bool, bool) {
+	patHost, patPort, err := net.SplitHostPort(pattern)
+	if err != nil {
+		return false, false
+	}
+	if patPort != port {
+		return false, false
+	}
+	if strings.HasPrefix(patHost, "*.") {
+		suffix := patHost[1:] // ".suffix"
+		if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {
+			return true, true
+		}
+		return false, false
+	}
+	if strings.HasSuffix(patHost, ".*") {
+		prefix := patHost[:len(patHost)-1] // "prefix."
+		if strings.HasPrefix(host, prefix) && len(host) > len(prefix) {
+			return false, true
+		}
+	}
+	return false, false
 }
 
 func (s *Server) StartProxy(addr string) error {

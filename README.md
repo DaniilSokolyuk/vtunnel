@@ -108,6 +108,23 @@ vtunnel client [flags]
 
 A domain without a port registers on both `:80` and `:443`.
 
+**Wildcard domain** — match a family of hostnames with one entry:
+
+```bash
+# All subdomains of example.test → one local service
+-forward *.example.test=localhost:8080
+
+# All hosts starting with mail. → one local service
+-forward mail.*=localhost:8080
+```
+
+Rules:
+
+- `*` must be a **complete label on a dot border**, either the leftmost (`*.example.test`) or the rightmost (`mail.*`). Middle or partial-label asterisks (`a.*.b`, `w*.example.test`) are treated as literal strings.
+- Matches **one or more** extra labels: `*.example.test` matches `a.example.test` and `a.b.example.test`, but not the apex `example.test`. `mail.*` matches `mail.example.test` and `mail.foo.example.test`, but not `mail` alone.
+- **Priority**: exact forwards win over wildcards; among wildcards, leftmost beats rightmost; within a group, the longer pattern wins.
+- Per-subdomain routing on the client side is the controlplane's job — vtunnel just delivers every matching request to the configured target.
+
 **Port** — server opens a TCP port, tunnels all connections:
 
 ```bash
