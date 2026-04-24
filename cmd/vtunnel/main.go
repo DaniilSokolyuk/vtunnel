@@ -41,6 +41,9 @@ Client flags:
                     Port:   -forward 8080=localhost:3000
                     Domain: -forward llmproxy.local=localhost:8080
                     TLS:    -forward 8085=tls://www.google.com:443
+  -H value          Inject HTTP header into MITM-proxied requests for the
+  -header value     preceding -forward (domain-flavored). Format "Name: Value".
+                    Repeatable. Each -H attaches to the most recent -forward.
 `)
 	os.Exit(1)
 }
@@ -126,6 +129,9 @@ func runClient(args []string) {
 	key := fs.String("key", os.Getenv("VTUNNEL_KEY"), "Private key (vt-priv-...)")
 	var forwards forwardList
 	fs.Var(&forwards, "forward", "Port forward: remotePort=localAddr (repeatable)")
+	headers := headerList{forwards: &forwards}
+	fs.Var(&headers, "H", "Header injected into MITM-proxied requests for the preceding domain -forward")
+	fs.Var(&headers, "header", "Alias for -H")
 	fs.Parse(args)
 
 	if *server == "" {
@@ -148,7 +154,11 @@ func runClient(args []string) {
 
 	for _, f := range forwards {
 		if f.domain != "" {
-			if err := client.Forward(f.domain, f.localAddr); err != nil {
+			var opts []vtunnel.ForwardOption
+			for _, h := range f.headers {
+				opts = append(opts, vtunnel.WithHeader(h.name, h.value))
+			}
+			if err := client.Forward(f.domain, f.localAddr, opts...); err != nil {
 				log.Fatalf("[vtunnel] Forward error for %s: %v", f.domain, err)
 			}
 		} else {
@@ -170,6 +180,12 @@ type forward struct {
 	remotePort int    // port-based forward (mutually exclusive with domain)
 	domain     string // domain-based forward (mutually exclusive with remotePort)
 	localAddr  string
+	headers    []forwardHeader
+}
+
+type forwardHeader struct {
+	name  string
+	value string
 }
 
 // forwardList implements flag.Value for repeatable -forward flags
@@ -188,6 +204,37 @@ func (f *forwardList) Set(val string) error {
 	} else {
 		*f = append(*f, forward{domain: left, localAddr: right})
 	}
+	return nil
+}
+
+// headerList implements flag.Value for repeatable -H/-header flags.
+// Each value attaches to the most recently appended entry in the referenced
+// forwardList, which mirrors how the flags appear on the CLI (Go stdlib flag
+// calls Set in argument order).
+type headerList struct {
+	forwards *forwardList
+}
+
+func (h *headerList) String() string { return "" }
+
+func (h *headerList) Set(val string) error {
+	if h.forwards == nil || len(*h.forwards) == 0 {
+		return fmt.Errorf("-H/-header %q: no preceding -forward", val)
+	}
+	last := &(*h.forwards)[len(*h.forwards)-1]
+	if last.domain == "" {
+		return fmt.Errorf("-H/-header %q: applies only to domain -forward (got port %d)", val, last.remotePort)
+	}
+	name, value, ok := strings.Cut(val, ":")
+	if !ok {
+		return fmt.Errorf("-H/-header %q: expected \"Name: Value\"", val)
+	}
+	name = strings.TrimSpace(name)
+	value = strings.TrimSpace(value)
+	if name == "" {
+		return fmt.Errorf("-H/-header %q: empty header name", val)
+	}
+	last.headers = append(last.headers, forwardHeader{name: name, value: value})
 	return nil
 }
 

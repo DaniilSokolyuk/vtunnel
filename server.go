@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ type Server struct {
 
 	// Proxy state (survives reconnections)
 	domainMap     map[string]string
+	domainHeaders map[string]http.Header // same keys as domainMap; headers injected into MITM-proxied requests
 	domainMu      sync.RWMutex
 	proxyListener net.Listener
 	proxyDone     chan struct{}
@@ -92,11 +94,12 @@ func WithClientKey(pubKey string) ServerOption {
 // NewServer creates a new vtunnel server.
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
-		keepAlive:   defaultKeepAlive,
-		connReady:   make(chan struct{}),
-		listeners:   make(map[int]net.Listener),
-		domainMap:   make(map[string]string),
-		tlsUpstream: make(map[string]string),
+		keepAlive:     defaultKeepAlive,
+		connReady:     make(chan struct{}),
+		listeners:     make(map[int]net.Listener),
+		domainMap:     make(map[string]string),
+		domainHeaders: make(map[string]http.Header),
+		tlsUpstream:   make(map[string]string),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -311,8 +314,15 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 			// Domain without port — register for both :80 and :443.
 			s.SetDomainMapping(net.JoinHostPort(req.Domain, "80"), target)
 			s.SetDomainMapping(net.JoinHostPort(req.Domain, "443"), target)
+			if req.Headers != nil {
+				s.SetDomainHeaders(net.JoinHostPort(req.Domain, "80"), req.Headers)
+				s.SetDomainHeaders(net.JoinHostPort(req.Domain, "443"), req.Headers)
+			}
 		} else {
 			s.SetDomainMapping(req.Domain, target)
+			if req.Headers != nil {
+				s.SetDomainHeaders(req.Domain, req.Headers)
+			}
 		}
 	}
 

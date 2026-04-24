@@ -43,7 +43,14 @@ type Client struct {
 	authSigner   ssh.Signer // nil = no auth
 
 	// Domain-based forwards (Forward method)
-	domainForwards map[string]string // domain -> localAddr
+	domainForwards map[string]*domainForward // domain -> forward config
+}
+
+// domainForward is the client-side record for a domain-based forward,
+// including headers the server should inject into MITM-proxied requests.
+type domainForward struct {
+	localAddr string
+	headers   http.Header
 }
 
 // Option configures a Client.
@@ -89,13 +96,35 @@ func WithKey(privKey string) Option {
 	}
 }
 
+// ForwardOption configures a single call to Client.Forward.
+type ForwardOption func(*forwardConfig)
+
+type forwardConfig struct {
+	headers http.Header
+}
+
+// WithHeader declares an HTTP header that the server's MITM proxy will inject
+// into every request forwarded through the tunnel for this domain. Use
+// multiple WithHeader calls to add several headers. Values with the same
+// name accumulate (http.Header.Add semantics on the client side); on the
+// server side the whole set overwrites any matching headers the sandbox
+// application sent.
+func WithHeader(name, value string) ForwardOption {
+	return func(fc *forwardConfig) {
+		if fc.headers == nil {
+			fc.headers = http.Header{}
+		}
+		fc.headers.Add(name, value)
+	}
+}
+
 // NewClient creates a new vtunnel client.
 func NewClient(wsURL string, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
 		wsURL:          wsURL,
 		forwards:       make(map[int]string),
-		domainForwards: make(map[string]string),
+		domainForwards: make(map[string]*domainForward),
 		done:           make(chan struct{}),
 		ctx:            ctx,
 		cancel:         cancel,
@@ -141,9 +170,17 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 // Forward registers a domain-based forward. The proxy on the server will route
 // requests for the given domain through the tunnel. The server auto-allocates
 // an internal port; the caller only deals with domain names.
-func (c *Client) Forward(domain, localAddr string) error {
+//
+// Optional ForwardOptions declare headers (WithHeader) that the server injects
+// into MITM-proxied requests for this domain.
+func (c *Client) Forward(domain, localAddr string, opts ...ForwardOption) error {
+	cfg := forwardConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
 	c.mu.Lock()
-	c.domainForwards[domain] = localAddr
+	c.domainForwards[domain] = &domainForward{localAddr: localAddr, headers: cfg.headers}
 	c.mu.Unlock()
 
 	log.Printf("[vtunnel-client] Requesting forward: %s -> %s", domain, localAddr)
@@ -153,7 +190,7 @@ func (c *Client) Forward(domain, localAddr string) error {
 		return nil // will be replayed on reconnect
 	}
 
-	return c.sendListenWithDomain(sshConn, localAddr, domain)
+	return c.sendListenWithDomain(sshConn, localAddr, domain, cfg.headers)
 }
 
 // Close closes the client and all connections.
@@ -308,8 +345,8 @@ func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error 
 // when MITM is active for :443 targets). If present, the rewritten address
 // is used instead of the original — this enables client-side TLS termination
 // so that MITM-decrypted plain HTTP is re-encrypted before reaching the target.
-func (c *Client) sendListenWithDomain(sshConn ssh.Conn, localAddr, domain string) error {
-	payload := marshalJSON(listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain})
+func (c *Client) sendListenWithDomain(sshConn ssh.Conn, localAddr, domain string, headers http.Header) error {
+	payload := marshalJSON(listenRequest{Port: 0, LocalAddr: localAddr, Domain: domain, Headers: headers})
 	ok, resp, err := sshConn.SendRequest("listen", true, payload)
 	if err != nil {
 		return fmt.Errorf("forward request: %w", err)
@@ -401,9 +438,9 @@ func (c *Client) replayForwards() {
 	for port, addr := range c.forwards {
 		fwds[port] = addr
 	}
-	domFwds := make(map[string]string, len(c.domainForwards))
-	for domain, addr := range c.domainForwards {
-		domFwds[domain] = addr
+	domFwds := make(map[string]*domainForward, len(c.domainForwards))
+	for domain, df := range c.domainForwards {
+		domFwds[domain] = df
 	}
 	c.mu.RUnlock()
 
@@ -418,8 +455,8 @@ func (c *Client) replayForwards() {
 		}
 	}
 
-	for domain, addr := range domFwds {
-		if err := c.sendListenWithDomain(sshConn, addr, domain); err != nil {
+	for domain, df := range domFwds {
+		if err := c.sendListenWithDomain(sshConn, df.localAddr, domain, df.headers); err != nil {
 			log.Printf("[vtunnel-client] Re-forward failed for %s: %v", domain, err)
 		}
 	}

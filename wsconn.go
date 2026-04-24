@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"sync"
 	"time"
 
@@ -157,9 +158,10 @@ func generateHostKey() (ssh.Signer, error) {
 
 // listenRequest is sent by the client to request the server to listen on a port.
 type listenRequest struct {
-	Port      int    `json:"port"`
-	LocalAddr string `json:"local_addr,omitempty"`
-	Domain    string `json:"domain,omitempty"` // proxy domain mapping (used by Forward)
+	Port      int         `json:"port"`
+	LocalAddr string      `json:"local_addr,omitempty"`
+	Domain    string      `json:"domain,omitempty"`  // proxy domain mapping (used by Forward)
+	Headers   http.Header `json:"headers,omitempty"` // headers injected into MITM-proxied requests for Domain
 }
 
 // tunnelRequest is the extra data sent when opening a tunnel SSH channel.
