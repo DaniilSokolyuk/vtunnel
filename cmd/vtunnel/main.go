@@ -15,7 +15,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	vtunnel "github.com/DaniilSokolyuk/vtunnel"
+	vtunnel "github.com/vivid-money/vtunnel"
 )
 
 var upgrader = websocket.Upgrader{

@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/vivid-money/vtunnel"
 )
 
 // setupBareRepo creates a bare git repo with one commit, runs update-server-info

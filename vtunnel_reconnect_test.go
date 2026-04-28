@@ -14,7 +14,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/vivid-money/vtunnel"
 )
 
 // --- helpers ---

@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/vivid-money/vtunnel"
 )
 
 // TestDomainForwardHTTP tests domain-based forwarding through the HTTP proxy.

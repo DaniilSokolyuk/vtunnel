@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/vivid-money/vtunnel"
 )
 
 // TestProxyMitmHeaderInjection drives HTTPS via a MITM proxy with configured

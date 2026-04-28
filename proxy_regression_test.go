@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/vivid-money/vtunnel"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
 )

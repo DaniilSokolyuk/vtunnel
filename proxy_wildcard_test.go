@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/DaniilSokolyuk/vtunnel"
+	"github.com/vivid-money/vtunnel"
 )
 
 // TestProxyWildcardMatching drives the full CONNECT path through a real proxy

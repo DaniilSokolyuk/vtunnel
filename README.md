@@ -58,7 +58,7 @@ curl https://public-api.com         # direct, bypasses tunnel
 ## Install
 
 ```bash
-go install github.com/DaniilSokolyuk/vtunnel/cmd/vtunnel@latest
+go install github.com/vivid-money/vtunnel/cmd/vtunnel@latest
 ```
 
 Or grab a binary from [Releases](https://github.com/vivid-money/vtunnel/releases).
@@ -198,7 +198,7 @@ SSH protocol over WebSocket — multiplexed channels, encryption, and auth for f
 
 ## Go Library
 
-See [pkg.go.dev](https://pkg.go.dev/github.com/DaniilSokolyuk/vtunnel) and [example/](example/).
+See [pkg.go.dev](https://pkg.go.dev/github.com/vivid-money/vtunnel) and [example/](example/).
 
 ## License
 
