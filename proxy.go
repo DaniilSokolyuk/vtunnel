@@ -344,11 +344,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string, injectHeade
 			removeHopByHop(w.Header(), false)
 			w.WriteHeader(resp.StatusCode)
 			flushingCopy(w, resp.Body)
-			for k, vv := range resp.Trailer {
-				for _, v := range vv {
-					w.Header().Set(http.TrailerPrefix+k, v)
-				}
-			}
+			forwardTrailers(w, resp)
 		}),
 	})
 }
@@ -465,6 +461,7 @@ func (h *proxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// Plain io.Copy leaves the http.ResponseWriter's bufio buffer un-flushed
 	// between writes, batching SSE events into one chunk at end-of-body.
 	flushingCopy(w, resp.Body)
+	forwardTrailers(w, resp)
 }
 
 // serveHijack handles HTTP/1.x CONNECT by hijacking the connection.
@@ -564,6 +561,17 @@ func flushingCopy(dst io.Writer, src io.Reader) {
 		}
 		if readErr != nil {
 			return
+		}
+	}
+}
+
+// forwardTrailers re-emits upstream response trailers (e.g. grpc-status)
+// after the body has been copied. Trailer names are unknown until the body
+// is drained, so they are sent unannounced via http.TrailerPrefix.
+func forwardTrailers(w http.ResponseWriter, resp *http.Response) {
+	for k, vv := range resp.Trailer {
+		for _, v := range vv {
+			w.Header().Set(http.TrailerPrefix+k, v)
 		}
 	}
 }
