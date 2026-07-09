@@ -178,9 +178,9 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Check domain mapping
 	mapped, injectHeaders, isMapped := h.server.resolveDomain(hostPort)
 
-	// MITM path: intercept TLS for mapped domains
+	// A mapped domain may still carry non-TLS traffic (e.g. h2c gRPC), so the
+	// MITM-vs-tunnel choice is made after peeking the client's first byte.
 	if h.certCache != nil && isMapped {
-		log.Printf("[vtunnel-proxy] CONNECT MITM %s", hostPort)
 		h.handleConnectMITM(w, r, hostPort, mapped, injectHeaders)
 		return
 	}
@@ -209,34 +209,42 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string, injectHeaders http.Header) {
-	// Get a net.Conn to the client — works for both HTTP/1.x and HTTP/2
-	var rawConn net.Conn
+// tlsHandshakeRecordType is the leading byte of every TLS record starting a
+// handshake (RFC 8446 §5.1). A CONNECT tunnel's client bytes are peeked and
+// compared against it to decide MITM vs. raw fallback, below.
+const tlsHandshakeRecordType = 0x16
 
-	switch r.ProtoMajor {
-	case 1:
-		clientConn, brw, err := hijack(w)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer clientConn.Close()
-		brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
-		brw.Flush()
-		// net/http may have already buffered tunneled bytes after CONNECT headers.
-		// Keep reading through that buffer so TLS handshake bytes are not dropped.
-		rawConn = newBufferedConn(clientConn, brw.Reader)
-	default: // HTTP/2+
-		w.WriteHeader(http.StatusOK)
-		if err := http.NewResponseController(w).Flush(); err != nil {
-			return
-		}
-		rawConn = newH2StreamConn(r.Body, w)
-		defer rawConn.Close()
+// handleConnectMITM establishes the client tunnel for a mapped domain, then
+// peeks its first byte to tell TLS apart from cleartext. h2c gRPC clients
+// send the plaintext HTTP/2 preface over CONNECT, not a ClientHello — MITM's
+// TLS handshake fails hard on that and kills the tunnel, so cleartext falls
+// back to the same raw byte pipe the no-MITM path uses.
+func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string, injectHeaders http.Header) {
+	rawConn, err := acceptConnectTunnel(w, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 
+	br := bufio.NewReader(rawConn)
+	first, err := br.Peek(1)
+	if err != nil {
+		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
+		rawConn.Close()
+		return
+	}
+	tunnelConn := newBufferedConn(rawConn, br)
+
+	if first[0] != tlsHandshakeRecordType {
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw fallback)", connectAuthority, mappedTarget)
+		defer tunnelConn.Close()
+		dialAndPipe(mappedTarget, tunnelConn)
+		return
+	}
+
+	log.Printf("[vtunnel-proxy] CONNECT MITM %s", connectAuthority)
 	connectHost := hostFromAuthority(connectAuthority)
-	tlsConn := tls.Server(rawConn, &tls.Config{
+	tlsConn := tls.Server(tunnelConn, &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return h.certCache.getCert(hello, connectHost)
 		},
@@ -244,6 +252,7 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		log.Printf("[vtunnel-proxy] MITM TLS handshake failed: %v", err)
+		tunnelConn.Close()
 		return
 	}
 	defer tlsConn.Close()
@@ -254,6 +263,48 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	}
 
 	h.serveMITMH1(tlsConn, mappedTarget, injectHeaders)
+}
+
+// acceptConnectTunnel sends the CONNECT success response and returns a
+// net.Conn to the client, covering both HTTP/1.x (hijack) and HTTP/2 (RFC
+// 8441 extended CONNECT) callers.
+func acceptConnectTunnel(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
+	if r.ProtoMajor != 1 {
+		w.WriteHeader(http.StatusOK)
+		if err := http.NewResponseController(w).Flush(); err != nil {
+			return nil, err
+		}
+		return newH2StreamConn(r.Body, w), nil
+	}
+
+	clientConn, brw, err := hijack(w)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		clientConn.Close()
+		return nil, err
+	}
+	if err := brw.Flush(); err != nil {
+		clientConn.Close()
+		return nil, err
+	}
+	// net/http may have already buffered tunneled bytes after CONNECT headers.
+	// Keep reading through that buffer so handshake/preface bytes aren't dropped.
+	return newBufferedConn(clientConn, brw.Reader), nil
+}
+
+// dialAndPipe dials the mapped target and pipes bytes bidirectionally — the
+// same behavior as the no-MITM CONNECT path, reused so cleartext traffic on
+// a MITM-configured domain still reaches its upstream.
+func dialAndPipe(target string, clientConn net.Conn) {
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		log.Printf("[vtunnel-proxy] dial %s failed: %v", target, err)
+		return
+	}
+	defer targetConn.Close()
+	dualStream(targetConn, clientConn, clientConn)
 }
 
 func (h *proxyHandler) probeH2C(target string) bool {
