@@ -218,40 +218,66 @@ const peekTimeout = 30 * time.Second
 // dialTimeout bounds every upstream dial the proxy makes.
 const dialTimeout = 10 * time.Second
 
-// h2c gRPC clients send a plaintext HTTP/2 preface over CONNECT, not a TLS
-// ClientHello — MITM would hard-fail on that, so cleartext gets a raw pipe.
+// handleConnectMITM decides, from the client's opening bytes, how to serve a
+// mapped domain: TLS goes through MITM, cleartext h2c is terminated so headers
+// can still be injected, and any other cleartext is a raw byte pipe.
 func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string, injectHeaders http.Header) {
 	rawConn := acceptConnectTunnel(w, r)
 	if rawConn == nil {
 		return
 	}
 
-	// Bound the first-byte wait; clear once decided so the tunnel isn't capped.
+	// Bound the wait for the opening bytes so an idle CONNECT can't park a
+	// goroutine and fd; cleared once the tunnel kind is decided.
 	rawConn.SetReadDeadline(time.Now().Add(peekTimeout))
 	br := bufio.NewReader(rawConn)
 	first, err := br.Peek(1)
-	rawConn.SetReadDeadline(time.Time{})
 	if err != nil {
+		rawConn.SetReadDeadline(time.Time{})
 		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
 		rawConn.Close()
 		return
 	}
+
+	// A TLS ClientHello starts with 0x16; cleartext carrying the HTTP/2 client
+	// preface is h2c, which we can terminate and inject into just like MITM.
+	isTLS := first[0] == tlsHandshakeRecordType
+	isH2C := !isTLS && isH2CPreface(br)
+	rawConn.SetReadDeadline(time.Time{})
 	tunnelConn := newBufferedConn(rawConn, br)
 
-	if first[0] != tlsHandshakeRecordType {
-		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw fallback)", connectAuthority, mappedTarget)
-		if len(injectHeaders) > 0 {
-			// Raw byte pipe can't parse h2c to inject headers; controlplane creds are skipped.
-			log.Printf("[vtunnel-proxy] WARNING: %s: %d configured header(s) NOT injected on cleartext fallback", connectAuthority, len(injectHeaders))
-		}
-		defer tunnelConn.Close()
-		dialAndPipe(mappedTarget, tunnelConn)
-		return
-	}
+	// The h2c injection path runs a nested HTTP/2 server on the tunnel conn,
+	// which is only safe on a real socket. An HTTP/2 CONNECT tunnel is backed by
+	// the outer response writer, whose lifetime ends with the outer handler, so
+	// a nested server's async write could fire after it and panic. Restrict
+	// injection to HTTP/1.1 CONNECT (a hijacked socket); the rare h2 CONNECT
+	// tunnel keeps the raw pipe.
+	overHijackedSocket := r.ProtoMajor == 1
 
+	switch {
+	case isTLS:
+		h.serveMITMTLS(tunnelConn, connectAuthority, mappedTarget, injectHeaders)
+	case isH2C && overHijackedSocket:
+		defer tunnelConn.Close()
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext h2c, injecting headers)", connectAuthority, mappedTarget)
+		h.serveInjectingH2(tunnelConn, mappedTarget, injectHeaders)
+	default:
+		defer tunnelConn.Close()
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw pipe)", connectAuthority, mappedTarget)
+		if len(injectHeaders) > 0 {
+			// Raw byte pipe can't inject headers; only HTTP/1.1-CONNECT h2c is terminated.
+			log.Printf("[vtunnel-proxy] WARNING: %s: %d header(s) NOT injected (raw pipe)", connectAuthority, len(injectHeaders))
+		}
+		dialAndPipe(mappedTarget, tunnelConn)
+	}
+}
+
+// serveMITMTLS terminates the client's TLS inside the tunnel with an on-the-fly
+// cert, then proxies the decrypted h2/h1 requests to the upstream.
+func (h *proxyHandler) serveMITMTLS(clientConn net.Conn, connectAuthority, target string, injectHeaders http.Header) {
 	log.Printf("[vtunnel-proxy] CONNECT MITM %s", connectAuthority)
 	connectHost := hostFromAuthority(connectAuthority)
-	tlsConn := tls.Server(tunnelConn, &tls.Config{
+	tlsConn := tls.Server(clientConn, &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			return h.certCache.getCert(hello, connectHost)
 		},
@@ -259,17 +285,16 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	})
 	if err := tlsConn.Handshake(); err != nil {
 		log.Printf("[vtunnel-proxy] MITM TLS handshake failed: %v", err)
-		tunnelConn.Close()
+		clientConn.Close()
 		return
 	}
 	defer tlsConn.Close()
 
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		h.serveMITMH2(tlsConn, mappedTarget, injectHeaders)
+		h.serveInjectingH2(tlsConn, target, injectHeaders)
 		return
 	}
-
-	h.serveMITMH1(tlsConn, mappedTarget, injectHeaders)
+	h.serveMITMH1(tlsConn, target, injectHeaders)
 }
 
 // acceptConnectTunnel sends the CONNECT success response and returns a net.Conn
@@ -316,6 +341,17 @@ func dialAndPipe(target string, clientConn net.Conn) {
 	dualStream(targetConn, clientConn, clientConn)
 }
 
+// isH2CPreface reports whether the buffered stream opens with the HTTP/2 client
+// connection preface (RFC 7540 §3.5) — the marker of cleartext h2c, which sends
+// it over CONNECT in place of a TLS ClientHello.
+func isH2CPreface(br *bufio.Reader) bool {
+	p, err := br.Peek(len(http2.ClientPreface))
+	if err != nil {
+		return false
+	}
+	return string(p) == http2.ClientPreface
+}
+
 func (h *proxyHandler) probeH2C(target string) bool {
 	if v, ok := h.h2cProbed.Load(target); ok {
 		return v.(bool)
@@ -342,7 +378,11 @@ func (h *proxyHandler) probeH2C(target string) bool {
 	return ok
 }
 
-func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string, injectHeaders http.Header) {
+// serveInjectingH2 serves an already-established HTTP/2 client connection —
+// TLS-terminated or cleartext h2c — and proxies each request to target with the
+// configured headers injected. It works on any net.Conn, so MITM'd TLS and raw
+// h2c share one path.
+func (h *proxyHandler) serveInjectingH2(clientConn net.Conn, target string, injectHeaders http.Header) {
 	var rt http.RoundTripper
 	scheme := "http"
 
@@ -378,7 +418,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string, injectHeade
 	}
 
 	h2srv := &http2.Server{}
-	h2srv.ServeConn(tlsConn, &http2.ServeConnOpts{
+	h2srv.ServeConn(clientConn, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			r.URL.Scheme = scheme
 			r.URL.Host = target
