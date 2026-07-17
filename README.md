@@ -155,6 +155,7 @@ Rules:
 - Only domain-flavored forwards (not port-flavored) accept `-H`.
 - Injection happens inside the MITM path — the server needs `-proxy-mitm-ca` for headers to take effect.
 - Values overwrite any same-named header the sandbox application sent (Set, not Add).
+- Cleartext h2c gRPC over CONNECT bypasses MITM (raw byte pipe), so headers are **not** injected there; the server logs a `WARNING` when this happens.
 
 The Go library mirrors the CLI with `vtunnel.WithHeader`:
 

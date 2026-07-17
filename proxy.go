@@ -178,8 +178,7 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Check domain mapping
 	mapped, injectHeaders, isMapped := h.server.resolveDomain(hostPort)
 
-	// A mapped domain may still carry non-TLS traffic (e.g. h2c gRPC), so the
-	// MITM-vs-tunnel choice is made after peeking the client's first byte.
+	// A mapped domain may carry cleartext h2c gRPC, not only TLS.
 	if h.certCache != nil && isMapped {
 		h.handleConnectMITM(w, r, hostPort, mapped, injectHeaders)
 		return
@@ -194,7 +193,7 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[vtunnel-proxy] CONNECT %s -> direct", hostPort)
 	}
 
-	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -209,25 +208,29 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// tlsHandshakeRecordType is the leading byte of every TLS record starting a
-// handshake (RFC 8446 §5.1). A CONNECT tunnel's client bytes are peeked and
-// compared against it to decide MITM vs. raw fallback, below.
+// tlsHandshakeRecordType is the first byte of a TLS handshake record (RFC 8446 §5.1).
 const tlsHandshakeRecordType = 0x16
 
-// handleConnectMITM establishes the client tunnel for a mapped domain, then
-// peeks its first byte to tell TLS apart from cleartext. h2c gRPC clients
-// send the plaintext HTTP/2 preface over CONNECT, not a ClientHello — MITM's
-// TLS handshake fails hard on that and kills the tunnel, so cleartext falls
-// back to the same raw byte pipe the no-MITM path uses.
+// peekTimeout bounds the wait for the client's first tunnel byte, so an idle
+// CONNECT can't park a goroutine and fd indefinitely.
+const peekTimeout = 30 * time.Second
+
+// dialTimeout bounds every upstream dial the proxy makes.
+const dialTimeout = 10 * time.Second
+
+// h2c gRPC clients send a plaintext HTTP/2 preface over CONNECT, not a TLS
+// ClientHello — MITM would hard-fail on that, so cleartext gets a raw pipe.
 func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string, injectHeaders http.Header) {
-	rawConn, err := acceptConnectTunnel(w, r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	rawConn := acceptConnectTunnel(w, r)
+	if rawConn == nil {
 		return
 	}
 
+	// Bound the first-byte wait; clear once decided so the tunnel isn't capped.
+	rawConn.SetReadDeadline(time.Now().Add(peekTimeout))
 	br := bufio.NewReader(rawConn)
 	first, err := br.Peek(1)
+	rawConn.SetReadDeadline(time.Time{})
 	if err != nil {
 		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
 		rawConn.Close()
@@ -237,6 +240,10 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 
 	if first[0] != tlsHandshakeRecordType {
 		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw fallback)", connectAuthority, mappedTarget)
+		if len(injectHeaders) > 0 {
+			// Raw byte pipe can't parse h2c to inject headers; controlplane creds are skipped.
+			log.Printf("[vtunnel-proxy] WARNING: %s: %d configured header(s) NOT injected on cleartext fallback", connectAuthority, len(injectHeaders))
+		}
 		defer tunnelConn.Close()
 		dialAndPipe(mappedTarget, tunnelConn)
 		return
@@ -265,40 +272,42 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	h.serveMITMH1(tlsConn, mappedTarget, injectHeaders)
 }
 
-// acceptConnectTunnel sends the CONNECT success response and returns a
-// net.Conn to the client, covering both HTTP/1.x (hijack) and HTTP/2 (RFC
-// 8441 extended CONNECT) callers.
-func acceptConnectTunnel(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
+// acceptConnectTunnel sends the CONNECT success response and returns a net.Conn
+// to the client — HTTP/1.x (hijack) or HTTP/2 (RFC 8441 extended CONNECT). It
+// owns the whole response and returns nil on failure: once 200 is committed or
+// the conn is hijacked, w can no longer carry an error status, so the caller
+// must not write to w after a nil.
+func acceptConnectTunnel(w http.ResponseWriter, r *http.Request) net.Conn {
 	if r.ProtoMajor != 1 {
 		w.WriteHeader(http.StatusOK)
 		if err := http.NewResponseController(w).Flush(); err != nil {
-			return nil, err
+			return nil
 		}
-		return newH2StreamConn(r.Body, w), nil
+		return newH2StreamConn(r.Body, w)
 	}
 
 	clientConn, brw, err := hijack(w)
 	if err != nil {
-		return nil, err
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return nil
 	}
 	if _, err := brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		clientConn.Close()
-		return nil, err
+		return nil
 	}
 	if err := brw.Flush(); err != nil {
 		clientConn.Close()
-		return nil, err
+		return nil
 	}
 	// net/http may have already buffered tunneled bytes after CONNECT headers.
 	// Keep reading through that buffer so handshake/preface bytes aren't dropped.
-	return newBufferedConn(clientConn, brw.Reader), nil
+	return newBufferedConn(clientConn, brw.Reader)
 }
 
-// dialAndPipe dials the mapped target and pipes bytes bidirectionally — the
-// same behavior as the no-MITM CONNECT path, reused so cleartext traffic on
-// a MITM-configured domain still reaches its upstream.
+// dialAndPipe lets cleartext traffic on a MITM-configured domain still reach
+// its upstream, reusing the no-MITM raw byte pipe.
 func dialAndPipe(target string, clientConn net.Conn) {
-	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
 		log.Printf("[vtunnel-proxy] dial %s failed: %v", target, err)
 		return
@@ -340,7 +349,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string, injectHeade
 	if tlsHost, ok := h.server.tlsUpstreamHost(target); ok {
 		// Proxy-side TLS: connect to tunnel port, do TLS with real server's hostname.
 		scheme = "https"
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
+		dialer := &net.Dialer{Timeout: dialTimeout}
 		transport := h.transport.Clone()
 		transport.ForceAttemptHTTP2 = true
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -361,7 +370,7 @@ func (h *proxyHandler) serveMITMH2(tlsConn *tls.Conn, target string, injectHeade
 		rt = &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return net.DialTimeout(network, addr, 10*time.Second)
+				return net.DialTimeout(network, addr, dialTimeout)
 			},
 		}
 	} else {
@@ -407,7 +416,7 @@ func (h *proxyHandler) serveMITMH1(tlsConn *tls.Conn, target string, injectHeade
 		// Proxy-side TLS: connect to tunnel port, do TLS with real server's hostname.
 		transport = &http.Transport{
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := net.DialTimeout(network, target, 10*time.Second)
+				conn, err := net.DialTimeout(network, target, dialTimeout)
 				if err != nil {
 					return nil, err
 				}
@@ -657,10 +666,15 @@ func (c *h2StreamConn) Write(p []byte) (int, error) {
 	}
 	return n, nil
 }
-func (c *h2StreamConn) Close() error                       { return c.r.Close() }
-func (c *h2StreamConn) LocalAddr() net.Addr                { return h2Addr{} }
-func (c *h2StreamConn) RemoteAddr() net.Addr               { return h2Addr{} }
-func (c *h2StreamConn) SetDeadline(t time.Time) error      { return c.rc.SetWriteDeadline(t) }
+func (c *h2StreamConn) Close() error         { return c.r.Close() }
+func (c *h2StreamConn) LocalAddr() net.Addr  { return h2Addr{} }
+func (c *h2StreamConn) RemoteAddr() net.Addr { return h2Addr{} }
+func (c *h2StreamConn) SetDeadline(t time.Time) error {
+	if err := c.rc.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.rc.SetWriteDeadline(t)
+}
 func (c *h2StreamConn) SetReadDeadline(t time.Time) error  { return c.rc.SetReadDeadline(t) }
 func (c *h2StreamConn) SetWriteDeadline(t time.Time) error { return c.rc.SetWriteDeadline(t) }
 
@@ -682,6 +696,16 @@ func newBufferedConn(c net.Conn, r *bufio.Reader) *bufferedConn {
 
 func (c *bufferedConn) Read(p []byte) (int, error) {
 	return c.r.Read(p)
+}
+
+// CloseWrite forwards TCP half-close to the wrapped conn, so dualStream's
+// closeWriter assertion still fires through the buffered wrapper (the embedded
+// net.Conn interface would otherwise hide the underlying *net.TCPConn's method).
+func (c *bufferedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 func hostFromAuthority(authority string) string {
