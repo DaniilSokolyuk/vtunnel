@@ -211,6 +211,10 @@ func (h *proxyHandler) handleConnect(w http.ResponseWriter, r *http.Request) {
 // tlsHandshakeRecordType is the first byte of a TLS handshake record (RFC 8446 §5.1).
 const tlsHandshakeRecordType = 0x16
 
+// tlsRecordHeaderLen is the number of leading bytes startsLikeTLSRecord inspects:
+// content type + the two-byte legacy record version.
+const tlsRecordHeaderLen = 3
+
 // peekTimeout bounds the wait for the client's first tunnel byte, so an idle
 // CONNECT can't park a goroutine and fd indefinitely.
 const peekTimeout = 30 * time.Second
@@ -231,7 +235,7 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 	// goroutine and fd; cleared once the tunnel kind is decided.
 	rawConn.SetReadDeadline(time.Now().Add(peekTimeout))
 	br := bufio.NewReader(rawConn)
-	first, err := br.Peek(1)
+	first, err := br.Peek(tlsRecordHeaderLen)
 	if err != nil {
 		rawConn.SetReadDeadline(time.Time{})
 		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
@@ -239,9 +243,10 @@ func (h *proxyHandler) handleConnectMITM(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// A TLS ClientHello starts with 0x16; cleartext carrying the HTTP/2 client
-	// preface is h2c, which we can terminate and inject into just like MITM.
-	isTLS := first[0] == tlsHandshakeRecordType
+	// A TLS ClientHello opens with a handshake record header; cleartext carrying
+	// the HTTP/2 client preface is h2c, which we can terminate and inject into
+	// just like MITM.
+	isTLS := startsLikeTLSRecord(first)
 	isH2C := !isTLS && isH2CPreface(br)
 	rawConn.SetReadDeadline(time.Time{})
 	tunnelConn := newBufferedConn(rawConn, br)
@@ -345,6 +350,18 @@ func dialAndPipe(target string, clientConn net.Conn) {
 	dualStream(targetConn, clientConn, clientConn)
 }
 
+// startsLikeTLSRecord reports whether the bytes look like the start of a TLS
+// handshake record: a handshake content type (0x16) followed by a legacy record
+// version of 0x03 0x00-0x03 (SSLv3 through TLS 1.3, which pins the record
+// version at 0x0303). Checking the version too, not just the content type,
+// keeps a cleartext protocol that happens to open with 0x16 out of the TLS
+// path. Mirrors mitmproxy's starts_like_tls_record.
+func startsLikeTLSRecord(d []byte) bool {
+	return len(d) >= tlsRecordHeaderLen &&
+		d[0] == tlsHandshakeRecordType &&
+		d[1] == 0x03 && d[2] <= 0x03
+}
+
 // isH2CPreface reports whether the buffered stream opens with the HTTP/2 client
 // connection preface (RFC 7540 §3.5) — the marker of cleartext h2c, which sends
 // it over CONNECT in place of a TLS ClientHello.
@@ -360,21 +377,23 @@ func (h *proxyHandler) probeH2C(target string) bool {
 	if v, ok := h.h2cProbed.Load(target); ok {
 		return v.(bool)
 	}
+	// The dial and round-trip travel the whole tunnel (server -> SSH -> client
+	// -> upstream), so a transient failure — tunnel reconnecting, slow hop —
+	// says nothing about whether the target speaks h2c. Cache only a
+	// deterministic answer; leave transient failures unmemoized so the next
+	// request re-probes instead of pinning the target to HTTP/1.1 forever.
 	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
-		h.h2cProbed.Store(target, false)
 		return false
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
 	// HTTP/2 connection preface
 	if _, err := conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
-		h.h2cProbed.Store(target, false)
 		return false
 	}
 	buf := make([]byte, 9) // h2 frame header
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		h.h2cProbed.Store(target, false)
 		return false
 	}
 	ok := buf[3] == 0x04 // SETTINGS frame type

@@ -273,6 +273,69 @@ func TestProxyConnectPeekErrorDoesNotWedgeProxy(t *testing.T) {
 	}
 }
 
+// A cleartext protocol whose first byte happens to be 0x16 (the TLS handshake
+// content type) but whose following bytes are not a TLS record version must not
+// be forced into the MITM TLS handshake — which would fail and kill it. The
+// three-byte record check keeps it on the raw pipe to the upstream.
+func TestProxyConnectCleartext0x16IsNotMistakenForTLS(t *testing.T) {
+	backendAddr := startRawEchoBackend(t)
+	server, proxyAddr := startMitmProxy(t)
+	server.SetDomainMapping("raw16.test:443", backendAddr)
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Dial proxy: %v", err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	if _, err := fmt.Fprintf(conn, "CONNECT raw16.test:443 HTTP/1.1\r\nHost: raw16.test:443\r\n\r\n"); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+	br := readConnectResponse(t, conn)
+
+	// 0x16, then 0x00 0x01 — a valid TLS record needs 0x03 0x00-0x03 here, so
+	// this is not TLS and must be piped raw, not run through the MITM handshake.
+	// Padded past the h2c-preface length so preface detection resolves at once
+	// instead of waiting for more bytes that a one-shot client won't send.
+	payload := append([]byte{0x16, 0x00, 0x01}, []byte("not-tls-not-h2c-preface-payload")...)
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatalf("write payload: %v", err)
+	}
+
+	echoed := make([]byte, len(payload))
+	if _, err := io.ReadFull(br, echoed); err != nil {
+		t.Fatalf("raw pipe did not echo (traffic likely captured by MITM): %v", err)
+	}
+	if string(echoed) != string(payload) {
+		t.Fatalf("expected raw echo %q, got %q", payload, echoed)
+	}
+}
+
+// startRawEchoBackend starts a plain TCP server that echoes bytes back, closed
+// via t.Cleanup. Returns its listen address.
+func startRawEchoBackend(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen raw echo backend: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				io.Copy(c, c)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
 // startMitmProxy starts a proxy with a MITM CA and returns it plus its address.
 // The proxy is closed via t.Cleanup.
 func startMitmProxy(t *testing.T) (*vtunnel.Server, string) {
