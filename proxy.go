@@ -299,13 +299,14 @@ func (h *proxyHandler) serveMITMTLS(clientConn net.Conn, connectAuthority, targe
 
 // acceptConnectTunnel sends the CONNECT success response and returns a net.Conn
 // to the client — HTTP/1.x (hijack) or HTTP/2 (RFC 8441 extended CONNECT). It
-// owns the whole response and returns nil on failure: once 200 is committed or
-// the conn is hijacked, w can no longer carry an error status, so the caller
-// must not write to w after a nil.
+// owns the whole response and returns nil on failure (logging the cause): once
+// 200 is committed or the conn is hijacked, w can no longer carry an error
+// status, so the caller must not write to w after a nil.
 func acceptConnectTunnel(w http.ResponseWriter, r *http.Request) net.Conn {
 	if r.ProtoMajor != 1 {
 		w.WriteHeader(http.StatusOK)
 		if err := http.NewResponseController(w).Flush(); err != nil {
+			log.Printf("[vtunnel-proxy] CONNECT %s: flush h2 200 failed: %v", r.Host, err)
 			return nil
 		}
 		return newH2StreamConn(r.Body, w)
@@ -313,14 +314,17 @@ func acceptConnectTunnel(w http.ResponseWriter, r *http.Request) net.Conn {
 
 	clientConn, brw, err := hijack(w)
 	if err != nil {
+		log.Printf("[vtunnel-proxy] CONNECT %s: hijack failed: %v", r.Host, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return nil
 	}
 	if _, err := brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		log.Printf("[vtunnel-proxy] CONNECT %s: write 200 failed: %v", r.Host, err)
 		clientConn.Close()
 		return nil
 	}
 	if err := brw.Flush(); err != nil {
+		log.Printf("[vtunnel-proxy] CONNECT %s: flush 200 failed: %v", r.Host, err)
 		clientConn.Close()
 		return nil
 	}
