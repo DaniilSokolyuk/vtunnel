@@ -2,14 +2,11 @@ package vtunnel
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -39,22 +36,9 @@ type Server struct {
 	listeners   map[int]net.Listener
 	listenersMu sync.Mutex
 
-	// Proxy state (survives reconnections)
-	domainMap     map[string]string
-	domainHeaders map[string]http.Header // same keys as domainMap; headers injected into MITM-proxied requests
-	domainMu      sync.RWMutex
-	proxyListener net.Listener
-	proxyDone     chan struct{}
-	proxyOnce     sync.Once
-
-	// MITM CA certificate for HTTPS interception (nil = transparent tunnel)
-	mitmCA *tls.Certificate
-
-	// tlsUpstream tracks tunnel targets that need proxy-side TLS.
-	// Key: "127.0.0.1:<tunnelPort>", Value: original hostname (for SNI).
-	// Populated by handleListen when MITM is active and target port is 443.
-	tlsUpstream   map[string]string
-	tlsUpstreamMu sync.RWMutex
+	// router is the sandbox-side forward proxy. Its allowlist survives
+	// reconnections; the client replays it on every connect.
+	router *Router
 }
 
 // ServerOption configures a Server.
@@ -64,16 +48,6 @@ type ServerOption func(*Server)
 func WithServerKeepAlive(d time.Duration) ServerOption {
 	return func(s *Server) {
 		s.keepAlive = d
-	}
-}
-
-// WithProxyMitmCA sets the CA certificate used for HTTPS MITM interception.
-// When set, the proxy will decrypt HTTPS traffic for mapped domains,
-// generating certificates on the fly signed by this CA.
-// Clients must trust this CA for HTTPS to work without errors.
-func WithProxyMitmCA(cert tls.Certificate) ServerOption {
-	return func(s *Server) {
-		s.mitmCA = &cert
 	}
 }
 
@@ -94,16 +68,15 @@ func WithClientKey(pubKey string) ServerOption {
 // NewServer creates a new vtunnel server.
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
-		keepAlive:     defaultKeepAlive,
-		connReady:     make(chan struct{}),
-		listeners:     make(map[int]net.Listener),
-		domainMap:     make(map[string]string),
-		domainHeaders: make(map[string]http.Header),
-		tlsUpstream:   make(map[string]string),
+		keepAlive: defaultKeepAlive,
+		connReady: make(chan struct{}),
+		listeners: make(map[int]net.Listener),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+
+	s.router = newRouter()
 
 	// Build SSH config after options are applied
 	var hostKey ssh.Signer
@@ -235,22 +208,19 @@ func (s *Server) handleRequests(sshConn ssh.Conn, reqs <-chan *ssh.Request) {
 //
 // Two modes of operation:
 //
-//  1. Port-based (Listen): req.Port is set, req.Domain is empty.
+//  1. Port-based (Listen): req.Port is set, req.Domains is empty.
 //     Server opens the requested TCP port and tunnels all connections.
 //
-//  2. Domain-based (Forward): req.Port is 0, req.Domain is set.
-//     Server auto-allocates a free port and registers a proxy domain mapping
-//     so the HTTP/CONNECT proxy routes traffic for that domain through the tunnel.
+//  2. Router-based (Forward): req.Port is 0, req.Domains lists the domains the
+//     controlplane proxy handles. The server allocates a port and points the
+//     router at it, so allowlisted requests are chained through the tunnel.
 //
-// Listeners are persistent — they survive client reconnects. On reconnect
-// the client replays its Listen/Forward calls; existing listeners are reused.
+// Listeners are persistent — they survive client reconnects. On reconnect the
+// client replays its calls; an existing listener is reused and its routes are
+// refreshed from the request.
 //
-// MITM + TLS targets: when the MITM CA is configured and the client's target
-// address (LocalAddr) has port 443, the server rewrites LocalAddr in the reply
-// to add a "tls://" prefix. This tells the client to establish TLS to the target,
-// so the MITM proxy can send decrypted plain HTTP through the tunnel while the
-// client re-encrypts it for the upstream server. Without MITM, the proxy does
-// a raw TCP passthrough and the client dials plain TCP (browser TLS goes end-to-end).
+// The request carries domain names only. Targets, credentials and injected
+// headers stay on the controlplane and never cross the tunnel.
 func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	var req listenRequest
 	if err := json.Unmarshal(r.Payload, &req); err != nil {
@@ -267,7 +237,10 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 		if _, exists := s.listeners[port]; exists {
 			s.listenersMu.Unlock()
 			log.Printf("[vtunnel-server] Reusing listener on port %d", port)
-			r.Reply(true, nil)
+			// Routes are refreshed even on reuse: the client is authoritative
+			// and may have added or dropped domains since it last connected.
+			s.router.SetRoutes(port, req.Domains)
+			r.Reply(true, marshalJSON(listenRequest{Port: port}))
 			return
 		}
 	}
@@ -295,50 +268,23 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	reply := listenRequest{Port: port}
 	r.Reply(true, marshalJSON(reply))
 
-	// Register domain mapping for proxy.
-	target := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
-
-	// When MITM is active and the client's target is a TLS endpoint (:443),
-	// record the hostname so the proxy can do TLS through the tunnel itself
-	// (controlling ALPN), instead of relying on client-side TLS.
-	if req.Domain != "" && s.mitmCA != nil && !strings.HasPrefix(req.LocalAddr, "tls://") {
-		if host, p, _ := net.SplitHostPort(req.LocalAddr); p == "443" {
-			s.tlsUpstreamMu.Lock()
-			s.tlsUpstream[target] = host
-			s.tlsUpstreamMu.Unlock()
-		}
-	}
-	if req.Domain != "" {
-		_, _, err := net.SplitHostPort(req.Domain)
-		if err != nil {
-			// Domain without port — register for both :80 and :443.
-			s.SetDomainMapping(net.JoinHostPort(req.Domain, "80"), target)
-			s.SetDomainMapping(net.JoinHostPort(req.Domain, "443"), target)
-			if req.Headers != nil {
-				s.SetDomainHeaders(net.JoinHostPort(req.Domain, "80"), req.Headers)
-				s.SetDomainHeaders(net.JoinHostPort(req.Domain, "443"), req.Headers)
-			}
-		} else {
-			s.SetDomainMapping(req.Domain, target)
-			if req.Headers != nil {
-				s.SetDomainHeaders(req.Domain, req.Headers)
-			}
-		}
-	}
+	// Point the router at this tunnel port for the client's domains.
+	s.router.SetRoutes(port, req.Domains)
 
 	// Start persistent accept loop — runs forever, uses getSSH() to
 	// wait for reconnects.
 	go s.acceptLoop(ln, port)
 }
 
-// tlsUpstreamHost returns the original hostname for a tunnel target
-// that needs proxy-side TLS (e.g. "google.com" for target "127.0.0.1:54321").
-func (s *Server) tlsUpstreamHost(target string) (string, bool) {
-	s.tlsUpstreamMu.RLock()
-	host, ok := s.tlsUpstream[target]
-	s.tlsUpstreamMu.RUnlock()
-	return host, ok
-}
+// Router returns the sandbox-side forward proxy. Its allowlist survives client
+// reconnections.
+func (s *Server) Router() *Router { return s.router }
+
+// StartProxy starts the router on addr.
+func (s *Server) StartProxy(addr string) error { return s.router.Start(addr) }
+
+// CloseProxy stops the router.
+func (s *Server) CloseProxy() { s.router.Close() }
 
 // acceptLoop accepts TCP connections and tunnels them through SSH channels.
 // It NEVER stops — when SSH dies, handleTunnelConn calls getSSH() which

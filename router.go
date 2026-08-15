@@ -1,0 +1,242 @@
+package vtunnel
+
+import (
+	"bufio"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
+	"sync"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
+)
+
+// Router is the sandbox-side forward proxy. It is deliberately dumb: it holds
+// an allowlist of domains and nothing else — no CA, no credentials, no TLS
+// termination.
+//
+// The domain comes from the CONNECT request line, which the application sends
+// in cleartext before any TLS, so routing needs no decryption. Allowlisted
+// requests are chained to the controlplane's proxy through a tunnel port,
+// exactly like any HTTP proxy chaining to an upstream proxy; everything else is
+// dialed directly, so unmapped traffic still egresses from the sandbox.
+type Router struct {
+	// routes maps a domain pattern to the tunnel port that reaches the
+	// controlplane proxy responsible for it.
+	routes map[string]int
+	mu     sync.RWMutex
+
+	transport http.Transport
+
+	listener net.Listener
+	once     sync.Once
+}
+
+func newRouter() *Router {
+	return &Router{routes: make(map[string]int)}
+}
+
+// Start begins serving on addr.
+func (r *Router) Start(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("router listen on %s: %w", addr, err)
+	}
+	r.listener = ln
+	r.once = sync.Once{}
+
+	log.Printf("[vtunnel-router] Listening on %s", addr)
+	go http.Serve(ln, h2c.NewHandler(r, &http2.Server{}))
+	return nil
+}
+
+// Addr returns the address the router listens on, or nil before Start.
+func (r *Router) Addr() net.Addr {
+	if r.listener == nil {
+		return nil
+	}
+	return r.listener.Addr()
+}
+
+// Close stops serving. It is safe to call more than once.
+func (r *Router) Close() {
+	r.once.Do(func() {
+		if r.listener != nil {
+			r.listener.Close()
+		}
+	})
+}
+
+// SetRoutes makes domains reachable through chainPort, replacing any routes
+// previously registered for that port. The client re-sends its full list on
+// every reconnect, so replacing keeps the allowlist in step with it.
+//
+// A domain without a port is registered for both :80 and :443.
+func (r *Router) SetRoutes(chainPort int, domains []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for domain, port := range r.routes {
+		if port == chainPort {
+			delete(r.routes, domain)
+		}
+	}
+	for _, domain := range domains {
+		if _, _, err := net.SplitHostPort(domain); err != nil {
+			r.routes[net.JoinHostPort(domain, "80")] = chainPort
+			r.routes[net.JoinHostPort(domain, "443")] = chainPort
+			continue
+		}
+		r.routes[domain] = chainPort
+	}
+	log.Printf("[vtunnel-router] Routes for tunnel port %d: %v", chainPort, domains)
+}
+
+// route returns the tunnel port serving hostPort, if it is allowlisted.
+func (r *Router) route(hostPort string) (int, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	pattern, ok := bestDomainMatch(r.routes, hostPort)
+	if !ok {
+		return 0, false
+	}
+	return r.routes[pattern], true
+}
+
+func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method == http.MethodConnect {
+		r.handleConnect(w, req)
+		return
+	}
+	r.handleHTTP(w, req)
+}
+
+func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request) {
+	hostPort := req.Host
+	if hostPort == "" {
+		hostPort = req.URL.Host
+	}
+
+	if chainPort, ok := r.route(hostPort); ok {
+		r.chainConnect(w, req, hostPort, chainPort)
+		return
+	}
+
+	log.Printf("[vtunnel-router] CONNECT %s -> direct", hostPort)
+	targetConn, err := net.DialTimeout("tcp", hostPort, dialTimeout)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer targetConn.Close()
+
+	switch req.ProtoMajor {
+	case 1:
+		serveHijack(w, targetConn)
+	default: // HTTP/2, HTTP/3
+		serveH2Connect(w, req, targetConn)
+	}
+}
+
+// chainConnect forwards the CONNECT verbatim to the controlplane proxy on the
+// far side of chainPort and then pipes bytes. The client's TLS is never
+// touched here — it is terminated on the controlplane, which is the only side
+// holding the MITM CA.
+func (r *Router) chainConnect(w http.ResponseWriter, req *http.Request, hostPort string, chainPort int) {
+	upstreamAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(chainPort))
+	log.Printf("[vtunnel-router] CONNECT %s -> tunnel %s", hostPort, upstreamAddr)
+
+	upstream, err := net.DialTimeout("tcp", upstreamAddr, dialTimeout)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer upstream.Close()
+	setTCPOptions(upstream)
+
+	if _, err := fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostPort, hostPort); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// Read the chained proxy's answer before touching the client's connection,
+	// so a failure can still be reported as a status rather than a dead tunnel.
+	br := bufio.NewReader(upstream)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("upstream proxy: %v", err), http.StatusBadGateway)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		http.Error(w, fmt.Sprintf("upstream proxy: %s", resp.Status), http.StatusBadGateway)
+		return
+	}
+
+	// br may already hold bytes the chained proxy sent after its 200.
+	upstreamConn := newBufferedConn(upstream, br)
+
+	switch req.ProtoMajor {
+	case 1:
+		serveHijack(w, upstreamConn)
+	default:
+		serveH2Connect(w, req, upstreamConn)
+	}
+}
+
+func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
+	hostPort := req.Host
+	if _, _, err := net.SplitHostPort(hostPort); err != nil {
+		port := "80"
+		if req.URL.Scheme == "https" {
+			port = "443"
+		}
+		hostPort = net.JoinHostPort(hostPort, port)
+	}
+
+	transport := &r.transport
+	if chainPort, ok := r.route(hostPort); ok {
+		// Cleartext HTTP chains the same way, as an ordinary proxied request
+		// in absolute-URI form.
+		log.Printf("[vtunnel-router] %s %s -> tunnel port %d", req.Method, hostPort, chainPort)
+		proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(chainPort))}
+		chained := r.transport.Clone()
+		chained.Proxy = http.ProxyURL(proxyURL)
+		transport = chained
+	}
+
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
+	}
+	if req.URL.Host == "" {
+		req.URL.Host = req.Host
+	}
+	req.Proto = "HTTP/1.1"
+	req.ProtoMajor = 1
+	req.ProtoMinor = 1
+	req.RequestURI = ""
+	removeHopByHop(req.Header, false)
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	removeHopByHop(w.Header(), false)
+	w.WriteHeader(resp.StatusCode)
+	// flushingCopy keeps SSE and other streaming responses arriving
+	// event-by-event instead of being batched at end-of-body.
+	flushingCopy(w, resp.Body)
+	forwardTrailers(w, resp)
+}

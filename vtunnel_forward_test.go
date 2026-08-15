@@ -350,7 +350,7 @@ func TestDomainForwardReconnect(t *testing.T) {
 // MITM + auto tls:// on the client side.
 func TestDomainForwardSameDomainTargetWithMitm(t *testing.T) {
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	server := vtunnel.NewServer() // sandbox side: router only, CA lives on the client
 
 	proxyPort := freePort(t)
 	if err := server.StartProxy(fmt.Sprintf("127.0.0.1:%d", proxyPort)); err != nil {
@@ -368,7 +368,7 @@ func TestDomainForwardSameDomainTargetWithMitm(t *testing.T) {
 	}))
 	defer tunnelServer.Close()
 
-	client := vtunnel.NewClient(wsURL(tunnelServer))
+	client := vtunnel.NewClient(wsURL(tunnelServer), vtunnel.WithMitm(ca))
 	if err := client.Connect(); err != nil {
 		t.Fatalf("Connect: %v", err)
 	}

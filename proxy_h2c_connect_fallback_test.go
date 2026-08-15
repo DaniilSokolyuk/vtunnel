@@ -1,5 +1,10 @@
 package vtunnel_test
 
+// These tests drive MITMProxy directly, without a tunnel, to cover proxy
+// behaviour in isolation. That is not how the library is normally used: see
+// doc.go and example_test.go for the Client.Forward entry point, and
+// router_e2e_test.go for the full sandbox-to-controlplane path.
+
 // A mapped domain configured with a MITM CA is not always TLS traffic — h2c
 // gRPC clients (e.g. grpcurl -plaintext) send the plaintext HTTP/2 preface
 // over CONNECT instead of a TLS ClientHello. MITM's TLS handshake fails hard
@@ -29,8 +34,8 @@ import (
 
 func TestProxyConnectHTTP1H2CFallsBackFromMITM(t *testing.T) {
 	backendAddr := startH2CTrailerBackend(t, "h2c-fallback-ok")
-	server, proxyAddr := startMitmProxy(t)
-	server.SetDomainMapping("h2c-fallback.test:443", backendAddr)
+	proxy, proxyAddr := startMitmProxy(t)
+	proxy.SetDomainMapping("h2c-fallback.test:443", backendAddr)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {
@@ -78,8 +83,8 @@ func TestProxyConnectHTTP1H2CFallsBackFromMITM(t *testing.T) {
 
 func TestProxyConnectHTTP2H2CFallsBackFromMITM(t *testing.T) {
 	backendAddr := startH2CTrailerBackend(t, "h2-h2c-fallback-ok")
-	server, proxyAddr := startMitmProxy(t)
-	server.SetDomainMapping("h2-h2c-fallback.test:443", backendAddr)
+	proxy, proxyAddr := startMitmProxy(t)
+	proxy.SetDomainMapping("h2-h2c-fallback.test:443", backendAddr)
 
 	// HTTP/2 CONNECT to the proxy itself (RFC 8441 extended CONNECT via h2c).
 	h2t := &http2.Transport{
@@ -147,8 +152,8 @@ func TestProxyConnectTLSStillMITMAfterPeek(t *testing.T) {
 	}))
 	t.Cleanup(backend.Close)
 
-	server, proxyAddr := startMitmProxy(t)
-	server.SetDomainMapping("tls-peek.test:443", backend.Listener.Addr().String())
+	proxy, proxyAddr := startMitmProxy(t)
+	proxy.SetDomainMapping("tls-peek.test:443", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -185,9 +190,9 @@ func TestProxyConnectH2CInjectsHeaders(t *testing.T) {
 	}), &http2.Server{}))
 	t.Cleanup(backend.Close)
 
-	server, proxyAddr := startMitmProxy(t)
-	server.SetDomainMapping("inject.test:443", backend.Listener.Addr().String())
-	server.SetDomainHeaders("inject.test:443", http.Header{"Authorization": []string{"Bearer secret"}})
+	proxy, proxyAddr := startMitmProxy(t)
+	proxy.SetDomainMapping("inject.test:443", backend.Listener.Addr().String())
+	proxy.SetDomainHeaders("inject.test:443", http.Header{"Authorization": []string{"Bearer secret"}})
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {
@@ -226,8 +231,8 @@ func TestProxyConnectH2CInjectsHeaders(t *testing.T) {
 // be cleaned up without wedging the proxy for subsequent tunnels.
 func TestProxyConnectPeekErrorDoesNotWedgeProxy(t *testing.T) {
 	backendAddr := startH2CTrailerBackend(t, "still-alive")
-	server, proxyAddr := startMitmProxy(t)
-	server.SetDomainMapping("recover.test:443", backendAddr)
+	proxy, proxyAddr := startMitmProxy(t)
+	proxy.SetDomainMapping("recover.test:443", backendAddr)
 
 	// First client: CONNECT, read 200, close without any tunnel bytes → peek EOF.
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
@@ -279,8 +284,8 @@ func TestProxyConnectPeekErrorDoesNotWedgeProxy(t *testing.T) {
 // three-byte record check keeps it on the raw pipe to the upstream.
 func TestProxyConnectCleartext0x16IsNotMistakenForTLS(t *testing.T) {
 	backendAddr := startRawEchoBackend(t)
-	server, proxyAddr := startMitmProxy(t)
-	server.SetDomainMapping("raw16.test:443", backendAddr)
+	proxy, proxyAddr := startMitmProxy(t)
+	proxy.SetDomainMapping("raw16.test:443", backendAddr)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {
@@ -312,7 +317,7 @@ func TestProxyConnectCleartext0x16IsNotMistakenForTLS(t *testing.T) {
 	}
 }
 
-// startRawEchoBackend starts a plain TCP server that echoes bytes back, closed
+// startRawEchoBackend starts a plain TCP proxy that echoes bytes back, closed
 // via t.Cleanup. Returns its listen address.
 func startRawEchoBackend(t *testing.T) string {
 	t.Helper()
@@ -338,16 +343,16 @@ func startRawEchoBackend(t *testing.T) string {
 
 // startMitmProxy starts a proxy with a MITM CA and returns it plus its address.
 // The proxy is closed via t.Cleanup.
-func startMitmProxy(t *testing.T) (*vtunnel.Server, string) {
+func startMitmProxy(t *testing.T) (*vtunnel.MITMProxy, string) {
 	t.Helper()
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	t.Cleanup(server.CloseProxy)
-	return server, proxyAddr
+	t.Cleanup(proxy.Close)
+	return proxy, proxyAddr
 }
 
 // startH2CTrailerBackend starts an h2c backend that returns body plus an

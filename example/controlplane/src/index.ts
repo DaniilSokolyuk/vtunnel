@@ -1,7 +1,7 @@
 /**
  * vtunnel controlplane example
  *
- * The sandbox has vtunnel server with MITM proxy. When code inside does
+ * The sandbox has vtunnel server with a routing proxy. When code inside does
  * `https://api.anthropic.com/...` or `git clone https://github.com/...`,
  * the MITM proxy intercepts TLS, decrypts, and routes through the tunnel
  * to this controlplane as plain HTTP.
@@ -122,7 +122,7 @@ function startVtunnelClient(): ChildProcess {
     args.push("-key", VTUNNEL_KEY);
   }
 
-  // Domain forwards: sandbox MITM proxy → tunnel → controlplane HTTP service
+  // Domain forwards: sandbox router → tunnel → this machine's MITM proxy → local service
   args.push("-forward", `api.anthropic.com=localhost:${ANTHROPIC_PROXY_PORT}`);
   args.push("-forward", `github.com=localhost:${GITHUB_PROXY_PORT}`);
 

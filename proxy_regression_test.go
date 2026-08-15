@@ -1,5 +1,10 @@
 package vtunnel_test
 
+// These tests drive MITMProxy directly, without a tunnel, to cover proxy
+// behaviour in isolation. That is not how the library is normally used: see
+// doc.go and example_test.go for the Client.Forward entry point, and
+// router_e2e_test.go for the full sandbox-to-controlplane path.
+
 import (
 	"bufio"
 	"crypto/tls"
@@ -69,14 +74,14 @@ func TestProxyMitmHTTP2PreservesTeTrailers(t *testing.T) {
 	defer backend.Close()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("grpc-te.test:443", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("grpc-te.test:443", backend.Listener.Addr().String())
 
 	conn, br := openHTTP1ConnectTunnel(t, proxyAddr, "grpc-te.test:443")
 	defer conn.Close()
@@ -137,16 +142,16 @@ func TestProxyMitmNoSNIIpLiteralUsesConnectAuthorityForCert(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AddCert(caLeaf)
 
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
 	targetIP := "203.0.113.10"
 	targetAuthority := net.JoinHostPort(targetIP, "443")
-	server.SetDomainMapping(targetAuthority, backend.Listener.Addr().String())
+	proxy.SetDomainMapping(targetAuthority, backend.Listener.Addr().String())
 
 	conn, br := openHTTP1ConnectTunnel(t, proxyAddr, targetAuthority)
 	defer conn.Close()

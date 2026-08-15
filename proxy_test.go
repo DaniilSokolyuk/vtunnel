@@ -1,5 +1,10 @@
 package vtunnel_test
 
+// These tests drive MITMProxy directly, without a tunnel, to cover proxy
+// behaviour in isolation. That is not how the library is normally used: see
+// doc.go and example_test.go for the Client.Forward entry point, and
+// router_e2e_test.go for the full sandbox-to-controlplane path.
+
 import (
 	"bufio"
 	"context"
@@ -25,15 +30,15 @@ func TestProxyPlainHTTPMapped(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	server := vtunnel.NewServer()
+	proxy := vtunnel.NewMITMProxy()
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("example.test:80", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("example.test:80", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -79,15 +84,15 @@ func TestProxyConnectMapped(t *testing.T) {
 		}
 	}()
 
-	server := vtunnel.NewServer()
+	proxy := vtunnel.NewMITMProxy()
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("example.test:443", echoLn.Addr().String())
+	proxy.SetDomainMapping("example.test:443", echoLn.Addr().String())
 
 	conn, err := net.Dial("tcp", proxyAddr)
 	if err != nil {
@@ -140,15 +145,15 @@ func TestProxyHTTPSNoMitmFails(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	server := vtunnel.NewServer() // no MITM CA
+	proxy := vtunnel.NewMITMProxy() // no MITM CA
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("example.test:443", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("example.test:443", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -179,15 +184,15 @@ func TestProxyHTTPSMitm(t *testing.T) {
 	defer backend.Close()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("google.com:443", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("google.com:443", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -235,15 +240,15 @@ func TestProxyHTTP2PlainHTTP(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	server := vtunnel.NewServer()
+	proxy := vtunnel.NewMITMProxy()
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("example.test:80", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("example.test:80", backend.Listener.Addr().String())
 
 	client := h2cClient(proxyAddr)
 
@@ -283,15 +288,15 @@ func TestProxyHTTP2Connect(t *testing.T) {
 		}
 	}()
 
-	server := vtunnel.NewServer()
+	proxy := vtunnel.NewMITMProxy()
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("echo.test:443", echoLn.Addr().String())
+	proxy.SetDomainMapping("echo.test:443", echoLn.Addr().String())
 
 	// HTTP/2 CONNECT via h2c
 	h2t := &http2.Transport{
@@ -337,15 +342,15 @@ func TestProxyHTTP2Mitm(t *testing.T) {
 	defer backend.Close()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("secure.test:443", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("secure.test:443", backend.Listener.Addr().String())
 
 	// HTTP/2 CONNECT to proxy via h2c, then TLS handshake inside the tunnel (MITM)
 	h2t := &http2.Transport{
@@ -413,15 +418,15 @@ func TestProxyMitmHTTP2Inner(t *testing.T) {
 	defer backend.Close()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("grpc.test:443", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("grpc.test:443", backend.Listener.Addr().String())
 
 	// Connect to proxy, send CONNECT, get a raw tunnel
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)

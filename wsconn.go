@@ -16,12 +16,38 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
+// wsBufferSize is the read and write buffer gorilla uses per connection.
+//
+// The default is 4 KiB, which is smaller than a single SSH packet: every packet
+// would then be flushed to the socket in several pieces. Sizing the buffers to
+// match the 32 KiB copy buffer keeps one packet to one write. There is exactly
+// one WebSocket connection per tunnel, so this costs 64 KiB.
+const wsBufferSize = 32 * 1024
+
+// NewUpgrader returns a websocket.Upgrader configured for tunnel traffic.
+// Origin checks are left open on purpose: the tunnel authenticates with SSH
+// keys, and browser-origin rules mean nothing to it.
+func NewUpgrader() websocket.Upgrader {
+	return websocket.Upgrader{
+		HandshakeTimeout: defaultHandshakeTimeout,
+		ReadBufferSize:   wsBufferSize,
+		WriteBufferSize:  wsBufferSize,
+		CheckOrigin:      func(*http.Request) bool { return true },
+	}
+}
+
 // wsConn wraps a *websocket.Conn as a net.Conn for use with SSH.
 // Reads stream directly from the WS message reader to avoid allocations.
 // Writes send each call as a single binary WS message.
 type wsConn struct {
 	*websocket.Conn
 	reader io.Reader
+
+	// gorilla allows one concurrent reader and one concurrent writer, and
+	// counts the deadline setters as read and write methods. SSH happens to
+	// serialize its writes already, but that is its business, not a guarantee
+	// to build on.
+	writeMu sync.Mutex
 }
 
 // NewWSConn wraps a *websocket.Conn as a net.Conn suitable for SSH.
@@ -53,17 +79,26 @@ func (c *wsConn) Read(dst []byte) (int, error) {
 }
 
 func (c *wsConn) Write(b []byte) (int, error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	if err := c.Conn.WriteMessage(websocket.BinaryMessage, b); err != nil {
 		return 0, err
 	}
 	return len(b), nil
 }
 
+func (c *wsConn) SetWriteDeadline(t time.Time) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	return c.Conn.SetWriteDeadline(t)
+}
+
 func (c *wsConn) SetDeadline(t time.Time) error {
 	if err := c.Conn.SetReadDeadline(t); err != nil {
 		return err
 	}
-	return c.Conn.SetWriteDeadline(t)
+	return c.SetWriteDeadline(t)
 }
 
 // pipe copies bidirectionally between a and b using io.Copy.
@@ -157,11 +192,14 @@ func generateHostKey() (ssh.Signer, error) {
 }
 
 // listenRequest is sent by the client to request the server to listen on a port.
+//
+// It deliberately carries no targets, no credentials and no headers: everything
+// the controlplane knows about where a domain really goes, and what to inject
+// into it, stays on the controlplane. The sandbox learns domain names only.
 type listenRequest struct {
-	Port      int         `json:"port"`
-	LocalAddr string      `json:"local_addr,omitempty"`
-	Domain    string      `json:"domain,omitempty"`  // proxy domain mapping (used by Forward)
-	Headers   http.Header `json:"headers,omitempty"` // headers injected into MITM-proxied requests for Domain
+	Port int `json:"port"`
+	// Domains are routed through this port by the sandbox router.
+	Domains []string `json:"domains,omitempty"`
 }
 
 // tunnelRequest is the extra data sent when opening a tunnel SSH channel.

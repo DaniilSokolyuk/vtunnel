@@ -1,5 +1,10 @@
 package vtunnel_test
 
+// These tests drive MITMProxy directly, without a tunnel, to cover proxy
+// behaviour in isolation. That is not how the library is normally used: see
+// doc.go and example_test.go for the Client.Forward entry point, and
+// router_e2e_test.go for the full sandbox-to-controlplane path.
+
 import (
 	"fmt"
 	"net"
@@ -52,15 +57,15 @@ func TestProxyGitCloneHTTP(t *testing.T) {
 
 	gitAddr := ln.Addr().String()
 
-	server := vtunnel.NewServer()
+	proxy := vtunnel.NewMITMProxy()
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("gitserver.test:80", gitAddr)
+	proxy.SetDomainMapping("gitserver.test:80", gitAddr)
 
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 
@@ -98,15 +103,15 @@ func TestProxyGitCloneCONNECTMitm(t *testing.T) {
 	gitAddr := ln.Addr().String()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("gitsecure.test:443", gitAddr)
+	proxy.SetDomainMapping("gitsecure.test:443", gitAddr)
 
 	cloneDir := filepath.Join(t.TempDir(), "clone-mitm")
 
@@ -145,15 +150,15 @@ func TestProxyGitCloneCONNECTMitmHTTP2(t *testing.T) {
 	gitAddr := ln.Addr().String()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("gith2.test:443", gitAddr)
+	proxy.SetDomainMapping("gith2.test:443", gitAddr)
 
 	cloneDir := filepath.Join(t.TempDir(), "clone-mitm-h2")
 

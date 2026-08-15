@@ -179,3 +179,35 @@ func TestParseClientFlags(t *testing.T) {
 		})
 	}
 }
+
+// -H is only meaningful when the proxy terminates TLS. runClient rejects the
+// combination at startup rather than dropping the header silently, which is the
+// difference between a failed run and a credential that never arrives.
+func TestFirstHeaderName(t *testing.T) {
+	cases := []struct {
+		name     string
+		forwards forwardList
+		want     string
+	}{
+		{name: "no forwards"},
+		{
+			name:     "forwards without headers",
+			forwards: forwardList{{domain: "a.test"}, {remotePort: 8080}},
+		},
+		{
+			name: "reports the first header",
+			forwards: forwardList{
+				{domain: "a.test"},
+				{domain: "b.test", headers: []forwardHeader{{"Authorization", "x"}, {"X-Env", "y"}}},
+			},
+			want: "Authorization",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.forwards.firstHeaderName(); got != tc.want {
+				t.Fatalf("firstHeaderName() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

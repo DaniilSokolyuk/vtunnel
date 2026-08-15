@@ -67,21 +67,21 @@ func TestProxyMitmHeaderInjection(t *testing.T) {
 			defer backend.Close()
 
 			ca := generateTestCA(t)
-			server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+			proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 			proxyPort := freePort(t)
 			proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-			if err := server.StartProxy(proxyAddr); err != nil {
+			if err := proxy.Start(proxyAddr); err != nil {
 				t.Fatalf("StartProxy error: %v", err)
 			}
-			defer server.CloseProxy()
+			defer proxy.Close()
 
-			server.SetDomainMapping("api.test:443", backend.Listener.Addr().String())
+			proxy.SetDomainMapping("api.test:443", backend.Listener.Addr().String())
 			if len(tc.configure) > 0 {
 				h := http.Header{}
 				for _, e := range tc.configure {
 					h.Add(e.name, e.value)
 				}
-				server.SetDomainHeaders("api.test:443", h)
+				proxy.SetDomainHeaders("api.test:443", h)
 			}
 
 			client := newMitmProxyClient(t, proxyAddr)
@@ -123,18 +123,18 @@ func TestProxyMitmDifferentHeadersPerForward(t *testing.T) {
 	defer backendB.srv.Close()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("a.test:443", backendA.srv.Listener.Addr().String())
-	server.SetDomainHeaders("a.test:443", http.Header{"X-Who": []string{"alpha"}})
-	server.SetDomainMapping("b.test:443", backendB.srv.Listener.Addr().String())
-	server.SetDomainHeaders("b.test:443", http.Header{"X-Who": []string{"bravo"}})
+	proxy.SetDomainMapping("a.test:443", backendA.srv.Listener.Addr().String())
+	proxy.SetDomainHeaders("a.test:443", http.Header{"X-Who": []string{"alpha"}})
+	proxy.SetDomainMapping("b.test:443", backendB.srv.Listener.Addr().String())
+	proxy.SetDomainHeaders("b.test:443", http.Header{"X-Who": []string{"bravo"}})
 
 	client := newMitmProxyClient(t, proxyAddr)
 
@@ -161,16 +161,16 @@ func TestProxyPlainHTTPHeaderInjection(t *testing.T) {
 	b := captureBackend(t)
 	defer b.srv.Close()
 
-	server := vtunnel.NewServer()
+	proxy := vtunnel.NewMITMProxy()
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("plain.test:80", b.srv.Listener.Addr().String())
-	server.SetDomainHeaders("plain.test:80", http.Header{"Authorization": []string{"Bearer plain"}})
+	proxy.SetDomainMapping("plain.test:80", b.srv.Listener.Addr().String())
+	proxy.SetDomainHeaders("plain.test:80", http.Header{"Authorization": []string{"Bearer plain"}})
 
 	proxyURL, _ := url.Parse("http://" + proxyAddr)
 	client := &http.Client{
@@ -189,17 +189,17 @@ func TestProxyPlainHTTPHeaderInjection(t *testing.T) {
 	}
 }
 
-// TestClientForwardWithHeader exercises the public Client.Forward API end-to-end,
-// confirming that headers configured via vtunnel.WithHeader reach the backend.
+// TestClientForwardWithHeader exercises the whole architecture: an application
+// in the sandbox talks to the router, which chains through the tunnel to the
+// controlplane proxy, which is the only side holding the CA and the headers.
 func TestClientForwardWithHeader(t *testing.T) {
 	b := captureBackend(t)
 	defer b.srv.Close()
 
-	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
-	proxyPort := freePort(t)
-	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	// --- Sandbox: router only. No CA, no headers. ---
+	server := vtunnel.NewServer()
+	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(routerAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
 	defer server.CloseProxy()
@@ -214,7 +214,9 @@ func TestClientForwardWithHeader(t *testing.T) {
 	}))
 	defer tunnelServer.Close()
 
-	client := vtunnel.NewClient(wsURL(tunnelServer))
+	// --- Controlplane: CA and credentials live here. ---
+	ca := generateTestCA(t)
+	client := vtunnel.NewClient(wsURL(tunnelServer), vtunnel.WithMitm(ca))
 	if err := client.Connect(); err != nil {
 		t.Fatalf("Connect error: %v", err)
 	}
@@ -228,7 +230,8 @@ func TestClientForwardWithHeader(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	httpClient := newMitmProxyClient(t, proxyAddr)
+	// The application only ever sees the router.
+	httpClient := newMitmProxyClient(t, routerAddr)
 	resp, err := httpClient.Get("https://api.test/hello")
 	if err != nil {
 		t.Fatalf("HTTPS GET error: %v", err)

@@ -1,5 +1,10 @@
 package vtunnel_test
 
+// These tests drive MITMProxy directly, without a tunnel, to cover proxy
+// behaviour in isolation. That is not how the library is normally used: see
+// doc.go and example_test.go for the Client.Forward entry point, and
+// router_e2e_test.go for the full sandbox-to-controlplane path.
+
 import (
 	"bufio"
 	"crypto/tls"
@@ -136,10 +141,10 @@ func TestProxyWildcardMatching(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			server, proxyAddr := startProxyForTest(t)
+			proxy, proxyAddr := startProxyForTest(t)
 
 			for pattern, tgt := range tc.mappings {
-				server.SetDomainMapping(pattern, tgt)
+				proxy.SetDomainMapping(pattern, tgt)
 			}
 
 			got200 := connectReturns200(t, proxyAddr, tc.host)
@@ -213,9 +218,9 @@ func TestProxyWildcardPriorityPicksCorrectTarget(t *testing.T) {
 			loser := tagBackend("loser")
 			defer loser.Close()
 
-			server, proxyAddr := startProxyForTest(t)
+			proxy, proxyAddr := startProxyForTest(t)
 			for pattern, target := range tc.mappings(winner.Listener.Addr().String(), loser.Listener.Addr().String()) {
-				server.SetDomainMapping(pattern, target)
+				proxy.SetDomainMapping(pattern, target)
 			}
 
 			body := httpViaProxy(t, proxyAddr, tc.host)
@@ -236,15 +241,15 @@ func TestProxyWildcardMitm(t *testing.T) {
 	defer backend.Close()
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer(vtunnel.WithProxyMitmCA(ca))
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
-	if err := server.StartProxy(proxyAddr); err != nil {
+	if err := proxy.Start(proxyAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
-	defer server.CloseProxy()
+	defer proxy.Close()
 
-	server.SetDomainMapping("*.secure.test:443", backend.Listener.Addr().String())
+	proxy.SetDomainMapping("*.secure.test:443", backend.Listener.Addr().String())
 
 	proxyConn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {
@@ -320,16 +325,15 @@ func tagBackend(tag string) *httptest.Server {
 	}))
 }
 
-func startProxyForTest(t *testing.T) (*vtunnel.Server, string) {
+func startProxyForTest(t *testing.T) (*vtunnel.MITMProxy, string) {
 	t.Helper()
-	s := vtunnel.NewServer()
-	port := freePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	if err := s.StartProxy(addr); err != nil {
-		t.Fatalf("StartProxy error: %v", err)
+	proxy := vtunnel.NewMITMProxy()
+	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := proxy.Start(addr); err != nil {
+		t.Fatalf("Start proxy error: %v", err)
 	}
-	t.Cleanup(func() { s.CloseProxy() })
-	return s, addr
+	t.Cleanup(proxy.Close)
+	return proxy, addr
 }
 
 func connectReturns200(t *testing.T, proxyAddr, host string) bool {

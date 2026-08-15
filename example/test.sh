@@ -19,7 +19,7 @@ pass() { echo -e "${GREEN}PASS${NC} $1"; }
 fail() { echo -e "${RED}FAIL${NC} $1"; cleanup; exit 1; }
 log()  { echo -e "${DIM}$1${NC}"; }
 
-# Run curl inside the sandbox container (where MITM CA is trusted)
+# Run curl inside the sandbox container (where the controlplane CA is trusted)
 sandbox_curl() {
   docker exec vtunnel-test-sandbox \
     sh -c "HTTPS_PROXY=http://localhost:9090 curl -sf $*"
@@ -33,6 +33,7 @@ cleanup() {
     wait "$pid" 2>/dev/null || true
   done
   docker rm -f vtunnel-test-sandbox 2>/dev/null || true
+  [ -n "${CA_DIR:-}" ] && rm -rf "$CA_DIR"
 }
 trap cleanup EXIT
 
@@ -43,6 +44,13 @@ VTUNNEL_KEY=$(echo "$KEYGEN" | grep "Private" | awk '{print $NF}')
 VTUNNEL_PUBLIC_KEY=$(echo "$KEYGEN" | grep "Public" | awk '{print $NF}')
 export VTUNNEL_KEY VTUNNEL_PUBLIC_KEY
 
+# --- Generate the MITM CA on THIS machine ---
+# The private key never leaves the host; only the certificate is mounted.
+log "generating MITM CA (private key stays here)..."
+CA_DIR=$(mktemp -d)
+export VTUNNEL_MITM_CA="$CA_DIR/ca.pem"
+vtunnel ca -mitm-ca "$VTUNNEL_MITM_CA" -out "$CA_DIR/ca.crt" 2>/dev/null
+
 # --- Build sandbox ---
 log "building sandbox image..."
 docker build -t vtunnel-test-sandbox sandbox/ -q
@@ -52,6 +60,7 @@ log "starting sandbox container..."
 docker run --rm -d --name vtunnel-test-sandbox \
   -p 3001:3001 \
   -e VTUNNEL_PUBLIC_KEY="$VTUNNEL_PUBLIC_KEY" \
+  -v "$CA_DIR/ca.crt:/etc/vtunnel-ca.crt:ro" \
   vtunnel-test-sandbox > /dev/null
 
 log "waiting for vtunnel server..."

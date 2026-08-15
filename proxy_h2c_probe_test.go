@@ -40,7 +40,7 @@ func TestProbeH2CDoesNotCacheTransientFailure(t *testing.T) {
 		}
 	}()
 
-	h := &proxyHandler{}
+	h := NewMITMProxy()
 	target := ln.Addr().String()
 
 	if h.probeH2C(target) {

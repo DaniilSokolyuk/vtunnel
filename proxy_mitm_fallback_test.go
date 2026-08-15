@@ -1,5 +1,10 @@
 package vtunnel
 
+// These tests drive MITMProxy directly, without a tunnel, to cover proxy
+// behaviour in isolation. That is not how the library is normally used: see
+// doc.go and example_test.go for the Client.Forward entry point, and
+// router_e2e_test.go for the full sandbox-to-controlplane path.
+
 import (
 	"bufio"
 	"crypto/ecdsa"
@@ -55,21 +60,16 @@ func TestProxyMITMHTTP2TLSUpstreamFallbackToHTTP11(t *testing.T) {
 		t.Fatalf("newCertCache: %v", err)
 	}
 
-	server := NewServer(WithProxyMitmCA(ca))
-	target := upstream.Listener.Addr().String()
-	server.SetDomainMapping("fallback.test:443", target)
-	server.tlsUpstreamMu.Lock()
-	// httptest TLS cert is issued for example.com.
-	server.tlsUpstream[target] = "example.com"
-	server.tlsUpstreamMu.Unlock()
-
-	handler := &proxyHandler{
-		server:    server,
-		certCache: certCache,
-		transport: http.Transport{
-			TLSClientConfig: &tls.Config{RootCAs: rootCAs},
-		},
+	handler := NewMITMProxy(WithMitmCA(ca))
+	handler.certCache = certCache
+	handler.transport = http.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: rootCAs},
 	}
+
+	target := upstream.Listener.Addr().String()
+	handler.SetDomainMapping("fallback.test:443", target)
+	// httptest TLS cert is issued for example.com.
+	handler.SetTLSUpstream(target, "example.com")
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
