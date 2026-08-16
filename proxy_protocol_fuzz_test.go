@@ -237,6 +237,10 @@ func FuzzTunnelInteriorSurvivesAnything(f *testing.F) {
 	f.Add("greet.corp:25", []byte(nil), 1)
 	f.Add("api.corp:443", []byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), 5)
 	f.Add("api.corp:443", []byte{0x00, 0x01, 0x02, 0x03}, 1)
+	// A TLS record header and then silence: classified as TLS, so the handshake
+	// is what ends it rather than the peek. Found by the fuzzer, kept here
+	// because a corpus file under testdata is one `rm` from gone.
+	f.Add("api.corp:443", []byte{0x16, 0x03, 0x02, 0x01, 0x04, 0x05}, 1)
 
 	f.Fuzz(func(t *testing.T, authority string, script []byte, pieces int) {
 		if !isRoutableAuthority(authority) {
