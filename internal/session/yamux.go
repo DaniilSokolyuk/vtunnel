@@ -8,12 +8,21 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
-// defaultMuxWindow is the per-stream receive window when Config says nothing.
+// The per-stream window is left at yamux's own default of 256 KB, which is
+// also what gost settles for — it overrides nothing either.
 //
-// It is set equal to what golang.org/x/crypto/ssh hard-codes, so that swapping
-// backends changes the multiplexer and not the flow control underneath it.
-// Unlike SSH's, this one is a setting: see Config.StreamWindow.
-const defaultMuxWindow = 2 * 1024 * 1024
+// It is a deliberate choice against the throughput this backend exists to
+// offer, and the reason is memory. yamux does not grow the window towards a
+// ceiling: sendWindowUpdate hands out the whole of MaxStreamWindowSize as soon
+// as the application reads, so the figure is a flat per-stream buffer, paid
+// for every tunnelled connection at once. A sandbox with fifty of them open
+// costs fifty times whatever this is, on both ends, and a container is a place
+// where that is noticed.
+//
+// So the default is the cheap one and the fast one is asked for:
+// Config.StreamWindow, reachable as WithStreamWindow and
+// WithServerStreamWindow. Anyone moving large objects over a link with real
+// latency wants it, and the arithmetic for how much is in those docs.
 
 // conn arrives already authenticated and encrypted — see secureClient and
 // secureServer. yamux itself brings no cryptography, and nothing in this file
@@ -24,7 +33,6 @@ func muxConfig(cfg Config) *yamux.Config {
 	// Keepalive is the tunnel layer's job, done the same way on every backend
 	// rather than once per multiplexer that happens to offer it.
 	c.EnableKeepAlive = false
-	c.MaxStreamWindowSize = defaultMuxWindow
 	if cfg.StreamWindow > 0 {
 		c.MaxStreamWindowSize = uint32(cfg.StreamWindow)
 	}

@@ -5,9 +5,26 @@
 // # Two sides
 //
 // A [Server] runs inside the sandbox. A [Client] runs on the controlplane —
-// your machine — and dials the server over WebSocket, carrying SSH inside it
-// for multiplexing, encryption and authentication. Because the client dials
-// in, the sandbox needs no route back out to you.
+// your machine — and dials it. Because the client dials in, the sandbox needs
+// no route back out to you.
+//
+// # Three layers
+//
+// The tunnel is a transport, a session and the tunnel proper, and each is
+// chosen independently:
+//
+//   - The transport carries bytes and produces a net.Conn. The URL scheme
+//     picks it — ws, wss or tcp — for both [NewClient] and [Listen], and
+//     [WithDialer] covers anything else.
+//   - The session multiplexes streams over that connection and authenticates
+//     both ends. [WithProtocol] picks it; see [Protocol].
+//   - The tunnel opens ports in the sandbox, routes by domain and pipes.
+//
+// Authentication is the session's job and only the session's job. The
+// transport contributes nothing to it: wss:// proves that the far end holds a
+// certificate for a name, which is not the question of whether it knows this
+// tunnel's secret. So ws://, wss:// and tcp:// are equally safe, and choosing
+// between them is a networking decision.
 //
 // Each side owns a proxy, and they are deliberately unequal:
 //
@@ -33,6 +50,15 @@
 //	server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
 //	server.StartProxy(":9090") // the application's HTTPS_PROXY
 //
+//	ln, err := vtunnel.Listen("ws://:3001/") // or tcp://:3001
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	log.Fatal(vtunnel.Serve(ln, server))
+//
+// To share the port with handlers of your own — a health endpoint, a metrics
+// scrape — upgrade the request yourself and hand the connection over:
+//
 //	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 //	    conn, err := upgrader.Upgrade(w, r, nil)
 //	    if err != nil {
@@ -42,6 +68,9 @@
 //	    server.HandleWebSocket(conn)
 //	})
 //	http.ListenAndServe(":3001", nil)
+//
+// [Server.HandleConn] takes any net.Conn, so a transport of your own needs
+// nothing beyond an accept loop.
 //
 // # Controlplane side
 //
@@ -91,18 +120,10 @@
 //	client.Listen(9000, "localhost:3000")
 //	client.Listen(8085, "tls://www.google.com:443")
 //
-// # Migrating to 0.7
+// # Migrating
 //
-// Interception moved from the sandbox to the controlplane in 0.7, so the
-// options moved with it:
-//
-//   - Server: WithProxyMitmCA is gone, and so is the -proxy-mitm-ca flag. The
-//     server cannot intercept TLS at all now. Server.SetDomainMapping and
-//     Server.SetDomainHeaders are gone too; routes arrive over the tunnel.
-//   - Client: configure interception with [WithMitm]. Client.Forward and
-//     Client.Unforward are gone; routes are declared on the proxy the client
-//     owns, via [Client.Proxy], and configure that proxy instead of shipping
-//     the target and headers into the sandbox.
-//   - The listen request on the wire lost its LocalAddr and Headers fields.
-//     A 0.7 client cannot drive a 0.6 server, or the reverse.
+// 0.8 replaced the tunnel keypair with one shared secret — [WithSecret] and
+// [WithServerSecret] — and split the transport from the session. Both ends
+// upgrade together; see MIGRATING.md for the details and for why every
+// pre-0.8 keypair should be treated as compromised.
 package vtunnel

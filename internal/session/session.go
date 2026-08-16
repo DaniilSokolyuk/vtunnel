@@ -72,17 +72,20 @@ type Config struct {
 	// Handshake bounds the setup exchange. Zero means no bound.
 	Handshake time.Duration
 
-	// StreamWindow is the per-stream receive window, in bytes. Zero takes the
-	// backend's default.
+	// StreamWindow is the per-stream receive window, in bytes. Zero takes
+	// yamux's own default of 256 KB.
 	//
 	// It is the ceiling on one stream: a sender may have this much in flight
 	// unacknowledged, so a single stream tops out at StreamWindow/RTT no matter
-	// how fat the link is. Only the multiplexing backends honour it —
+	// how fat the link is.
+	//
+	// Raising it is not free: this much may be buffered for every concurrent
+	// stream, which is why the default is the small one.
+	//
+	// Only the multiplexing backends honour it. KindSSH ignores it —
 	// golang.org/x/crypto/ssh fixes its channel window at 2 MB and offers no
 	// way to ask for more, which is the concrete reason there is a second
 	// backend at all.
-	//
-	// Raising it is not free: this much may be buffered per concurrent stream.
 	StreamWindow int
 }
 

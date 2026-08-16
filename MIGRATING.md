@@ -1,10 +1,18 @@
 # Migrating to 0.8
 
-Coming from 0.7.x. Tunnel authentication changed from a keypair to a single
-shared secret, and **the old scheme did not authenticate the server at all** —
-treat every existing `vt-pub-`/`vt-priv-` pair as compromised and replace it.
+Coming from 0.7.x. Two changes, and both ends upgrade together:
 
-## Why
+1. **Tunnel authentication** moved from a keypair to a single shared secret,
+   and **the old scheme did not authenticate the server at all** — treat every
+   existing `vt-pub-`/`vt-priv-` pair as compromised and replace it.
+2. **The tunnel was split into transport and session**, so what carries the
+   bytes and what multiplexes them are separate choices. The wire changed with
+   it; a 0.8 client cannot drive a 0.7 sandbox either way.
+
+The first is the reason to upgrade. The second is mostly invisible unless you
+want it: the defaults are still a WebSocket carrying SSH.
+
+## Why the secret
 
 The server's SSH host key was derived from the client's *public* key:
 
@@ -54,12 +62,15 @@ the ability to pose as all of them.
 ```diff
  # in the sandbox
 -vtunnel server -port 3001 -proxy 9090 -client-key "vt-pub-…"
-+vtunnel server -port 3001 -proxy 9090 -secret "$SECRET"
++vtunnel server -listen ws://:3001/ -proxy 9090 -secret "$SECRET"
 
  # on your machine
 -vtunnel client -server ws://sandbox:3001/ -key "vt-priv-…" …
 +vtunnel client -server ws://sandbox:3001/ -secret "$SECRET" …
 ```
+
+`-port 3001` became `-listen ws://:3001/`, which is the only change forced on
+you by the transport split — see below.
 
 `$VTUNNEL_SECRET` works on both, and replaces `$VTUNNEL_CLIENT_KEY` and
 `$VTUNNEL_KEY`. `-secret @/run/secrets/vtunnel` reads it from a file instead,
@@ -86,6 +97,12 @@ unauthenticated and will accept or dial anything.
 | `vtunnel keygen` | removed — use `openssl rand -base64 32` or your secret manager |
 | `-client-key`, `$VTUNNEL_CLIENT_KEY` | `-secret`, `$VTUNNEL_SECRET` |
 | `-key`, `$VTUNNEL_KEY` | `-secret`, `$VTUNNEL_SECRET` |
+| `-port 3001` | `-listen ws://:3001/`, `$VTUNNEL_LISTEN` |
+| `server.HandleConn(wsConn)` | `server.HandleWebSocket(wsConn)` |
+| — | `server.HandleConn(conn)` now takes any `net.Conn` |
+| — | `vtunnel.Listen(url)`, `vtunnel.Serve(ln, srv)`, `vtunnel.NewDialer(url, headers)` |
+| — | `-protocol`, `$VTUNNEL_PROTOCOL`; `WithProtocol` / `WithServerProtocol` |
+| — | `WithDialer`, `WithStreamWindow` / `WithServerStreamWindow` |
 
 ### What counts as a secret
 
@@ -105,6 +122,75 @@ to alert on. The secret is stretched with Argon2id (RFC 9106's second profile:
 64 MiB, t=3, p=4) before the keys are derived, costing ~25 ms once at startup
 and the same on every guess. That is worth roughly sixteen bits, and it is not
 a substitute for entropy.
+
+## Transport and session
+
+The tunnel is now three layers instead of one lump. Nothing here is required —
+the defaults are what 0.7 did — but the split is what the new options hang off.
+
+```
+transport   carries bytes, gives a net.Conn      ws, wss, tcp
+session     multiplexes streams, authenticates   ssh, yamux
+tunnel      opens ports, routes by domain        server.go, client.go
+```
+
+**Where security lives moved, and it is worth reading once.** Authentication is
+the session's job and only the session's job; the transport contributes
+nothing. `wss://` proves that the far end holds a certificate for a name, which
+is a different question from whether it knows this tunnel's secret — so
+`ws://`, `wss://` and `tcp://` are equally safe, and choosing between them is a
+networking decision.
+
+**Picking a transport.** The URL scheme does it, on both ends:
+
+```bash
+vtunnel server -listen tcp://:3001 …
+vtunnel client -server tcp://sandbox:3001 …
+```
+
+In Go, `NewClient` reads the scheme too, and the sandbox side gained the
+matching half:
+
+```go
+ln, err := vtunnel.Listen("tcp://:3001")   // or ws://:3001/
+go vtunnel.Serve(ln, server)
+
+client := vtunnel.NewClient("tcp://sandbox:3001", vtunnel.WithSecret(secret))
+```
+
+`Server.HandleConn` now takes a `net.Conn` rather than a `*websocket.Conn`, so
+a transport of your own needs only an accept loop. Code that upgrades requests
+on its own mux — to keep a health endpoint on the same port — changes one word:
+
+```diff
+-server.HandleConn(wsConn)
++server.HandleWebSocket(wsConn)
+```
+
+**Picking a session protocol.** `-protocol` / `$VTUNNEL_PROTOCOL`, and it must
+match on both ends — there is no negotiation, so a mismatch fails rather than
+falling back.
+
+`ssh` stays the default. `yamux` exists for one reason: `golang.org/x/crypto/ssh`
+fixes its per-stream window at 2 MB and offers no way to lift it, and a stream
+cannot exceed window/RTT. Measured through the full tunnel at 50 ms of round
+trip, with the window raised to 16 MB:
+
+| protocol | throughput | allocated per MB moved |
+|---|---|---|
+| `ssh` | 37 MB/s | 2.40 MB |
+| `yamux` | 161 MB/s | 1.12 MB |
+
+Reproduce with `go run ./cmd/bench -latency 50ms -window 16777216 -mode direct`.
+On loopback the gap nearly disappears — this is worth switching for when the
+sandbox is far away, and the allocation difference is worth knowing about
+everywhere.
+
+There is also `yamux-insecure`: the same path with the TLS removed, **no
+encryption, no authentication, the secret ignored**. It is there so the cost of
+the cryptography can be measured, and the measurement says that cost is nothing
+once there is any latency — 162 MB/s against `yamux`'s 161. Both ends log a
+warning naming it at every start. Do not run it.
 
 ## Rollback
 

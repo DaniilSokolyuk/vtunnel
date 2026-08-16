@@ -62,10 +62,12 @@ func WithServerProtocol(p Protocol) ServerOption {
 	}
 }
 
-// WithServerStreamWindow sets how many bytes the controlplane may have in
-// flight to this sandbox on one tunnelled connection. Zero keeps the default of
-// 2 MB. It is [WithStreamWindow] for the other direction — each end sets its
-// own receive window — and [ProtocolSSH] ignores it for the same reason.
+// WithServerStreamWindow sets how much the controlplane may send into one
+// tunnelled connection before this sandbox has acknowledged any of it. Zero
+// keeps the default of 256 KB.
+//
+// It is [WithStreamWindow] for the other direction, and everything said there
+// about what it costs and when to raise it applies here too.
 func WithServerStreamWindow(bytes int) ServerOption {
 	return func(s *Server) {
 		s.streamWindow = bytes

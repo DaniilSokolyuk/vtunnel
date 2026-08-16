@@ -44,6 +44,8 @@ vtunnel is two pieces that work together and ship in one binary, documented sepa
   - [Sandbox side](#sandbox-side)
   - [Controlplane side](#controlplane-side)
   - [Authentication](#authentication)
+  - [Transports](#transports)
+  - [Session protocols](#session-protocols)
   - [Raw port forwards](#raw-port-forwards)
   - [Reconnection](#reconnection)
 - [**The MITM proxy**](#the-mitm-proxy)
@@ -82,7 +84,7 @@ cp ca.crt /usr/local/share/ca-certificates/vtunnel-ca.crt && update-ca-certifica
 **2. Server** (in container/sandbox) — routes by domain, never decrypts:
 
 ```bash
-vtunnel server -port 3001 -proxy 9090
+vtunnel server -listen ws://:3001/ -proxy 9090
 ```
 
 **3. Client** (on your machine) — holds the CA, the targets and the credentials:
@@ -117,9 +119,19 @@ Upgrading from 0.6.x? Interception moved out of the sandbox and the wire protoco
 
 ## How it works
 
-SSH over WebSocket — multiplexed channels, encryption and authentication for free, through firewalls and corporate HTTP proxies. Implemented in [`server.go`](server.go), [`client.go`](client.go) and [`wsconn.go`](wsconn.go).
+Three layers, each replaceable without touching the others:
 
-**The client dials in.** A [`Server`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Server) runs inside the sandbox and accepts a WebSocket; a [`Client`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Client) runs on your machine and connects to it. The sandbox therefore needs no route back out to you, and no inbound port beyond the one the tunnel arrives on.
+| layer | what it does | choices |
+|---|---|---|
+| **transport** | carries bytes, produces a `net.Conn` | `ws`, `wss`, `tcp` |
+| **session** | multiplexes streams, authenticates both ends | `ssh`, `yamux` |
+| **tunnel** | opens ports, routes by domain, pipes | [`server.go`](server.go), [`client.go`](client.go) |
+
+The split is worth stating because it decides where security lives: **the session authenticates, always, and the transport contributes nothing.** Running over `wss://` proves nothing about who is on the other end — a TLS endpoint is whoever holds a certificate for that name, and that is not the same question as whether the peer knows this tunnel's secret. So `ws://` and `tcp://` are exactly as safe as `wss://`, and picking between them is a networking decision.
+
+Above the session sits one small protocol ([`protocol.go`](protocol.go)): every stream opens with a length-prefixed JSON header saying what it is for, and a control stream reads one reply back. That is deliberately not built out of SSH channel types and global requests, which a multiplexer like yamux does not have — written above the session instead, it is written once for every backend.
+
+**The client dials in.** A [`Server`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Server) runs inside the sandbox and accepts connections; a [`Client`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Client) runs on your machine and connects to it. The sandbox therefore needs no route back out to you, and no inbound port beyond the one the tunnel arrives on.
 
 **The two sides are deliberately unequal.** The [`Router`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Router) in the sandbox ([`router.go`](router.go)) holds a list of domain names and nothing else. It reads the domain from the `CONNECT` request line — which the application sends in cleartext, before any TLS — and either chains the connection to the controlplane or dials it directly. It has no CA and cannot decrypt.
 
@@ -128,27 +140,39 @@ SSH over WebSocket — multiplexed channels, encryption and authentication for f
 ## Sandbox side
 
 ```bash
-vtunnel server -port 3001 -proxy 9090
+vtunnel server -listen ws://:3001/ -proxy 9090
 ```
 
-The server takes no CA: it cannot intercept TLS by design. `/health` returns `ok` for health checks.
+The server takes no CA: it cannot intercept TLS by design. Over `ws`, `/health` returns `ok` for health checks.
 
-As a library:
+As a library, when the tunnel is all this process serves:
 
 ```go
 server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
 server.StartProxy(":9090") // the application's HTTPS_PROXY
 
+ln, err := vtunnel.Listen("ws://:3001/") // or tcp://:3001
+if err != nil {
+    log.Fatal(err)
+}
+log.Fatal(vtunnel.Serve(ln, server))
+```
+
+To share a port with your own HTTP handlers instead — a health endpoint, a metrics scrape — upgrade the request yourself and hand the connection over:
+
+```go
 http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
     conn, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
         return
     }
     defer conn.Close()
-    server.HandleConn(conn)
+    server.HandleWebSocket(conn)
 })
 http.ListenAndServe(":3001", nil)
 ```
+
+[`Server.HandleConn`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Server.HandleConn) takes any `net.Conn`, so a transport of your own needs nothing more than an accept loop.
 
 ## Controlplane side
 
@@ -181,19 +205,64 @@ One shared secret, the same string on both ends:
 ```bash
 SECRET=$(openssl rand -base64 32)
 
-vtunnel server -port 3001 -secret "$SECRET"
+vtunnel server -listen ws://:3001/ -secret "$SECRET"
 vtunnel client -server ws://... -secret "$SECRET" -forward ...
 ```
 
 There is no key format and nothing to generate with vtunnel — the secret is any string you find hard to guess. Whatever already mints secrets for you does fine: a per-sandbox UUID, a token out of a secret manager, 32 bytes from `openssl`.
 
-From it both ed25519 identities are derived ([`auth.go`](auth.go)) — the client's key and the server's host key — so the client proves itself *and* pins the host key, with nothing to exchange by hand. The secret goes through Argon2id first, which is what lets it be an ordinary string: SSH sends the host public key in cleartext during key exchange, so anyone who can dial the sandbox collects it and can test candidates offline, and Argon2id makes each of those guesses cost ~25 ms and 64 MiB.
+From it both ed25519 identities are derived — the client's key and the server's host key — so the client proves itself *and* pins the peer's key, with nothing to exchange by hand. The secret goes through Argon2id first, which is what lets it be an ordinary string: whatever the session protocol, someone who can merely dial the sandbox ends up holding a value derived from the secret — SSH hands out the host public key during key exchange, and a TLS server sends its certificate to anyone who completes the handshake with it. Candidates can therefore always be tested offline, unthrottled, and Argon2id makes each of those guesses cost ~25 ms and 64 MiB.
 
 **One per sandbox, passed at launch.** It is symmetric, so whoever holds it can be either end: a value baked into an image, or shared across a fleet, turns one compromised sandbox into the ability to pose as all of them. `-secret @/run/secrets/vtunnel` reads it from a file, which beats an argument visible in `ps`.
 
 Nothing is refused. A short secret is taken and warned about, and no secret at all leaves the tunnel unauthenticated — both sides say so loudly at startup, and that warning is the only thing between that mode and production.
 
 This is the tunnel's own authentication and has nothing to do with the MITM CA — see [The CA](#the-ca) for that.
+
+## Transports
+
+What carries the bytes. The scheme in the URL picks it, and both ends must agree:
+
+| scheme | dial | listen | notes |
+|---|---|---|---|
+| `ws` | ✓ | ✓ | the default. Goes through firewalls and corporate HTTP proxies |
+| `wss` | ✓ | — | terminate TLS in front and listen on `ws://` behind it |
+| `tcp` | ✓ | ✓ | a raw socket: no WebSocket framing, no second encryption layer |
+
+```bash
+# sandbox                              # controlplane
+vtunnel server -listen tcp://:3001     vtunnel client -server tcp://sandbox:3001 …
+```
+
+```go
+ln, _ := vtunnel.Listen("tcp://:3001")
+go vtunnel.Serve(ln, server)
+
+client := vtunnel.NewClient("tcp://sandbox:3001", vtunnel.WithSecret(secret))
+```
+
+None of these is more secure than another — see [How it works](#how-it-works). Anything else is [`WithDialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithDialer) plus a `net.Listener` of your own; wrap [`NewDialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewDialer) to add behaviour the tunnel has no opinion about. Covered by [`vtunnel_protocol_test.go`](vtunnel_protocol_test.go).
+
+## Session protocols
+
+What multiplexes the streams and authenticates the two ends. There is no negotiation on purpose — a preamble exchanged before authentication is attack surface, and whoever deploys one end deploys the other — so a mismatch fails rather than falling back.
+
+| `-protocol` | what it is | per-stream window |
+|---|---|---|
+| `ssh` | the default, `golang.org/x/crypto/ssh` | fixed at 2 MB |
+| `yamux` | yamux over TLS 1.3, both ends' keys pinned to the secret | [tunable](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) |
+| `yamux-insecure` | the same with the TLS removed | tunable |
+
+**The window is the reason there is a second one.** A stream cannot exceed window/RTT whatever the bandwidth, and 2 MB over a 50 ms link is 40 MB/s — a ceiling `x/crypto/ssh` hard-codes and offers no way to lift. Measured through the full tunnel at 50 ms with `-window 16777216`:
+
+| protocol | throughput | allocated per MB moved |
+|---|---|---|
+| `ssh` | 37 MB/s | 2.40 MB |
+| `yamux` | 161 MB/s | 1.12 MB |
+
+Reproduce with `go run ./cmd/bench -latency 50ms -window 16777216 -mode direct`. On loopback the difference nearly vanishes, which is the honest caveat: this matters when the sandbox is far away, and the allocation gap matters everywhere — SSH allocates more bytes than it moves.
+
+**`yamux-insecure` has no encryption and no authentication**, and ignores the secret even when one is set. Whoever reaches the port owns the tunnel, and that includes every [`Client.Listen`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Client.Listen) target and the credential-injecting proxy behind it. It exists so the cost of the cryptography can be measured against the same code path without it — and the measurement says that cost is nothing: at 50 ms it runs at 162 MB/s against `yamux`'s 161. Both ends log a warning naming it, every time they start.
 
 ## Raw port forwards
 
@@ -256,7 +325,7 @@ One entry matches a family of hostnames. The same matcher serves both sides of t
 - Matches **one or more** extra labels: `*.example.test` matches `a.example.test` and `a.b.example.test`, but not the apex `example.test`.
 - **Priority**: exact beats wildcard; leftmost beats rightmost; within a group, the longer pattern wins.
 
-Covered by [`proxy_wildcard_test.go`](proxy_wildcard_test.go).
+Covered by [`mitmproxy_wildcard_test.go`](mitmproxy_wildcard_test.go).
 
 ## Injecting headers
 
@@ -338,15 +407,15 @@ Two things this cannot fix: a runtime with its own keystore that ignores these v
 
 HTTP/1.1 and HTTP/2 on both legs, plus cleartext h2c inside a `CONNECT` tunnel.
 
-**ALPN is mirrored, not guessed.** The proxy establishes the upstream connection before finishing the client's handshake, so the protocol it offers the application is one the upstream actually supports. When the client's ALPN excludes what the upstream settled on, the proxy translates between the two instead of failing the handshake — it re-issues requests rather than piping them, so the two sides need not agree ([`proxy_alpn_mirror_test.go`](proxy_alpn_mirror_test.go)).
+**ALPN is mirrored, not guessed.** The proxy establishes the upstream connection before finishing the client's handshake, so the protocol it offers the application is one the upstream actually supports. When the client's ALPN excludes what the upstream settled on, the proxy translates between the two instead of failing the handshake — it re-issues requests rather than piping them, so the two sides need not agree ([`mitmproxy_alpn_mirror_test.go`](mitmproxy_alpn_mirror_test.go)).
 
-**gRPC works, trailers included.** `grpc-status` arrives after the body, so it is forwarded separately from the headers; unannounced trailers are handled too ([`proxy_trailers_test.go`](proxy_trailers_test.go), [`proxy_grpcurl_test.go`](proxy_grpcurl_test.go)). Cleartext h2c over `CONNECT` is terminated without a certificate, which is what makes header injection into plain gRPC possible ([`proxy_h2c_connect_fallback_test.go`](proxy_h2c_connect_fallback_test.go)).
+**gRPC works, trailers included.** `grpc-status` arrives after the body, so it is forwarded separately from the headers; unannounced trailers are handled too ([`mitmproxy_trailers_test.go`](mitmproxy_trailers_test.go), [`mitmproxy_grpcurl_test.go`](mitmproxy_grpcurl_test.go)). Cleartext h2c over `CONNECT` is terminated without a certificate, which is what makes header injection into plain gRPC possible ([`proxy_h2c_connect_fallback_test.go`](proxy_h2c_connect_fallback_test.go)).
 
-**Compression passes through correctly.** If the application asked for `gzip`, the compressed bytes are forwarded untouched with `Content-Encoding` intact. If it did not, the proxy's own transport asks for compression, decompresses, and drops the header — so the body and the headers describing it always agree ([`proxy_gzip_test.go`](proxy_gzip_test.go)).
+**Compression passes through correctly.** If the application asked for `gzip`, the compressed bytes are forwarded untouched with `Content-Encoding` intact. If it did not, the proxy's own transport asks for compression, decompresses, and drops the header — so the body and the headers describing it always agree ([`mitmproxy_gzip_test.go`](mitmproxy_gzip_test.go)).
 
 ## Streaming responses
 
-Server-sent events are delivered event by event, not batched at end-of-body — an agent that depends on incremental `text/event-stream` from an LLM API behaves as if the response arrived empty otherwise. Every path the proxy can serve a route on has its own copy loop, and all of them are covered: HTTP/1.1, HTTP/2, an h2 client against an HTTP/1.1 upstream, a `tls://` upstream, an in-process handler, a raw pipe and plain HTTP ([`proxy_sse_matrix_test.go`](proxy_sse_matrix_test.go)).
+Server-sent events are delivered event by event, not batched at end-of-body — an agent that depends on incremental `text/event-stream` from an LLM API behaves as if the response arrived empty otherwise. Every path the proxy can serve a route on has its own copy loop, and all of them are covered: HTTP/1.1, HTTP/2, an h2 client against an HTTP/1.1 upstream, a `tls://` upstream, an in-process handler, a raw pipe and plain HTTP ([`mitmproxy_sse_test.go`](mitmproxy_sse_test.go)).
 
 Streaming survives compression and header injection too.
 
@@ -356,7 +425,7 @@ Upgrades are **spliced, not re-terminated**. The handshake is re-issued as an or
 
 That is what keeps the negotiation between the endpoints: **subprotocols, `permessage-deflate` and frame boundaries survive exactly as agreed**. A proxy that terminates the WebSocket in the middle has to re-negotiate both and in practice drops compression.
 
-Works on every route shape and on both transports — `wss` through `CONNECT`, and cleartext `ws://` through the sandbox router, which cannot use an ordinary HTTP transport because it has no way to return a `101`. Covered by [`proxy_websocket_test.go`](proxy_websocket_test.go); see [`ExampleMITMProxy_ForwardTo_webSocket`](example_test.go).
+Works on every route shape and on both transports — `wss` through `CONNECT`, and cleartext `ws://` through the sandbox router, which cannot use an ordinary HTTP transport because it has no way to return a `101`. Covered by [`mitmproxy_websocket_test.go`](mitmproxy_websocket_test.go); see [`ExampleMITMProxy_ForwardTo_webSocket`](example_test.go).
 
 ## Inspecting and rewriting traffic
 
@@ -393,7 +462,7 @@ Domains known to pin can be declared up front, so not even the first request is 
 proxy.MITMExceptions("pinned.example.com")
 ```
 
-Covered by [`proxy_mitm_exceptions_test.go`](proxy_mitm_exceptions_test.go); see [`ExampleMITMProxy_MITMExceptions`](example_test.go).
+Covered by [`mitmproxy_exceptions_test.go`](mitmproxy_exceptions_test.go); see [`ExampleMITMProxy_MITMExceptions`](example_test.go).
 
 ## Shutting down
 
@@ -401,7 +470,7 @@ Covered by [`proxy_mitm_exceptions_test.go`](proxy_mitm_exceptions_test.go); see
 
 [`Shutdown(ctx)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Shutdown) lets requests already in flight finish first, and gives up at the deadline. A byte pipe and an open stream have no request boundary to wait for, so those are only ever ended by the deadline — give the context a bound you are willing to wait for.
 
-Either way the teardown reaches **past the proxy**: closing the client connection cancels the handler's request context, which aborts the upstream round trip and closes its body, so a streaming upstream stops streaming instead of billing for tokens nobody reads ([`proxy_shutdown_test.go`](proxy_shutdown_test.go)).
+Either way the teardown reaches **past the proxy**: closing the client connection cancels the handler's request context, which aborts the upstream round trip and closes its body, so a streaming upstream stops streaming instead of billing for tokens nobody reads ([`mitmproxy_shutdown_test.go`](mitmproxy_shutdown_test.go)).
 
 ## Debugging an intercepted session
 
@@ -438,16 +507,18 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-port` | WebSocket listen port | `3001` |
+| `-listen` | Where to accept the tunnel: `ws://:3001/` (also serves `/health`) or `tcp://:3001` | `$VTUNNEL_LISTEN`, else `ws://:3001/` |
 | `-proxy` | Routing proxy port (0 = disabled) | `0` |
 | `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
+| `-protocol` | Session protocol: `ssh`, `yamux`, `yamux-insecure`. Must match the client | `$VTUNNEL_PROTOCOL`, else `ssh` |
 
 ### `vtunnel client`
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `-server` | WebSocket URL (required) | — |
+| `-server` | Tunnel URL; the scheme picks the transport (required) | — |
 | `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
+| `-protocol` | Session protocol: `ssh`, `yamux`, `yamux-insecure`. Must match the sandbox | `$VTUNNEL_PROTOCOL`, else `ssh` |
 | `-mitm-ca` | PEM with CA cert+key for HTTPS MITM; created if missing. Without it TLS is piped through untouched and `-H` is rejected | `$VTUNNEL_MITM_CA` (unset = no interception) |
 | `-forward` | Forward mapping (repeatable, at least one required) | — |
 | `-H` / `-header` | Header injected into requests for the preceding `-forward` (repeatable) | — |
@@ -499,6 +570,41 @@ defer client.Close()
 client.Proxy().ForwardTo("api.corp", "localhost:8081",
     vtunnel.WithHeader("Authorization", "Bearer "+token))
 ```
+
+### Client options
+
+Passed to [`NewClient`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewClient).
+
+| Option | What it does | Default |
+|---|---|---|
+| [`WithSecret`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSecret) | The shared tunnel secret; see [Authentication](#authentication) | none — unauthenticated, and warned about |
+| [`WithProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithProtocol) | Session protocol; must match the sandbox | `ProtocolSSH` |
+| [`WithDialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithDialer) | A transport of your own, for what the URL schemes do not cover | from the URL scheme |
+| [`WithStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) | How much the sandbox may send into one connection before this end acknowledges it — a speed limit, see below. Ignored by `ssh` | 2 MB |
+| [`WithMitm`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithMitm) | Turn on TLS interception with this CA | off — TLS piped through untouched |
+| [`WithProxy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithProxy) | Supply the controlplane proxy yourself, to share one between clients or pin its address | one is created |
+| [`WithHeaders`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithHeaders) | Extra headers for the WebSocket handshake, for a corporate proxy in the way | none |
+| [`WithKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithKeepAlive) | Ping interval; negative disables | 30s |
+| [`WithReconnectBackoff`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithReconnectBackoff) | Reconnect backoff window | 1s → 5s |
+
+[`WithPingInterval`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithPingInterval) is a deprecated alias for `WithKeepAlive`.
+
+### Server options
+
+Passed to [`NewServer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewServer). Each mirrors a client option, and the pair must agree.
+
+| Option | What it does | Default |
+|---|---|---|
+| [`WithServerSecret`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerSecret) | The same secret the client is given | none — unauthenticated, and warned about |
+| [`WithServerProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerProtocol) | Session protocol; must match the client | `ProtocolSSH` |
+| [`WithServerStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerStreamWindow) | The same thing for the other direction: how much the controlplane may send into one connection before the sandbox acknowledges it | 2 MB |
+| [`WithServerKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerKeepAlive) | Ping interval | 30s |
+
+**About the stream window.** It reads like a buffer size and behaves like a speed limit: one tunnelled connection can go no faster than the window divided by the round trip, whatever the bandwidth. 2 MB against a sandbox 50 ms away is 40 MB/s on a gigabit link and 40 MB/s on a ten-gigabit one. Raising it is what [Session protocols](#session-protocols) measures. Two things to know: each direction has its own, so raising one raises one; and the cost is memory, because that much may sit buffered for every connection open at the time.
+
+### Route options
+
+Passed to [`MITMProxy.ForwardTo`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo) and its siblings: [`WithHeader`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithHeader) injects a header into every request for the domain, [`WithSNI`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSNI) sets the server name the proxy presents upstream. Proxy construction takes [`WithMitmCA`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithMitmCA); see [Using it without a tunnel](#using-it-without-a-tunnel).
 
 See [pkg.go.dev](https://pkg.go.dev/github.com/vivid-money/vtunnel).
 

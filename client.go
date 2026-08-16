@@ -151,19 +151,28 @@ func WithProtocol(p Protocol) Option {
 	}
 }
 
-// WithStreamWindow sets how many bytes the sandbox may have in flight to this
-// client on one tunnelled connection, before hearing back. Zero keeps the
-// default of 2 MB.
+// WithStreamWindow sets how much the sandbox may send into one tunnelled
+// connection before this client has acknowledged any of it. Zero keeps the
+// default of 256 KB.
 //
-// One stream cannot exceed window/RTT, whatever the bandwidth: 2 MB over a
-// 50 ms link is 40 MB/s and no more. Raise it for a sandbox that is far away
-// and moves large objects; the cost is that this much may be buffered per
-// concurrent connection.
+// It is a speed limit wearing the clothes of a buffer size. One connection can
+// go no faster than the window divided by the round trip, and bandwidth does
+// not enter into it: 256 KB against a sandbox 50 ms away is 5 MB/s, on a
+// gigabit link and on a ten-gigabit one alike. 16 MB against that same sandbox
+// is measured at 161 MB/s.
 //
-// [ProtocolSSH] ignores it — golang.org/x/crypto/ssh fixes the window at 2 MB
-// with no way to ask for more, which is why the other protocols exist. Each
-// end sets its own receive window, so the sandbox needs
-// [WithServerStreamWindow] for traffic in the other direction.
+// The default is small because the cost is memory, paid per connection rather
+// than per tunnel: this much may sit buffered for every tunnelled connection
+// open at the time, and a sandbox mid-build has plenty. Raise it when the
+// sandbox is far away and the traffic is large objects rather than many small
+// requests, which is the case where the arithmetic above bites and the
+// connection count is low.
+//
+// This governs sandbox to controlplane. The other direction is the sandbox's to
+// set, with [WithServerStreamWindow], and raising only one of them raises only
+// one of them. [ProtocolSSH] ignores both: golang.org/x/crypto/ssh fixes the
+// window at 2 MB and offers no way to ask for more, which is the concrete
+// reason the other protocols exist.
 func WithStreamWindow(bytes int) Option {
 	return func(c *Client) {
 		c.streamWindow = bytes
