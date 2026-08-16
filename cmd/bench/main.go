@@ -2,13 +2,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"runtime"
 	"runtime/pprof"
@@ -17,19 +17,18 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/vivid-money/vtunnel"
 )
-
-var wsUpgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
 
 func main() {
 	sizeStr := flag.String("size", "1GB", "data to transfer per connection (e.g. 100MB, 1GB, 10GB)")
 	numConns := flag.Int("c", 1, "number of parallel connections")
-	mode := flag.String("mode", "all", "benchmark mode: direct, proxy, all")
+	mode := flag.String("mode", "all", "benchmark modes, comma separated: direct, proxy, stream, handshake, all")
+	protocol := flag.String("protocol", "all", "session protocol: ssh, yamux, yamux-insecure, all")
+	transport := flag.String("transport", "ws", "transport under the session: ws or tcp")
+	latency := flag.Duration("latency", 0, "round trip added to the transport, e.g. 50ms (0 = loopback)")
+	window := flag.Int("window", 0, "per-stream receive window in bytes (0 = default 2MB; ssh ignores it)")
+	iters := flag.Int("n", 2000, "iterations for the stream and handshake modes")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")
 	flag.Parse()
@@ -56,51 +55,48 @@ func main() {
 	// Silence vtunnel library logs
 	log.SetOutput(io.Discard)
 
-	// Generate key pair for authenticated tunnel
-	priv, pub, err := vtunnel.GenerateKeyPair()
+	protocols, err := parseProtocols(*protocol)
 	if err != nil {
-		fmt.Printf("keygen error: %v\n", err)
+		fmt.Fprintln(flag.CommandLine.Output(), err)
+		flag.Usage()
 		return
 	}
 
-	fmt.Printf("vtunnel bench (mode=%s)\n", *mode)
-	fmt.Printf("  size: %s x %d conn\n", fmtSize(totalBytes), *numConns)
-	fmt.Printf("  auth: ed25519\n\n")
+	if *transport != "ws" && *transport != "tcp" {
+		fmt.Fprintf(flag.CommandLine.Output(), "unknown transport %q: expected ws or tcp\n", *transport)
+		flag.Usage()
+		return
+	}
 
-	// Start backend servers
+	// Start backend servers. They are shared across protocols so that only the
+	// session under test differs between runs.
 	sinkLn := startSink()
 	defer sinkLn.Close()
 	sourceLn := startSource()
 	defer sourceLn.Close()
 
-	// Start vtunnel server with key auth
-	srv := vtunnel.NewServer(vtunnel.WithClientKey(pub))
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := wsUpgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		srv.HandleConn(conn)
-	}))
-	defer ts.Close()
-
-	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http")
-
-	// Start vtunnel client with key auth
-	client := vtunnel.NewClient(wsURL, vtunnel.WithKeepAlive(-1), vtunnel.WithKey(priv))
-	if err := client.Connect(); err != nil {
-		fmt.Printf("connect error: %v\n", err)
-		return
-	}
-	defer client.Close()
-
-	if *mode == "direct" || *mode == "all" {
-		runDirect(srv, client, sinkLn, sourceLn, totalBytes, *numConns)
+	o := benchOpts{
+		mode:       *mode,
+		transport:  *transport,
+		latency:    *latency,
+		window:     *window,
+		totalBytes: totalBytes,
+		numConns:   *numConns,
+		iters:      *iters,
+		sink:       sinkLn,
+		source:     sourceLn,
 	}
 
-	if *mode == "proxy" || *mode == "all" {
-		runProxy(srv, client, sinkLn, sourceLn, totalBytes, *numConns)
+	fmt.Printf("vtunnel bench (mode=%s, transport=%s)\n", o.mode, o.transport)
+	fmt.Printf("  size: %s x %d conn\n", fmtSize(totalBytes), o.numConns)
+	fmt.Printf("  latency: %v round trip\n", o.latency)
+	if o.window > 0 {
+		fmt.Printf("  window: %s per stream (ssh ignores it)\n", fmtSize(int64(o.window)))
+	}
+
+	for _, p := range protocols {
+		fmt.Printf("\n########## protocol: %s ##########\n\n", p)
+		runProtocol(p, o)
 	}
 
 	// Memory profile
@@ -114,6 +110,181 @@ func main() {
 		runtime.GC()
 		pprof.WriteHeapProfile(f)
 	}
+}
+
+// secret authenticates both ends of the tunnel. Any string does; this one is a
+// literal because a benchmark has nobody to hide it from.
+//
+// yamux-insecure ignores it, which is the point of measuring against it.
+const secret = "bench-tunnel-secret-not-for-anything-else"
+
+func parseProtocols(v string) ([]vtunnel.Protocol, error) {
+	all := []vtunnel.Protocol{vtunnel.ProtocolSSH, vtunnel.ProtocolYamux, vtunnel.ProtocolYamuxInsecure}
+	if v == "all" {
+		return all, nil
+	}
+	for _, p := range all {
+		if vtunnel.Protocol(v) == p {
+			return []vtunnel.Protocol{p}, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown protocol %q: expected one of ssh, yamux, yamux-insecure, all", v)
+}
+
+// benchOpts is everything chosen on the command line, gathered so that the
+// tunnel can be stood up identically for every protocol.
+type benchOpts struct {
+	mode       string
+	transport  string
+	latency    time.Duration
+	window     int
+	totalBytes int64
+	numConns   int
+	iters      int
+	sink       net.Listener
+	source     net.Listener
+}
+
+// wants reports whether mode was asked for. -mode takes a comma-separated
+// list, so "stream,handshake" runs two of them and "all" runs every one.
+func (o benchOpts) wants(mode string) bool {
+	for _, m := range strings.Split(o.mode, ",") {
+		if m := strings.TrimSpace(m); m == mode || m == "all" {
+			return true
+		}
+	}
+	return false
+}
+
+// tunnel stands up a sandbox and a connected controlplane over the chosen
+// transport, and returns them with a function that takes them down.
+//
+// The transport is where the latency is injected, which is the honest place
+// for it: the session sits on a net.Conn and has no idea how far away the peer
+// is, exactly as in a real deployment.
+func tunnel(p vtunnel.Protocol, o benchOpts) (*vtunnel.Server, *vtunnel.Client, func(), error) {
+	srv := vtunnel.NewServer(
+		vtunnel.WithServerProtocol(p),
+		vtunnel.WithServerSecret(secret),
+		vtunnel.WithServerStreamWindow(o.window),
+	)
+
+	// Both transports are the same two calls; only the scheme differs.
+	ln, err := vtunnel.Listen(o.transport + "://127.0.0.1:0")
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go srv.HandleConn(withLatency(conn, o.latency))
+		}
+	}()
+
+	url := fmt.Sprintf("%s://%s", o.transport, ln.Addr())
+	base, err := vtunnel.NewDialer(url, nil)
+	if err != nil {
+		ln.Close()
+		return nil, nil, nil, err
+	}
+
+	client := vtunnel.NewClient(url,
+		vtunnel.WithProtocol(p),
+		vtunnel.WithKeepAlive(-1),
+		vtunnel.WithSecret(secret),
+		vtunnel.WithStreamWindow(o.window),
+		vtunnel.WithDialer(func(ctx context.Context) (net.Conn, error) {
+			conn, err := base(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return withLatency(conn, o.latency), nil
+		}),
+	)
+	if err := client.Connect(); err != nil {
+		ln.Close()
+		return nil, nil, nil, err
+	}
+	return srv, client, func() { client.Close(); ln.Close() }, nil
+}
+
+// runProtocol runs the selected benchmarks over one session protocol.
+// Everything outside the session is held constant, so a difference between
+// runs is the session and nothing else.
+func runProtocol(p vtunnel.Protocol, o benchOpts) {
+	srv, client, stop, err := tunnel(p, o)
+	if err != nil {
+		fmt.Printf("connect error: %v\n", err)
+		return
+	}
+	defer stop()
+
+	if o.wants("direct") {
+		runDirect(srv, client, o.sink, o.source, o.totalBytes, o.numConns)
+	}
+	if o.wants("proxy") {
+		runProxy(srv, client, o.sink, o.source, o.totalBytes, o.numConns)
+	}
+	if o.wants("stream") {
+		runStreams(client, o.sink, o.iters)
+	}
+	if o.wants("handshake") {
+		runHandshake(p, o)
+	}
+}
+
+// runStreams prices one tunnelled connection. Every request the sandbox
+// proxies opens a stream, so this lands on the latency of ordinary traffic in
+// a way throughput never shows.
+func runStreams(client *vtunnel.Client, target net.Listener, n int) {
+	fmt.Printf("=== stream open ===\n\n")
+
+	port := freePort()
+	if err := client.Listen(port, target.Addr().String()); err != nil {
+		fmt.Printf("listen error: %v\n", err)
+		return
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	fmt.Printf("--- open, write, close x%d ---\n", n)
+
+	m := startMeter()
+	for range n {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			fmt.Printf("dial error: %v\n", err)
+			return
+		}
+		conn.Write([]byte{1})
+		conn.Close()
+	}
+	printOps(n, m)
+}
+
+// runHandshake prices bringing a tunnel up, which happens once per connect and
+// again on every reconnect — repeatedly, for a sandbox on a flapping link.
+func runHandshake(p vtunnel.Protocol, o benchOpts) {
+	fmt.Printf("=== handshake ===\n\n")
+
+	// Handshakes are expensive, and with latency injected each one costs
+	// several round trips — a few hundred says as much as a few thousand.
+	n := max(o.iters/20, 20)
+	fmt.Printf("--- connect and close x%d ---\n", n)
+
+	m := startMeter()
+	for range n {
+		_, _, stop, err := tunnel(p, o)
+		if err != nil {
+			fmt.Printf("connect error: %v\n", err)
+			return
+		}
+		stop()
+	}
+	printOps(n, m)
 }
 
 func runDirect(_ *vtunnel.Server, client *vtunnel.Client, sinkLn, sourceLn net.Listener, totalBytes int64, numConns int) {
@@ -179,7 +350,7 @@ func bench(name string, perConn int64, numConns int, streams []stream) {
 	fmt.Printf("--- %s ---\n", name)
 
 	var transferred atomic.Int64
-	start := time.Now()
+	m := startMeter()
 
 	done := make(chan struct{})
 	go progress(&transferred, total, done)
@@ -197,7 +368,7 @@ func bench(name string, perConn int64, numConns int, streams []stream) {
 
 	wg.Wait()
 	close(done)
-	printResult(&transferred, start, numConns, len(streams))
+	printResult(&transferred, m, numConns, len(streams))
 }
 
 // benchParallel runs upload and download simultaneously on each connection pair.
@@ -206,7 +377,7 @@ func benchParallel(name string, perConn int64, numConns int, upPort, downPort in
 	fmt.Printf("--- %s ---\n", name)
 
 	var transferred atomic.Int64
-	start := time.Now()
+	m := startMeter()
 
 	done := make(chan struct{})
 	go progress(&transferred, total, done)
@@ -226,7 +397,7 @@ func benchParallel(name string, perConn int64, numConns int, upPort, downPort in
 
 	wg.Wait()
 	close(done)
-	printResult(&transferred, start, numConns, 2)
+	printResult(&transferred, m, numConns, 2)
 }
 
 func benchProxy(name string, perConn int64, numConns int, proxyAddr string, streams []proxyStream) {
@@ -234,7 +405,7 @@ func benchProxy(name string, perConn int64, numConns int, proxyAddr string, stre
 	fmt.Printf("--- %s ---\n", name)
 
 	var transferred atomic.Int64
-	start := time.Now()
+	m := startMeter()
 
 	done := make(chan struct{})
 	go progress(&transferred, total, done)
@@ -252,7 +423,7 @@ func benchProxy(name string, perConn int64, numConns int, proxyAddr string, stre
 
 	wg.Wait()
 	close(done)
-	printResult(&transferred, start, numConns, len(streams))
+	printResult(&transferred, m, numConns, len(streams))
 }
 
 func benchProxyParallel(name string, perConn int64, numConns int, proxyAddr, upHost, downHost string) {
@@ -260,7 +431,7 @@ func benchProxyParallel(name string, perConn int64, numConns int, proxyAddr, upH
 	fmt.Printf("--- %s ---\n", name)
 
 	var transferred atomic.Int64
-	start := time.Now()
+	m := startMeter()
 
 	done := make(chan struct{})
 	go progress(&transferred, total, done)
@@ -280,7 +451,7 @@ func benchProxyParallel(name string, perConn int64, numConns int, proxyAddr, upH
 
 	wg.Wait()
 	close(done)
-	printResult(&transferred, start, numConns, 2)
+	printResult(&transferred, m, numConns, 2)
 }
 
 func transfer(port int, size int64, upload bool, counter *atomic.Int64) {
@@ -366,8 +537,29 @@ func progress(transferred *atomic.Int64, total int64, done <-chan struct{}) {
 	}
 }
 
-func printResult(transferred *atomic.Int64, start time.Time, numConns, numStreams int) {
-	elapsed := time.Since(start)
+// meter records the clock and the allocator at the start of a run.
+//
+// Allocation is measured alongside throughput because on a data path it is
+// throughput: a copy loop that allocates per packet spends its time in the
+// collector, and that shows up as a number here rather than as a profile
+// somebody has to remember to take.
+type meter struct {
+	start   time.Time
+	alloc   uint64
+	mallocs uint64
+}
+
+func startMeter() meter {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	return meter{start: time.Now(), alloc: ms.TotalAlloc, mallocs: ms.Mallocs}
+}
+
+func printResult(transferred *atomic.Int64, m meter, numConns, numStreams int) {
+	elapsed := time.Since(m.start)
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
 	tot := transferred.Load()
 	speed := float64(tot) / elapsed.Seconds()
 
@@ -377,7 +569,44 @@ func printResult(transferred *atomic.Int64, start time.Time, numConns, numStream
 		perStream := speed / float64(numConns) / float64(numStreams)
 		fmt.Printf(" (%s/s per stream)", fmtSize(int64(perStream)))
 	}
+	fmt.Println()
+
+	movedMB := float64(tot) / (1 << 20)
+	allocBytes := ms.TotalAlloc - m.alloc
+	allocs := ms.Mallocs - m.mallocs
+	fmt.Printf("  alloc: %s in %s objects", fmtSize(int64(allocBytes)), fmtCount(allocs))
+	if movedMB > 0 {
+		fmt.Printf(" (%s and %.0f objects per MB moved)",
+			fmtSize(int64(float64(allocBytes)/movedMB)), float64(allocs)/movedMB)
+	}
 	fmt.Printf("\n\n")
+}
+
+// printOps reports a benchmark counted in operations rather than bytes.
+func printOps(n int, m meter) {
+	elapsed := time.Since(m.start)
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+
+	perOp := elapsed / time.Duration(n)
+	allocBytes := ms.TotalAlloc - m.alloc
+	allocs := ms.Mallocs - m.mallocs
+
+	fmt.Printf("  %d ops in %v\n", n, elapsed.Round(time.Millisecond))
+	fmt.Printf("  %v per op (%.0f ops/s)\n", perOp.Round(time.Microsecond), float64(n)/elapsed.Seconds())
+	fmt.Printf("  alloc: %s and %d objects per op\n\n",
+		fmtSize(int64(allocBytes)/int64(n)), allocs/uint64(n))
+}
+
+func fmtCount(n uint64) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1e6)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1e3)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 // startSink starts a TCP server that reads and discards everything.

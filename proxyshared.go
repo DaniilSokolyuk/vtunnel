@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -23,12 +24,19 @@ import (
 // Priority: exact > leftmost > rightmost; within a group, the longest pattern
 // wins. Both the sandbox router and the controlplane proxy route through this,
 // so a host resolves the same way on either side of a tunnel.
+//
+// Matching is case-insensitive, as hostnames are (RFC 4343). Comparing them
+// byte for byte meant a single capital letter missed the allowlist: on the
+// controlplane that fails closed, but on the sandbox router a miss is dialled
+// directly, so `https://API.corp/` egressed from the sandbox without ever
+// meeting the tunnel, the proxy or its injected credential.
 func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, bool) {
 	if _, ok := patterns[hostPort]; ok {
 		return hostPort, true
 	}
 
-	host, port, err := net.SplitHostPort(hostPort)
+	lower := strings.ToLower(hostPort)
+	host, port, err := net.SplitHostPort(lower)
 	if err != nil {
 		return "", false
 	}
@@ -36,7 +44,11 @@ func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, boo
 	var bestPattern string
 	var bestLeft bool
 	for pattern := range patterns {
-		isLeft, ok := wildcardMatches(pattern, host, port)
+		lowered := strings.ToLower(pattern)
+		if lowered == lower {
+			return pattern, true // exact modulo case; nothing outranks it
+		}
+		isLeft, ok := wildcardMatches(lowered, host, port)
 		if !ok {
 			continue
 		}
@@ -161,15 +173,22 @@ type closeWriter interface {
 }
 
 // flushingCopy copies from src to dst, flushing after each write if dst supports it.
-func flushingCopy(dst io.Writer, src io.Reader) {
+//
+// It reports the error that ended the copy only when that error came from src
+// and was not a clean end of body. Treating io.ErrUnexpectedEOF, a reset
+// connection or an h2 RST_STREAM as end-of-body handed the client a truncated
+// body inside a perfectly well-formed response, which is the one failure the
+// caller has no other way to discover. A write error means the client is
+// already gone, so there is nobody left to tell.
+func flushingCopy(dst io.Writer, src io.Reader) error {
 	rw, isRW := dst.(http.ResponseWriter)
 	bufPtr := bufPool.Get().(*[]byte)
 	buf := (*bufPtr)[:cap(*bufPtr)]
 	defer bufPool.Put(bufPtr)
 
 	if !isRW {
-		io.CopyBuffer(dst, src, buf)
-		return
+		_, err := io.CopyBuffer(dst, src, buf)
+		return err
 	}
 
 	rc := http.NewResponseController(rw)
@@ -178,17 +197,20 @@ func flushingCopy(dst io.Writer, src io.Reader) {
 		if nr > 0 {
 			nw, writeErr := dst.Write(buf[:nr])
 			if writeErr != nil {
-				return
+				return nil
 			}
 			if err := rc.Flush(); err != nil {
-				return
+				return nil
 			}
 			if nw != nr {
-				return
+				return nil
 			}
 		}
 		if readErr != nil {
-			return
+			if errors.Is(readErr, io.EOF) {
+				return nil
+			}
+			return readErr
 		}
 	}
 }
@@ -218,10 +240,30 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 		w.Header().Add("Trailer", k)
 		announced[http.CanonicalHeaderKey(k)] = true
 	}
+	if len(resp.Trailer) > 0 {
+		// A declared length and a trailer cannot coexist over HTTP/1.1: net/http
+		// picks identity framing whenever it knows the length, and identity has
+		// nowhere to put a trailer, so the announcement above would be the only
+		// thing the client ever saw of it. HTTP/2 has no chunked encoding at all,
+		// so an h2 upstream legitimately sends both and this is the ordinary case
+		// for a gRPC response forwarded to an HTTP/1.1 client.
+		w.Header().Del("Content-Length")
+	}
 
 	w.WriteHeader(resp.StatusCode)
-	flushingCopy(w, resp.Body)
+	copyErr := flushingCopy(w, resp.Body)
 	forwardTrailers(w, resp, announced)
+
+	if copyErr != nil {
+		// The status line and part of the body are already on the wire, so there
+		// is no status left to report this with. Killing the connection is the
+		// only in-band signal a truncated body has: net/http recognises
+		// ErrAbortHandler and drops it without logging a panic. Returning
+		// normally instead would frame the fragment as a complete response and
+		// the client would cache or commit it.
+		log.Printf("[vtunnel-proxy] upstream body ended early: %v", copyErr)
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // forwardTrailers re-emits upstream response trailers (grpc-status and the
@@ -231,14 +273,22 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 // A name that was announced is set plainly; one that only appeared while the
 // body streamed was never declared, and the sole way to send it is unannounced
 // via http.TrailerPrefix.
+//
+// Repeated values are kept. Setting each one in turn replaced the last, so a
+// trailer sent more than once — repeated grpc-metadata-* or X-Trace entries are
+// ordinary — arrived with everything but its final value dropped.
 func forwardTrailers(w http.ResponseWriter, resp *http.Response, announced map[string]bool) {
 	for k, vv := range resp.Trailer {
 		name := k
 		if !announced[http.CanonicalHeaderKey(k)] {
 			name = http.TrailerPrefix + k
 		}
-		for _, v := range vv {
-			w.Header().Set(name, v)
+		for i, v := range vv {
+			if i == 0 {
+				w.Header().Set(name, v)
+				continue
+			}
+			w.Header().Add(name, v)
 		}
 	}
 }
@@ -423,15 +473,21 @@ func serveUpgrade(w http.ResponseWriter, r *http.Request, upstream net.Conn, pro
 		// would have received from the client directly.
 		write = r.WriteProxy
 	}
+	// Both failures below are logged rather than returned. On the controlplane
+	// this answer travels back through the tunnel, and a socket error names the
+	// internal address it was talking to — which is the one thing that is not
+	// supposed to reach the sandbox.
 	if err := write(upstream); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		log.Printf("[vtunnel-proxy] upgrade %s: write to upstream failed: %v", r.Host, err)
+		http.Error(w, "vtunnel: upstream connection failed", http.StatusBadGateway)
 		return
 	}
 
 	br := bufio.NewReader(upstream)
 	resp, err := http.ReadResponse(br, r)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		log.Printf("[vtunnel-proxy] upgrade %s: read upstream response failed: %v", r.Host, err)
+		http.Error(w, "vtunnel: upstream connection failed", http.StatusBadGateway)
 		return
 	}
 	upstream.SetDeadline(time.Time{})
@@ -472,8 +528,13 @@ func serveUpgrade(w http.ResponseWriter, r *http.Request, upstream net.Conn, pro
 }
 
 func removeHopByHop(h http.Header, preserveTeTrailers bool) {
-	for _, key := range strings.Split(h.Get("Connection"), ",") {
-		h.Del(strings.TrimSpace(key))
+	// Values, not Get: Connection may arrive as several header lines, and
+	// reading only the first forwarded everything named on the rest to the next
+	// hop. removeHopByHopForUpgrade already reads them all.
+	for _, value := range h.Values("Connection") {
+		for _, key := range strings.Split(value, ",") {
+			h.Del(strings.TrimSpace(key))
+		}
 	}
 	for _, key := range hopByHopHeaders {
 		h.Del(key)

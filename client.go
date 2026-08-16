@@ -3,7 +3,6 @@ package vtunnel
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -14,8 +13,9 @@ import (
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
+
+	"github.com/vivid-money/vtunnel/internal/session"
+	"github.com/vivid-money/vtunnel/internal/tunnelkey"
 )
 
 const (
@@ -27,21 +27,26 @@ const (
 
 // Client connects to a vtunnel server and forwards connections.
 type Client struct {
-	wsURL     string
-	headers   http.Header
-	sshConn   ssh.Conn
-	connMu    sync.RWMutex
-	forwards  map[int]string // remotePort -> localAddr
-	mu        sync.RWMutex
-	done      chan struct{}
-	closeOnce sync.Once
-	ctx       context.Context
-	cancel    context.CancelFunc
+	url          string
+	headers      http.Header
+	dialer       Dialer
+	protocol     Protocol
+	streamWindow int
+	sess         session.Session
+	connMu       sync.RWMutex
+	forwards     map[int]string // remotePort -> localAddr
+	mu           sync.RWMutex
+	done         chan struct{}
+	closeOnce    sync.Once
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	keepAlive    time.Duration
 	reconnectMin time.Duration
 	reconnectMax time.Duration
-	authSigner   ssh.Signer // nil = no auth
+
+	// keys authenticates both ends; nil means the tunnel is unauthenticated.
+	keys *tunnelkey.Keys
 
 	// proxy is the controlplane-side MITM proxy and the single place routes are
 	// declared. It holds every target, header and the MITM CA — none of which
@@ -93,16 +98,75 @@ func WithReconnectBackoff(min, max time.Duration) Option {
 	}
 }
 
-// WithKey sets the client private key for authentication ("vt-priv-...").
-// When set, the client authenticates via SSH public key auth and
-// verifies the server's identity using a derived host key.
-func WithKey(privKey string) Option {
+// WithSecret sets the tunnel secret, the one value that authenticates this
+// client and the server to each other. The sandbox must be given the same
+// secret through [WithServerSecret].
+//
+// Any string will do — 32 random bytes, a token from a secret manager, a UUID
+// an orchestrator minted for one sandbox. There is no format, because a format
+// would prove nothing about the only property that matters, which is that
+// nobody else can guess it. A short or obviously public one is taken anyway and
+// warned about.
+//
+// Both identities are derived from it, so the client both proves itself and
+// pins the host key it will accept. Generate one per sandbox: the secret is
+// symmetric, so whoever holds it can be either end, and one shared across a
+// fleet makes any single compromised sandbox able to pose as all of them.
+//
+// An empty secret leaves the tunnel unauthenticated in both directions, and
+// [NewClient] says so.
+func WithSecret(secret string) Option {
 	return func(c *Client) {
-		signer, err := parsePrivateKey(privKey)
-		if err != nil {
-			panic(fmt.Sprintf("vtunnel: invalid key: %v", err))
+		if secret == "" {
+			return
 		}
-		c.authSigner = signer
+		if w := tunnelkey.Warning(secret); w != "" {
+			log.Printf("[vtunnel-client] WARNING: %s.", w)
+		}
+		keys, err := tunnelkey.Derive(secret)
+		if err != nil {
+			panic(fmt.Sprintf("vtunnel: derive tunnel keys: %v", err))
+		}
+		c.keys = keys
+	}
+}
+
+// WithDialer replaces the transport with one of your own, for anything the
+// URL schemes do not cover. The URL passed to [NewClient] is then only a label
+// for logs.
+//
+// Reaching a sandbox over TCP instead of a WebSocket needs no option at all —
+// see [NewClient].
+func WithDialer(d Dialer) Option {
+	return func(c *Client) {
+		c.dialer = d
+	}
+}
+
+// WithProtocol picks the session protocol. The sandbox must be configured with
+// the same one through [WithServerProtocol]; see [Protocol].
+func WithProtocol(p Protocol) Option {
+	return func(c *Client) {
+		c.protocol = p
+	}
+}
+
+// WithStreamWindow sets how many bytes the sandbox may have in flight to this
+// client on one tunnelled connection, before hearing back. Zero keeps the
+// default of 2 MB.
+//
+// One stream cannot exceed window/RTT, whatever the bandwidth: 2 MB over a
+// 50 ms link is 40 MB/s and no more. Raise it for a sandbox that is far away
+// and moves large objects; the cost is that this much may be buffered per
+// concurrent connection.
+//
+// [ProtocolSSH] ignores it — golang.org/x/crypto/ssh fixes the window at 2 MB
+// with no way to ask for more, which is why the other protocols exist. Each
+// end sets its own receive window, so the sandbox needs
+// [WithServerStreamWindow] for traffic in the other direction.
+func WithStreamWindow(bytes int) Option {
+	return func(c *Client) {
+		c.streamWindow = bytes
 	}
 }
 
@@ -181,10 +245,22 @@ func WithHeader(name, value string) ForwardOption {
 }
 
 // NewClient creates a new vtunnel client.
-func NewClient(wsURL string, opts ...Option) *Client {
+//
+// tunnelURL says both where the sandbox is and how to reach it: the scheme
+// picks the transport, and ws, wss and tcp are understood.
+//
+//	vtunnel.NewClient("wss://sandbox.example.com/", vtunnel.WithSecret(secret))
+//	vtunnel.NewClient("tcp://sandbox:3001", vtunnel.WithSecret(secret))
+//
+// Which one changes nothing about how safe the tunnel is — the session
+// authenticates the sandbox and encrypts the traffic either way. Anything the
+// schemes do not cover is [WithDialer].
+//
+// An unusable URL is not reported here; [Client.Connect] returns it.
+func NewClient(tunnelURL string, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
-		wsURL:        wsURL,
+		url:          tunnelURL,
 		forwards:     make(map[int]string),
 		done:         make(chan struct{}),
 		ctx:          ctx,
@@ -219,8 +295,13 @@ func NewClient(wsURL string, opts ...Option) *Client {
 	// Connect, or long after — reaches the sandbox without a second call.
 	c.proxy.OnChange(c.syncRoutes)
 
-	if c.authSigner == nil {
-		log.Println("[vtunnel-client] WARNING: No key configured. Authentication is DISABLED. Do NOT use in production! Use --key or VTUNNEL_KEY.")
+	if c.protocol.insecure() {
+		log.Printf("[vtunnel-client] WARNING: protocol %q has no encryption and no authentication. "+
+			"Any secret configured is ignored, and whoever answers this dial can pipe streams "+
+			"into every local target — the credential-injecting proxy included. "+
+			"It is here to be measured against, not to be run.", c.protocol)
+	} else if c.keys == nil {
+		log.Println("[vtunnel-client] WARNING: No tunnel secret configured. Authentication is DISABLED. Do NOT use in production! Use --secret or VTUNNEL_SECRET.")
 	}
 	return c
 }
@@ -230,7 +311,7 @@ func (c *Client) Connect() error {
 	if err := c.connectOnce(); err != nil {
 		return err
 	}
-	log.Printf("[vtunnel-client] Connected to %s", c.wsURL)
+	log.Printf("[vtunnel-client] Connected to %s", c.url)
 	go c.connectionLoop()
 	return nil
 }
@@ -243,12 +324,12 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 
 	log.Printf("[vtunnel-client] Requesting listen: remote=%d -> local=%s", remotePort, localAddr)
 
-	sshConn := c.getSSH()
-	if sshConn == nil {
+	sess := c.getSession()
+	if sess == nil {
 		return nil // will be replayed on reconnect
 	}
 
-	return c.sendListen(sshConn, remotePort, localAddr)
+	return c.sendListen(sess, remotePort, localAddr)
 }
 
 // syncRoutes brings the sandbox router in step with the proxy's routes. It runs
@@ -263,11 +344,11 @@ func (c *Client) syncRoutes() {
 		return
 	}
 
-	sshConn := c.getSSH()
-	if sshConn == nil {
+	sess := c.getSession()
+	if sess == nil {
 		return // replayed once connected
 	}
-	if err := c.sendRouterListen(sshConn); err != nil {
+	if err := c.sendRouterListen(sess); err != nil {
 		log.Printf("[vtunnel-client] Route sync failed: %v", err)
 	}
 }
@@ -333,10 +414,10 @@ func (c *Client) Close() error {
 		close(c.done)
 	})
 
-	sshConn := c.getSSH()
-	if sshConn != nil {
-		sshConn.Close()
-		c.setSSH(nil)
+	sess := c.getSession()
+	if sess != nil {
+		sess.Close()
+		c.setSession(nil)
 	}
 
 	// The proxy holds every configured credential and listens on loopback, so
@@ -351,91 +432,66 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// dialOnce establishes a single WS+SSH connection.
-func (c *Client) dialOnce() (ssh.Conn, error) {
-	dialer := websocket.Dialer{
-		HandshakeTimeout: defaultHandshakeTimeout,
-		ReadBufferSize:   wsBufferSize,
-		WriteBufferSize:  wsBufferSize,
-		// The controlplane is someone's laptop, which may only reach the
-		// sandbox through a corporate proxy. gorilla's own DefaultDialer does
-		// this; a zero Dialer would silently ignore the environment.
-		Proxy: http.ProxyFromEnvironment,
+// transport resolves the dialer once, from [WithDialer] if one was given and
+// otherwise from the scheme of the URL passed to [NewClient].
+func (c *Client) transport() (Dialer, error) {
+	if c.dialer != nil {
+		return c.dialer, nil
 	}
-	wsConn, _, err := dialer.DialContext(c.ctx, c.wsURL, c.headers)
+	d, err := NewDialer(c.url, c.headers)
+	if err != nil {
+		return nil, err
+	}
+	c.dialer = d
+	return d, nil
+}
+
+// dialOnce brings up one transport connection and one session over it.
+func (c *Client) dialOnce() (session.Session, error) {
+	dial, err := c.transport()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dial(c.ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	conn := NewWSConn(wsConn)
-	sshConfig := &ssh.ClientConfig{
-		User:    "vtunnel",
-		Timeout: defaultHandshakeTimeout,
-	}
-	if c.authSigner != nil {
-		sshConfig.Auth = []ssh.AuthMethod{ssh.PublicKeys(c.authSigner)}
-		hostSigner, err := deriveHostKey(c.authSigner.PublicKey())
-		if err != nil {
-			wsConn.Close()
-			return nil, fmt.Errorf("derive host key: %w", err)
-		}
-		sshConfig.HostKeyCallback = ssh.FixedHostKey(hostSigner.PublicKey())
-	} else {
-		sshConfig.HostKeyCallback = ssh.InsecureIgnoreHostKey()
-	}
-	sshConn, chans, reqs, err := ssh.NewClientConn(conn, "", sshConfig)
+	sess, err := session.Dial(session.Kind(c.protocol), conn, session.Config{
+		Keys:         c.keys,
+		Handshake:    defaultHandshakeTimeout,
+		StreamWindow: c.streamWindow,
+	})
 	if err != nil {
-		wsConn.Close()
-		return nil, fmt.Errorf("SSH handshake: %w", err)
+		return nil, err
 	}
 
-	// Accept tunnel channels from server
-	go c.handleChannels(chans)
-	// Handle server-initiated requests (ping/pong)
-	go handleRequests(reqs)
-	// Keepalive
+	go serveStreams(sess, c.handleStream)
 	if c.keepAlive > 0 {
-		go keepAliveLoop(sshConn, c.keepAlive)
+		go keepAliveLoop(sess, c.keepAlive)
 	}
-
-	return sshConn, nil
+	return sess, nil
 }
 
-// handleChannels accepts incoming SSH channels of type "tunnel" from the server.
-func (c *Client) handleChannels(chans <-chan ssh.NewChannel) {
-	for ch := range chans {
-		if ch.ChannelType() != "tunnel" {
-			ch.Reject(ssh.UnknownChannelType, "unknown channel type")
-			continue
-		}
-		go c.handleTunnel(ch)
-	}
-}
-
-// handleTunnel accepts a tunnel channel and pipes to the local target.
-func (c *Client) handleTunnel(ch ssh.NewChannel) {
-	var req tunnelRequest
-	if err := json.Unmarshal(ch.ExtraData(), &req); err != nil {
-		ch.Reject(ssh.ConnectionFailed, "invalid tunnel request")
+// handleStream pipes a tunnel stream from the sandbox into its local target.
+// Ping is already answered by serveStreams; the controlplane offers nothing
+// else the sandbox may ask for.
+func (c *Client) handleStream(stream net.Conn, h streamHeader) {
+	if h.Type != streamTunnel {
+		log.Printf("[vtunnel-client] Unknown stream type %q", h.Type)
+		stream.Close()
 		return
 	}
 
 	c.mu.RLock()
-	localAddr, ok := c.forwards[req.Port]
+	localAddr, ok := c.forwards[h.Port]
 	c.mu.RUnlock()
 
 	if !ok {
-		log.Printf("[vtunnel-client] No forward for port %d", req.Port)
-		ch.Reject(ssh.ConnectionFailed, "no forward for port")
+		log.Printf("[vtunnel-client] No forward for port %d", h.Port)
+		stream.Close()
 		return
 	}
-
-	stream, reqs, err := ch.Accept()
-	if err != nil {
-		log.Printf("[vtunnel-client] Accept channel failed: %v", err)
-		return
-	}
-	go ssh.DiscardRequests(reqs)
 
 	localConn, err := c.dialTarget(localAddr)
 	if err != nil {
@@ -444,7 +500,7 @@ func (c *Client) handleTunnel(ch ssh.NewChannel) {
 		return
 	}
 
-	log.Printf("[vtunnel-client] New tunnel: port=%d -> %s", req.Port, localAddr)
+	log.Printf("[vtunnel-client] New tunnel: port=%d -> %s", h.Port, localAddr)
 	pipe(stream, localConn)
 }
 
@@ -472,15 +528,14 @@ func (c *Client) dialTarget(addr string) (net.Conn, error) {
 	return conn, nil
 }
 
-// sendListen sends a listen request via SSH.
-func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error {
-	payload := marshalJSON(listenRequest{Port: port})
-	ok, resp, err := sshConn.SendRequest("listen", true, payload)
+// sendListen asks the sandbox to open a port and tunnel it here.
+func (c *Client) sendListen(sess session.Session, port int, localAddr string) error {
+	reply, err := request(sess, streamHeader{Type: streamListen, Port: port})
 	if err != nil {
 		return fmt.Errorf("listen request: %w", err)
 	}
-	if !ok {
-		return fmt.Errorf("listen rejected: %s", string(resp))
+	if !reply.OK {
+		return fmt.Errorf("listen rejected: %s", reply.Error)
 	}
 	log.Printf("[vtunnel-client] Listen OK: port=%d", port)
 	return nil
@@ -488,7 +543,7 @@ func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error 
 
 // sendRouterListen asks the server for one tunnel port serving every forwarded
 // domain and points the sandbox router at it. Only domain names travel.
-func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
+func (c *Client) sendRouterListen(sess session.Session) error {
 	domains := c.proxy.Routes()
 
 	c.mu.RLock()
@@ -510,12 +565,11 @@ func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
 	}
 	sort.Strings(domains) // stable payload, easier to diff in logs
 
-	payload := marshalJSON(listenRequest{Port: port, Domains: domains})
-	ok, resp, err := sshConn.SendRequest("listen", true, payload)
+	reply, err := request(sess, streamHeader{Type: streamListen, Port: port, Domains: domains})
 	if err != nil {
 		return fmt.Errorf("forward request: %w", err)
 	}
-	if !ok {
+	if !reply.OK {
 		// Drop the cached port. It is an ephemeral one the sandbox allocated
 		// last time, and a rejection usually means it is gone or taken by
 		// something else — asking for it again on every reconnect would keep
@@ -525,14 +579,13 @@ func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
 		delete(c.forwards, c.routerPort)
 		c.routerPort = 0
 		c.mu.Unlock()
-		return fmt.Errorf("forward rejected: %s", string(resp))
+		return fmt.Errorf("forward rejected: %s", reply.Error)
 	}
 
-	var reply listenRequest
-	if err := json.Unmarshal(resp, &reply); err == nil && reply.Port > 0 {
+	if reply.Port > 0 {
 		c.mu.Lock()
 		c.routerPort = reply.Port
-		// Tunnel channels for this port are piped into the local proxy.
+		// Tunnel streams for this port are piped into the local proxy.
 		c.forwards[reply.Port] = proxyAddr.String()
 		c.mu.Unlock()
 	}
@@ -541,26 +594,26 @@ func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
 	return nil
 }
 
-func (c *Client) setSSH(conn ssh.Conn) {
+func (c *Client) setSession(sess session.Session) {
 	c.connMu.Lock()
-	c.sshConn = conn
+	c.sess = sess
 	c.connMu.Unlock()
 }
 
-func (c *Client) getSSH() ssh.Conn {
+func (c *Client) getSession() session.Session {
 	c.connMu.RLock()
-	conn := c.sshConn
+	sess := c.sess
 	c.connMu.RUnlock()
-	return conn
+	return sess
 }
 
-// connectOnce dials, sets the SSH connection, and replays forwards.
+// connectOnce dials, publishes the session, and replays forwards.
 func (c *Client) connectOnce() error {
 	conn, err := c.dialOnce()
 	if err != nil {
 		return err
 	}
-	c.setSSH(conn)
+	c.setSession(conn)
 	c.replayForwards()
 	return nil
 }
@@ -569,7 +622,7 @@ func (c *Client) connectOnce() error {
 // with exponential backoff. Runs until the client is closed.
 func (c *Client) connectionLoop() {
 	// Wait for current connection to die
-	if conn := c.getSSH(); conn != nil {
+	if conn := c.getSession(); conn != nil {
 		conn.Wait()
 	}
 
@@ -592,10 +645,10 @@ func (c *Client) connectionLoop() {
 		}
 
 		bo.Reset()
-		log.Printf("[vtunnel-client] Reconnected to %s", c.wsURL)
+		log.Printf("[vtunnel-client] Reconnected to %s", c.url)
 
 		// Block until this connection dies
-		if conn := c.getSSH(); conn != nil {
+		if conn := c.getSession(); conn != nil {
 			conn.Wait()
 		}
 	}
@@ -612,21 +665,21 @@ func (c *Client) replayForwards() {
 	routerPort := c.routerPort
 	c.mu.RUnlock()
 
-	sshConn := c.getSSH()
-	if sshConn == nil {
+	sess := c.getSession()
+	if sess == nil {
 		return
 	}
 	for port, addr := range fwds {
 		if port == routerPort {
 			continue // replayed as one router listen below
 		}
-		if err := c.sendListen(sshConn, port, addr); err != nil {
+		if err := c.sendListen(sess, port, addr); err != nil {
 			log.Printf("[vtunnel-client] Re-listen failed for port %d: %v", port, err)
 		}
 	}
 
 	if len(c.proxy.Routes()) > 0 {
-		if err := c.sendRouterListen(sshConn); err != nil {
+		if err := c.sendRouterListen(sess); err != nil {
 			log.Printf("[vtunnel-client] Re-forward failed: %v", err)
 		}
 	}

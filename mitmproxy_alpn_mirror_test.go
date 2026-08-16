@@ -89,13 +89,8 @@ func newMirrorTestProxy(t *testing.T, upstreamHTTP2 bool) (string, func()) {
 	rootCAs.AddCert(upstreamCert)
 
 	ca := generateProxyTestCA(t)
-	certCache, err := newCertCache(ca)
-	if err != nil {
-		t.Fatalf("newCertCache: %v", err)
-	}
 
 	proxy := NewMITMProxy(WithMitmCA(ca))
-	proxy.certCache = certCache
 	proxy.transport = http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}}
 
 	// httptest TLS certs are issued for example.com, so the SNI has to say so.

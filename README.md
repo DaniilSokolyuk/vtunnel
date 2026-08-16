@@ -136,7 +136,7 @@ The server takes no CA: it cannot intercept TLS by design. `/health` returns `ok
 As a library:
 
 ```go
-server := vtunnel.NewServer(vtunnel.WithClientKey(publicKey))
+server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
 server.StartProxy(":9090") // the application's HTTPS_PROXY
 
 http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +162,7 @@ As a library — routes are declared on the proxy the client owns, and the clien
 ca, _ := vtunnel.LoadCA(pemBytes) // cert+key from ca.pem; the key stays here
 
 client := vtunnel.NewClient("ws://sandbox:3001/",
-    vtunnel.WithKey(privateKey),
+    vtunnel.WithSecret(secret),
     vtunnel.WithMitm(ca),
 )
 client.Connect()
@@ -176,16 +176,22 @@ Routes may be changed at any time while connected. Each change re-sends the full
 
 ## Authentication
 
-```bash
-vtunnel keygen
-# Private key (client): vt-priv-...
-# Public key (server):  vt-pub-...
+One shared secret, the same string on both ends:
 
-vtunnel server -port 3001 -client-key "vt-pub-..."
-vtunnel client -server ws://... -key "vt-priv-..." -forward ...
+```bash
+SECRET=$(openssl rand -base64 32)
+
+vtunnel server -port 3001 -secret "$SECRET"
+vtunnel client -server ws://... -secret "$SECRET" -forward ...
 ```
 
-ed25519 SSH auth ([`auth.go`](auth.go)). The host key is derived from the client key, so there is no manual host key exchange. It works without keys, insecurely.
+There is no key format and nothing to generate with vtunnel — the secret is any string you find hard to guess. Whatever already mints secrets for you does fine: a per-sandbox UUID, a token out of a secret manager, 32 bytes from `openssl`.
+
+From it both ed25519 identities are derived ([`auth.go`](auth.go)) — the client's key and the server's host key — so the client proves itself *and* pins the host key, with nothing to exchange by hand. The secret goes through Argon2id first, which is what lets it be an ordinary string: SSH sends the host public key in cleartext during key exchange, so anyone who can dial the sandbox collects it and can test candidates offline, and Argon2id makes each of those guesses cost ~25 ms and 64 MiB.
+
+**One per sandbox, passed at launch.** It is symmetric, so whoever holds it can be either end: a value baked into an image, or shared across a fleet, turns one compromised sandbox into the ability to pose as all of them. `-secret @/run/secrets/vtunnel` reads it from a file, which beats an argument visible in `ps`.
+
+Nothing is refused. A short secret is taken and warned about, and no secret at all leaves the tunnel unauthenticated — both sides say so loudly at startup, and that warning is the only thing between that mode and production.
 
 This is the tunnel's own authentication and has nothing to do with the MITM CA — see [The CA](#the-ca) for that.
 
@@ -434,14 +440,14 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 |------|-------------|---------|
 | `-port` | WebSocket listen port | `3001` |
 | `-proxy` | Routing proxy port (0 = disabled) | `0` |
-| `-client-key` | Client public key (`vt-pub-...`) | `$VTUNNEL_CLIENT_KEY` |
+| `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
 
 ### `vtunnel client`
 
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-server` | WebSocket URL (required) | — |
-| `-key` | Private key (`vt-priv-...`) | `$VTUNNEL_KEY` |
+| `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
 | `-mitm-ca` | PEM with CA cert+key for HTTPS MITM; created if missing. Without it TLS is piped through untouched and `-H` is rejected | `$VTUNNEL_MITM_CA` (unset = no interception) |
 | `-forward` | Forward mapping (repeatable, at least one required) | — |
 | `-H` / `-header` | Header injected into requests for the preceding `-forward` (repeatable) | — |
@@ -453,10 +459,6 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 | `-mitm-ca` | PEM with CA cert+key (created if missing) | `$VTUNNEL_MITM_CA`, else `ca.pem` |
 | `-out` | Where to write the certificate | alongside the CA, as `.crt` |
 | `-stdout` | Print the certificate instead of writing a file | `false` |
-
-### `vtunnel keygen`
-
-Prints a fresh ed25519 pair: the private key for the client, the public key for the server.
 
 ### `-forward` formats
 

@@ -1,10 +1,8 @@
 package vtunnel_test
 
+// One secret, both ends: what it accepts and what it refuses.
+
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,61 +10,54 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
 
 	"github.com/vivid-money/vtunnel"
 )
 
-func startAuthServer(t *testing.T, clientKey string) *httptest.Server {
+func startAuthServer(t *testing.T, secret string) *httptest.Server {
 	t.Helper()
-	server := vtunnel.NewServer(vtunnel.WithClientKey(clientKey))
+	server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	}))
 	return ts
 }
 
-// 1. GenerateKeyPair returns valid keys with correct prefixes.
-func TestAuthKeyPairGeneration(t *testing.T) {
-	priv, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(priv, "vt-priv-") {
-		t.Errorf("private key should start with vt-priv-, got %q", priv)
-	}
-	if !strings.HasPrefix(pub, "vt-pub-") {
-		t.Errorf("public key should start with vt-pub-, got %q", pub)
-	}
-	t.Logf("Private: %s", priv)
-	t.Logf("Public:  %s", pub)
+// secretA and secretB are two unrelated tunnel secrets. Nothing about their
+// shape matters — a secret is any string hard enough to guess, and these are
+// what an orchestrator handing one to each sandbox would produce.
+const (
+	secretA = "8Kq2vX7mR4nP1tY5uB9cD3fJ6wZ0aE"
+	secretB = "3f2a9c41-77b1-4de6-9f0a-1c5e8b2d4a63"
+)
 
-	// Two calls produce different keys
-	priv2, pub2, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if priv == priv2 {
-		t.Error("two GenerateKeyPair calls produced identical private keys")
-	}
-	if pub == pub2 {
-		t.Error("two GenerateKeyPair calls produced identical public keys")
+// 1. Whatever the operator decided a secret is, it is one: a random blob, a
+// UUID from an orchestrator, an opaque token out of a secret manager. Demanding
+// a format would prove nothing about the only property that counts.
+func TestSecretAcceptsAnyString(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"random blob", secretA},
+		{"uuid", secretB},
+		{"opaque token from a secret manager", "AQICAHhw3l2Kq9vZ0pR7sT1uY4nB6mC8dE0fG2hJ"},
+		{"short, warned about but accepted", "hunter2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := vtunnel.NewClient("ws://unused/", vtunnel.WithSecret(tc.value))
+			defer c.Close()
+		})
 	}
 }
 
-// 2. Client with correct key connects and tunnel works.
-func TestAuthValidKey(t *testing.T) {
-	priv, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
+// 3. The same secret on both ends connects and tunnels.
+func TestAuthValidSecret(t *testing.T) {
+	secret := secretA
 
-	ts := startAuthServer(t, pub)
+	ts := startAuthServer(t, secret)
 	defer ts.Close()
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -74,9 +65,9 @@ func TestAuthValidKey(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	client := vtunnel.NewClient(wsURL(ts), vtunnel.WithKey(priv))
+	client := vtunnel.NewClient(wsURL(ts), vtunnel.WithSecret(secret))
 	if err := client.Connect(); err != nil {
-		t.Fatalf("Connect with valid key: %v", err)
+		t.Fatalf("Connect with the matching secret: %v", err)
 	}
 	defer client.Close()
 
@@ -88,112 +79,42 @@ func TestAuthValidKey(t *testing.T) {
 	waitForHTTP(t, port, "authenticated", 3*time.Second)
 }
 
-// 3. Client with wrong key gets rejected.
-func TestAuthWrongKey(t *testing.T) {
-	_, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ts := startAuthServer(t, pub)
+// 4. A different secret is refused — and refused at the host key, before the
+// client ever offers its own credentials to a server it should not trust.
+func TestAuthWrongSecret(t *testing.T) {
+	ts := startAuthServer(t, secretA)
 	defer ts.Close()
 
-	wrongPriv, _, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	client := vtunnel.NewClient(wsURL(ts), vtunnel.WithKey(wrongPriv))
-	err = client.Connect()
+	client := vtunnel.NewClient(wsURL(ts), vtunnel.WithSecret(secretB))
+	err := client.Connect()
 	if err == nil {
 		client.Close()
-		t.Fatal("expected Connect to fail with wrong key, but it succeeded")
+		t.Fatal("Connect succeeded with a secret the server does not share")
 	}
-	t.Logf("Connect correctly rejected: %v", err)
+	if !strings.Contains(err.Error(), "host key") {
+		t.Fatalf("expected the host key check to fire first, got: %v", err)
+	}
+	t.Logf("correctly rejected: %v", err)
 }
 
-// 4. Server with key, client without key — rejected.
-func TestAuthNoKeyOnClient(t *testing.T) {
-	_, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ts := startAuthServer(t, pub)
+// 5. Server with a secret, client without — rejected.
+func TestAuthNoSecretOnClient(t *testing.T) {
+	ts := startAuthServer(t, secretA)
 	defer ts.Close()
 
 	client := vtunnel.NewClient(wsURL(ts))
-	err = client.Connect()
+	err := client.Connect()
 	if err == nil {
 		client.Close()
-		t.Fatal("expected Connect to fail without key, but it succeeded")
+		t.Fatal("expected Connect to fail without a secret, but it succeeded")
 	}
-	t.Logf("Connect correctly rejected: %v", err)
+	t.Logf("correctly rejected: %v", err)
 }
 
-// 4b. Attacker knows the public key (visible on server/Docker), derives
-// the correct host key, but authenticates with their own private key.
-// Must fail on "unable to authenticate", NOT "host key mismatch".
-func TestAuthWrongPrivateKeyKnownPublic(t *testing.T) {
-	_, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ts := startAuthServer(t, pub)
-	defer ts.Close()
-
-	// Attacker generates their own ed25519 keypair
-	_, attackerPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	attackerSigner, err := ssh.NewSignerFromKey(attackerPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Derive the correct server host key from the known public key
-	// (replicating what deriveHostKey does internally)
-	pubBytes, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(pub, "vt-pub-"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	sshPubKey, err := ssh.NewPublicKey(ed25519.PublicKey(pubBytes))
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := sha256.Sum256(sshPubKey.Marshal())
-	hostPriv := ed25519.NewKeyFromSeed(h[:])
-	hostSigner, err := ssh.NewSignerFromKey(hostPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Connect with correct host key but wrong auth key
-	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
-	wsConn, _, err := dialer.Dial(wsURL(ts), nil)
-	if err != nil {
-		t.Fatalf("WS dial: %v", err)
-	}
-
-	sshConfig := &ssh.ClientConfig{
-		User:            "vtunnel",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(attackerSigner)},
-		HostKeyCallback: ssh.FixedHostKey(hostSigner.PublicKey()),
-	}
-	_, _, _, err = ssh.NewClientConn(vtunnel.NewWSConn(wsConn), "", sshConfig)
-	if err == nil {
-		t.Fatal("expected auth failure, but connection succeeded")
-	}
-	if !strings.Contains(err.Error(), "unable to authenticate") {
-		t.Fatalf("expected 'unable to authenticate', got: %v", err)
-	}
-	t.Logf("Correctly rejected at auth (not host key): %v", err)
-}
-
-// 5. No keys on either side — works as before.
-func TestAuthNoKeyOnServer(t *testing.T) {
+// 6. No secret on either side — unauthenticated, and still working. The warning
+// both sides log at startup is the only thing standing between this mode and
+// production.
+func TestAuthNoSecretOnServer(t *testing.T) {
 	ts, _ := startTunnelServer(t)
 	defer ts.Close()
 
@@ -213,14 +134,11 @@ func TestAuthNoKeyOnServer(t *testing.T) {
 	waitForHTTP(t, port, "noauth", 3*time.Second)
 }
 
-// 6. Reconnect with key — auth replays correctly.
-func TestAuthReconnectWithKey(t *testing.T) {
-	priv, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		t.Fatal(err)
-	}
+// 7. Reconnect re-authenticates from the same secret.
+func TestAuthReconnectWithSecret(t *testing.T) {
+	secret := secretA
 
-	server := vtunnel.NewServer(vtunnel.WithClientKey(pub))
+	server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
 	connCh := make(chan *websocket.Conn, 20)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
@@ -228,14 +146,14 @@ func TestAuthReconnectWithKey(t *testing.T) {
 			return
 		}
 		connCh <- conn
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	}))
 	defer ts.Close()
 
 	client := vtunnel.NewClient(wsURL(ts),
 		vtunnel.WithKeepAlive(200*time.Millisecond),
 		vtunnel.WithReconnectBackoff(50*time.Millisecond, 200*time.Millisecond),
-		vtunnel.WithKey(priv),
+		vtunnel.WithSecret(secret),
 	)
 	if err := client.Connect(); err != nil {
 		t.Fatalf("Connect: %v", err)

@@ -69,15 +69,23 @@ PASS example.com went direct (HTTP 200)
 
 ### Manual run
 
+One secret, the same string on both sides — the sandbox and the controlplane
+authenticate each other with it, so generate it once and use it in both
+terminals:
+
+```bash
+export VTUNNEL_SECRET=$(openssl rand -base64 32)
+```
+
 ```bash
 # Terminal 1: sandbox
 cd example/sandbox
 docker build -t vtunnel-sandbox .
 docker run --rm -p 3001:3001 \
-  -e VTUNNEL_PUBLIC_KEY="vt-pub-..." \
+  -e VTUNNEL_SECRET="$VTUNNEL_SECRET" \
   vtunnel-sandbox
 
-# Terminal 2: controlplane
+# Terminal 2: controlplane — same VTUNNEL_SECRET in the environment
 cd example/controlplane
 bun src/index.ts
 ```

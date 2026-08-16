@@ -1,8 +1,6 @@
 package vtunnel
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -11,24 +9,29 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/crypto/ssh"
+
+	"github.com/vivid-money/vtunnel/internal/session"
+	"github.com/vivid-money/vtunnel/internal/tunnelkey"
 )
 
 const (
-	defaultKeepAlive = 30 * time.Second
-	sshWaitTimeout   = 35 * time.Second
+	defaultKeepAlive   = 30 * time.Second
+	sessionWaitTimeout = 35 * time.Second
 )
 
-// Server handles reverse tunnel connections from clients over SSH-over-WebSocket.
+// Server is the sandbox end of the tunnel. It accepts a connection from a
+// client, opens the ports the client asks for, and hands every connection to
+// those ports back through the tunnel.
 type Server struct {
-	sshConfig *ssh.ServerConfig
-	keepAlive time.Duration
+	keepAlive    time.Duration
+	protocol     Protocol
+	streamWindow int
 
-	// Client authentication
-	clientPubKey ssh.PublicKey // nil = no auth
+	// keys authenticates both ends; nil means the tunnel is unauthenticated.
+	keys *tunnelkey.Keys
 
-	// Active SSH connection
-	activeConn   ssh.Conn
+	// Active session
+	activeConn   session.Session
 	activeConnMu sync.RWMutex
 	connReady    chan struct{} // closed when activeConn becomes non-nil
 
@@ -51,17 +54,47 @@ func WithServerKeepAlive(d time.Duration) ServerOption {
 	}
 }
 
-// WithClientKey sets the authorized client public key ("vt-pub-...").
-// When set, only clients with the matching private key can connect.
-// The server host key is deterministically derived from this key,
-// enabling automatic MITM protection on the client side.
-func WithClientKey(pubKey string) ServerOption {
+// WithServerProtocol picks the session protocol this server speaks. The client
+// must be configured with the same one through [WithProtocol]; see [Protocol].
+func WithServerProtocol(p Protocol) ServerOption {
 	return func(s *Server) {
-		key, err := parsePublicKey(pubKey)
-		if err != nil {
-			panic(fmt.Sprintf("vtunnel: invalid client key: %v", err))
+		s.protocol = p
+	}
+}
+
+// WithServerStreamWindow sets how many bytes the controlplane may have in
+// flight to this sandbox on one tunnelled connection. Zero keeps the default of
+// 2 MB. It is [WithStreamWindow] for the other direction — each end sets its
+// own receive window — and [ProtocolSSH] ignores it for the same reason.
+func WithServerStreamWindow(bytes int) ServerOption {
+	return func(s *Server) {
+		s.streamWindow = bytes
+	}
+}
+
+// WithServerSecret sets the tunnel secret, the one value that authenticates
+// this server and the client to each other. The client must be given the same
+// secret through [WithSecret].
+//
+// Any string will do; see [WithSecret] for what that means and what gets
+// warned about. It is a secret here too, so pass it at launch — an environment
+// variable set by whatever creates the sandbox — and never bake it into an
+// image. Anyone holding it can be either end.
+//
+// An empty secret leaves the tunnel unauthenticated, and [NewServer] says so.
+func WithServerSecret(secret string) ServerOption {
+	return func(s *Server) {
+		if secret == "" {
+			return
 		}
-		s.clientPubKey = key
+		if w := tunnelkey.Warning(secret); w != "" {
+			log.Printf("[vtunnel-server] WARNING: %s.", w)
+		}
+		keys, err := tunnelkey.Derive(secret)
+		if err != nil {
+			panic(fmt.Sprintf("vtunnel: derive tunnel keys: %v", err))
+		}
+		s.keys = keys
 	}
 }
 
@@ -78,94 +111,93 @@ func NewServer(opts ...ServerOption) *Server {
 
 	s.router = newRouter()
 
-	// Build SSH config after options are applied
-	var hostKey ssh.Signer
-	var err error
-	if s.clientPubKey != nil {
-		hostKey, err = deriveHostKey(s.clientPubKey)
-	} else {
-		hostKey, err = generateHostKey()
+	if s.protocol.insecure() {
+		log.Printf("[vtunnel-server] WARNING: protocol %q has no encryption and no authentication. "+
+			"Any secret configured is ignored, and anyone who can reach this port owns the tunnel. "+
+			"It is here to be measured against, not to be run.", s.protocol)
+	} else if s.keys == nil {
+		log.Println("[vtunnel-server] WARNING: No tunnel secret configured. Authentication is DISABLED. Do NOT use in production! Use --secret or VTUNNEL_SECRET.")
 	}
-	if err != nil {
-		panic("vtunnel: generate host key: " + err.Error())
-	}
-
-	sshConfig := &ssh.ServerConfig{}
-	sshConfig.AddHostKey(hostKey)
-
-	if s.clientPubKey != nil {
-		expected := s.clientPubKey.Marshal()
-		sshConfig.PublicKeyCallback = func(_ ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
-			if bytes.Equal(key.Marshal(), expected) {
-				return &ssh.Permissions{}, nil
-			}
-			return nil, fmt.Errorf("unauthorized key")
-		}
-	} else {
-		sshConfig.NoClientAuth = true
-		log.Println("[vtunnel-server] WARNING: No client key configured. Authentication is DISABLED. Do NOT use in production! Use --client-key or VTUNNEL_CLIENT_KEY.")
-	}
-
-	s.sshConfig = sshConfig
 	return s
 }
 
-// HandleConn handles a WebSocket connection from a client.
-// Listeners persist across reconnections; acceptLoops keep running and
-// use getSSH() to wait for the next connection.
-func (s *Server) HandleConn(wsConn *websocket.Conn) {
-	conn := NewWSConn(wsConn)
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
+// HandleWebSocket serves a client that arrived over a WebSocket. It is
+// [Server.HandleConn] with the gorilla connection adapted, and the shape most
+// deployments want:
+//
+//	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+//	    conn, err := upgrader.Upgrade(w, r, nil)
+//	    if err != nil {
+//	        return
+//	    }
+//	    defer conn.Close()
+//	    server.HandleWebSocket(conn)
+//	})
+func (s *Server) HandleWebSocket(wsConn *websocket.Conn) {
+	s.HandleConn(NewWSConn(wsConn))
+}
+
+// HandleConn serves a client over an established connection, and returns when
+// that connection ends.
+//
+// Any net.Conn will do — a WebSocket, plain TCP, TLS, anything that carries
+// bytes in order. The tunnel's security does not depend on which: the session
+// authenticates both ends itself.
+//
+// Listeners persist across reconnections; their accept loops keep running and
+// wait for the next connection.
+func (s *Server) HandleConn(conn net.Conn) {
+	sess, err := session.Serve(session.Kind(s.protocol), conn, session.Config{
+		Keys:         s.keys,
+		Handshake:    defaultHandshakeTimeout,
+		StreamWindow: s.streamWindow,
+	})
 	if err != nil {
-		log.Printf("[vtunnel-server] SSH handshake failed: %v", err)
+		log.Printf("[vtunnel-server] Handshake failed: %v", err)
 		return
 	}
-	conn.SetDeadline(time.Time{}) // clear deadline after handshake
-	defer sshConn.Close()
+	defer sess.Close()
 
 	log.Println("[vtunnel-server] Client connected")
 
-	// Publish this connection so acceptLoops (and new ones) can use it
-	s.setSSH(sshConn)
+	// Publish this session so acceptLoops (and new ones) can use it
+	s.setSession(sess)
 	defer func() {
-		s.clearSSH(sshConn)
+		s.clearSession(sess)
 		log.Println("[vtunnel-server] Client disconnected")
 	}()
 
-	go s.handleRequests(sshConn, reqs)
-	go rejectChannels(chans)
+	go serveStreams(sess, s.handleStream)
 	if s.keepAlive > 0 {
-		go keepAliveLoop(sshConn, s.keepAlive)
+		go keepAliveLoop(sess, s.keepAlive)
 	}
 
-	// Block until SSH connection dies
-	sshConn.Wait()
+	sess.Wait()
 }
 
-// setSSH publishes a new SSH connection and unblocks anyone waiting in getSSH.
-func (s *Server) setSSH(conn ssh.Conn) {
+// setSession publishes a new session and unblocks anyone waiting in getSession.
+func (s *Server) setSession(sess session.Session) {
 	s.activeConnMu.Lock()
-	s.activeConn = conn
+	s.activeConn = sess
 	ch := s.connReady
 	s.connReady = make(chan struct{}) // prepare for next wait cycle
 	s.activeConnMu.Unlock()
-	close(ch) // unblock all goroutines waiting in getSSH
+	close(ch) // unblock all goroutines waiting in getSession
 }
 
-// clearSSH marks the connection as dead and creates a new wait channel.
-func (s *Server) clearSSH(conn ssh.Conn) {
+// clearSession marks the session as dead and creates a new wait channel.
+func (s *Server) clearSession(sess session.Session) {
 	s.activeConnMu.Lock()
-	if s.activeConn == conn {
+	if s.activeConn == sess {
 		s.activeConn = nil
 		s.connReady = make(chan struct{}) // new channel for next wait
 	}
 	s.activeConnMu.Unlock()
 }
 
-// getSSH returns the current SSH connection. If none is active, it blocks
-// until one becomes available or the timeout expires.
-func (s *Server) getSSH() ssh.Conn {
+// getSession returns the current session. If none is active, it blocks until
+// one becomes available or the timeout expires.
+func (s *Server) getSession() session.Session {
 	s.activeConnMu.RLock()
 	c := s.activeConn
 	ready := s.connReady
@@ -182,54 +214,41 @@ func (s *Server) getSSH() ssh.Conn {
 		c = s.activeConn
 		s.activeConnMu.RUnlock()
 		return c
-	case <-time.After(sshWaitTimeout):
-		log.Printf("[vtunnel-server] getSSH timeout (%v)", sshWaitTimeout)
+	case <-time.After(sessionWaitTimeout):
+		log.Printf("[vtunnel-server] getSession timeout (%v)", sessionWaitTimeout)
 		return nil
 	}
 }
 
-// handleRequests processes SSH global requests from the client.
-func (s *Server) handleRequests(sshConn ssh.Conn, reqs <-chan *ssh.Request) {
-	for r := range reqs {
-		switch r.Type {
-		case "ping":
-			r.Reply(true, []byte("pong"))
-		case "listen":
-			s.handleListen(sshConn, r)
-		default:
-			if r.WantReply {
-				r.Reply(false, nil)
-			}
-		}
+// handleStream dispatches a stream the client opened. Ping is already
+// answered by serveStreams; the sandbox has nothing else to offer.
+func (s *Server) handleStream(stream net.Conn, h streamHeader) {
+	defer stream.Close()
+
+	if h.Type != streamListen {
+		log.Printf("[vtunnel-server] Unknown stream type %q", h.Type)
+		writeFrame(stream, streamReply{Error: "unknown stream type"})
+		return
 	}
+	s.handleListen(stream, h)
 }
 
 // handleListen processes a listen request from the client.
 //
 // Two modes of operation:
 //
-//  1. Port-based (Listen): req.Port is set, req.Domains is empty.
+//  1. Port-based (Listen): h.Port is set, h.Domains is empty.
 //     Server opens the requested TCP port and tunnels all connections.
 //
-//  2. Router-based (Forward): req.Port is 0, req.Domains lists the domains the
+//  2. Router-based (Forward): h.Port is 0, h.Domains lists the domains the
 //     controlplane proxy handles. The server allocates a port and points the
 //     router at it, so allowlisted requests are chained through the tunnel.
 //
 // Listeners are persistent — they survive client reconnects. On reconnect the
 // client replays its calls; an existing listener is reused and its routes are
 // refreshed from the request.
-//
-// The request carries domain names only. Targets, credentials and injected
-// headers stay on the controlplane and never cross the tunnel.
-func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
-	var req listenRequest
-	if err := json.Unmarshal(r.Payload, &req); err != nil {
-		log.Printf("[vtunnel-server] Invalid listen request: %v", err)
-		r.Reply(false, []byte("invalid payload"))
-		return
-	}
-
-	port := req.Port
+func (s *Server) handleListen(stream net.Conn, h streamHeader) {
+	port := h.Port
 
 	s.listenersMu.Lock()
 	// Reuse existing listener on reconnect (client replays its forwards).
@@ -243,10 +262,10 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 			// domains, and if its ephemeral port ever collided with the router's
 			// this would clear the whole allowlist and send every forwarded
 			// domain straight out of the sandbox, quietly.
-			if len(req.Domains) > 0 {
-				s.router.SetRoutes(port, req.Domains)
+			if len(h.Domains) > 0 {
+				s.router.SetRoutes(port, h.Domains)
 			}
-			r.Reply(true, marshalJSON(listenRequest{Port: port}))
+			writeFrame(stream, streamReply{OK: true, Port: port})
 			return
 		}
 	}
@@ -257,7 +276,7 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	if err != nil {
 		s.listenersMu.Unlock()
 		log.Printf("[vtunnel-server] Failed to listen on %s: %v", addr, err)
-		r.Reply(false, []byte(err.Error()))
+		writeFrame(stream, streamReply{Error: err.Error()})
 		return
 	}
 
@@ -271,13 +290,12 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 	log.Printf("[vtunnel-server] Listening on %s", ln.Addr())
 
 	// Reply with the allocated port (no LocalAddr rewrite — client dials plain TCP).
-	reply := listenRequest{Port: port}
-	r.Reply(true, marshalJSON(reply))
+	writeFrame(stream, streamReply{OK: true, Port: port})
 
 	// Point the router at this tunnel port for the client's domains.
-	s.router.SetRoutes(port, req.Domains)
+	s.router.SetRoutes(port, h.Domains)
 
-	// Start persistent accept loop — runs forever, uses getSSH() to
+	// Start persistent accept loop — runs forever, uses getSession() to
 	// wait for reconnects.
 	go s.acceptLoop(ln, port)
 }
@@ -292,9 +310,9 @@ func (s *Server) StartProxy(addr string) error { return s.router.Start(addr) }
 // CloseProxy stops the router.
 func (s *Server) CloseProxy() { s.router.Close() }
 
-// acceptLoop accepts TCP connections and tunnels them through SSH channels.
-// It NEVER stops — when SSH dies, handleTunnelConn calls getSSH() which
-// blocks until the client reconnects.
+// acceptLoop accepts TCP connections and tunnels them through session streams.
+// It NEVER stops — when the session dies, handleTunnelConn calls getSession()
+// which blocks until the client reconnects.
 func (s *Server) acceptLoop(ln net.Listener, port int) {
 	for {
 		conn, err := ln.Accept()
@@ -311,25 +329,23 @@ func (s *Server) acceptLoop(ln net.Listener, port int) {
 	}
 }
 
-// handleTunnelConn gets the current SSH connection (waiting for reconnect
-// if needed), then opens a channel and pipes data.
+// handleTunnelConn gets the current session (waiting for reconnect if needed),
+// then opens a stream and pipes data.
 func (s *Server) handleTunnelConn(tcpConn net.Conn, port int) {
 	defer tcpConn.Close()
 
-	sshConn := s.getSSH()
-	if sshConn == nil {
-		log.Printf("[vtunnel-server] No SSH connection for port %d (timeout)", port)
+	sess := s.getSession()
+	if sess == nil {
+		log.Printf("[vtunnel-server] No session for port %d (timeout)", port)
 		return
 	}
 
-	payload := marshalJSON(tunnelRequest{Port: port})
-	ch, reqs, err := sshConn.OpenChannel("tunnel", payload)
+	stream, err := openTunnel(sess, port)
 	if err != nil {
-		log.Printf("[vtunnel-server] OpenChannel failed for port %d: %v", port, err)
+		log.Printf("[vtunnel-server] Open stream failed for port %d: %v", port, err)
 		return
 	}
-	go ssh.DiscardRequests(reqs)
 
 	log.Printf("[vtunnel-server] New tunnel: port=%d", port)
-	pipe(ch, tcpConn)
+	pipe(stream, tcpConn)
 }

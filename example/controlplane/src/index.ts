@@ -27,7 +27,7 @@ import { spawn, ChildProcess } from "node:child_process";
 
 // --- Config ---
 
-const VTUNNEL_KEY = process.env.VTUNNEL_KEY;
+const VTUNNEL_SECRET = process.env.VTUNNEL_SECRET;
 const SANDBOX_WS_URL = process.env.SANDBOX_WS_URL || "ws://localhost:3001/";
 
 const ANTHROPIC_PROXY_PORT = 8081;
@@ -120,8 +120,8 @@ function startGitHubProxy(): Promise<void> {
 function startVtunnelClient(): ChildProcess {
   const args = ["client", "-server", SANDBOX_WS_URL];
 
-  if (VTUNNEL_KEY) {
-    args.push("-key", VTUNNEL_KEY);
+  if (VTUNNEL_SECRET) {
+    args.push("-secret", VTUNNEL_SECRET);
   }
 
   // Domain forwards: sandbox router → tunnel → this machine's MITM proxy → local service

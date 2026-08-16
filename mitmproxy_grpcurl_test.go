@@ -39,7 +39,7 @@ func TestProxyGrpcurlMITMTunnel(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	}))
 	defer tunnelServer.Close()
 

@@ -71,7 +71,7 @@ func TestMITMDoesNotFallBackWhenHeadersAreConfigured(t *testing.T) {
 	if _, err := client.Get("https://pinned.test/"); err == nil {
 		t.Fatal("first request succeeded unexpectedly")
 	}
-	if proxy.mitmBlocked("pinned.test:443") {
+	if blocked, _ := proxy.mitmBlocked("pinned.test:443"); blocked {
 		t.Fatal("a route with injected headers was excluded from interception; " +
 			"it would keep working while the credential quietly went missing")
 	}
@@ -92,7 +92,7 @@ func TestMITMDoesNotFallBackForHandlerRoute(t *testing.T) {
 	if _, err := client.Get("https://pinned.test/"); err == nil {
 		t.Fatal("first request succeeded unexpectedly")
 	}
-	if proxy.mitmBlocked("pinned.test:443") {
+	if blocked, _ := proxy.mitmBlocked("pinned.test:443"); blocked {
 		t.Fatal("a handler route was excluded from interception, but it has no target to pipe to")
 	}
 }
@@ -122,7 +122,7 @@ func TestMITMExceptionsSkipInterceptionFromTheStart(t *testing.T) {
 	proxy.noMITMMu.Lock()
 	proxy.sweepNoMITMLocked(time.Now().Add(100 * noMITMTTL))
 	proxy.noMITMMu.Unlock()
-	if !proxy.mitmBlocked("pinned.test:443") {
+	if blocked, _ := proxy.mitmBlocked("pinned.test:443"); !blocked {
 		t.Fatal("a configured exception expired; only learned ones should")
 	}
 }
@@ -136,7 +136,7 @@ func TestMITMLearnedExclusionExpires(t *testing.T) {
 	proxy.noMITM = map[string]time.Time{"stale.test:443": time.Now().Add(-time.Minute)}
 	proxy.noMITMMu.Unlock()
 
-	if proxy.mitmBlocked("stale.test:443") {
+	if blocked, _ := proxy.mitmBlocked("stale.test:443"); blocked {
 		t.Fatal("an expired exclusion is still in force")
 	}
 
@@ -172,7 +172,7 @@ func TestOptionalClientCertUpstreamStillIntercepts(t *testing.T) {
 	if string(body) != "reached-upstream" {
 		t.Fatalf("body = %q", body)
 	}
-	if proxy.mitmBlocked("optional.test:443") {
+	if blocked, _ := proxy.mitmBlocked("optional.test:443"); blocked {
 		t.Fatal("an optional client-certificate request was treated as a refusal")
 	}
 }
@@ -308,7 +308,7 @@ func waitBlocked(t *testing.T, p *MITMProxy, authority string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if p.mitmBlocked(authority) {
+		if blocked, _ := p.mitmBlocked(authority); blocked {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)

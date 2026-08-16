@@ -28,7 +28,9 @@ import (
 // a routing proxy for the application to point HTTPS_PROXY at. No CA and no
 // credentials appear anywhere here — this side cannot decrypt.
 func Example_sandbox() {
-	server := vtunnel.NewServer(vtunnel.WithClientKey(os.Getenv("VTUNNEL_CLIENT_KEY")))
+	// The same secret the controlplane dials in with, handed to this container
+	// at launch by whatever created it.
+	server := vtunnel.NewServer(vtunnel.WithServerSecret(os.Getenv("VTUNNEL_SECRET")))
 
 	if err := server.StartProxy(":9090"); err != nil {
 		log.Fatal(err)
@@ -41,7 +43,7 @@ func Example_sandbox() {
 			return
 		}
 		defer conn.Close()
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	})
 
 	log.Fatal(http.ListenAndServe(":3001", nil))
@@ -61,7 +63,7 @@ func Example_controlplane() {
 	}
 
 	client := vtunnel.NewClient("ws://sandbox:3001/",
-		vtunnel.WithKey(os.Getenv("VTUNNEL_KEY")),
+		vtunnel.WithSecret(os.Getenv("VTUNNEL_SECRET")),
 		vtunnel.WithMitm(ca),
 	)
 	if err := client.Connect(); err != nil {

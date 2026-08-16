@@ -55,13 +55,10 @@ func TestProxyMITMHTTP2TLSUpstreamFallbackToHTTP11(t *testing.T) {
 	rootCAs.AddCert(upstreamCert)
 
 	ca := generateProxyTestCA(t)
-	certCache, err := newCertCache(ca)
-	if err != nil {
-		t.Fatalf("newCertCache: %v", err)
-	}
 
+	// No Start: a proxy served as a plain http.Handler intercepts just the same,
+	// which is what the exported ServeHTTP promises.
 	handler := NewMITMProxy(WithMitmCA(ca))
-	handler.certCache = certCache
 	handler.transport = http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: rootCAs},
 	}

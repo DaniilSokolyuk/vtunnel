@@ -1,7 +1,9 @@
 #!/bin/sh
 set -e
 
-VTUNNEL_PORT=${VTUNNEL_PORT:-3001}
+# The scheme picks the transport. ws also serves /health, which is what the
+# test script waits on; tcp:// would work just as well and just as safely.
+VTUNNEL_LISTEN=${VTUNNEL_LISTEN:-ws://:3001/}
 PROXY_PORT=${PROXY_PORT:-9090}
 
 # Trust the controlplane's MITM CA certificate if one was mounted. Only the
@@ -17,6 +19,6 @@ fi
 
 # Start vtunnel server: routing proxy only, no TLS interception here.
 exec vtunnel server \
-  -port "$VTUNNEL_PORT" \
+  -listen "$VTUNNEL_LISTEN" \
   -proxy "$PROXY_PORT" \
-  ${VTUNNEL_PUBLIC_KEY:+-client-key "$VTUNNEL_PUBLIC_KEY"}
+  ${VTUNNEL_SECRET:+-secret "$VTUNNEL_SECRET"}

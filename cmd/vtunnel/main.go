@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,13 +25,24 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `Usage:
   vtunnel server [flags]        # runs in the sandbox: routes, never decrypts
   vtunnel client [flags]        # runs on the controlplane: MITM, credentials
-  vtunnel keygen                # tunnel authentication keypair
   vtunnel ca [flags]            # MITM CA: makes the pair, exports the certificate
 
 Server flags:
-  -port int            WebSocket listen port (default 3001)
+  -listen string       Where to accept the tunnel. The scheme picks the
+                       transport, and the client's -server URL must use the
+                       same one:
+                         ws://:3001/    also serves /health  (default)
+                         tcp://:3001    a raw socket, and cheaper
+                       Neither is more secure — the session authenticates the
+                       peer either way. [$VTUNNEL_LISTEN]
   -proxy int           HTTP CONNECT proxy port (0 = disabled, default 0)
-  -client-key string   Client public key for auth (vt-pub-...) [$VTUNNEL_CLIENT_KEY]
+  -secret string       Shared tunnel secret, the same value the client is
+                       given. Any hard-to-guess string; @/path reads it from
+                       a file. [$VTUNNEL_SECRET]
+  -protocol string     Session protocol, the same value the client is given:
+                       ssh (default), yamux, or yamux-insecure — the last of
+                       which has no encryption and no authentication, and is
+                       there to be measured against. [$VTUNNEL_PROTOCOL]
 
 CA flags:
   -mitm-ca string   PEM file with CA cert+key, created if missing. Same file
@@ -40,8 +52,17 @@ CA flags:
   -stdout           Print the certificate to stdout instead of writing a file
 
 Client flags:
-  -server string    WebSocket server URL (e.g. ws://example.com/)
-  -key string       Private key for auth (vt-priv-...) [$VTUNNEL_KEY]
+  -server string    Tunnel URL. The scheme picks the transport:
+                      ws://sandbox:3001/   wss://sandbox.example.com/
+                      tcp://sandbox:3001
+                    It must match how the sandbox is listening.
+  -secret string    Shared tunnel secret, the same value the sandbox is given.
+                    Any hard-to-guess string, e.g. openssl rand -base64 32;
+                    @/path reads it from a file. [$VTUNNEL_SECRET]
+  -protocol string  Session protocol, the same value the sandbox is given:
+                    ssh (default), yamux, or yamux-insecure — the last of
+                    which has no encryption and no authentication, and is
+                    there to be measured against. [$VTUNNEL_PROTOCOL]
   -mitm-ca string   PEM file with CA cert+key for HTTPS MITM [$VTUNNEL_MITM_CA]
                     Created if missing. Without it TLS is piped through
                     untouched and -H cannot be used.
@@ -71,8 +92,6 @@ func main() {
 		runServer(os.Args[2:])
 	case "client":
 		runClient(os.Args[2:])
-	case "keygen":
-		runKeygen()
 	case "ca":
 		runCA(os.Args[2:])
 	default:
@@ -82,13 +101,19 @@ func main() {
 
 var srv *vtunnel.Server
 
-func runKeygen() {
-	priv, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		log.Fatalf("[vtunnel] keygen error: %v", err)
+// readSecret resolves a secret given on the command line. "@/path" reads the
+// file instead, because an argument is visible in ps output and lands in shell
+// history — and this one value is the whole tunnel.
+func readSecret(v string) string {
+	path, ok := strings.CutPrefix(v, "@")
+	if !ok {
+		return v
 	}
-	fmt.Printf("Private key (client): %s\n", priv)
-	fmt.Printf("Public key (server):  %s\n", pub)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("[vtunnel] read secret from %s: %v", path, err)
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // defaultCAName is where the MITM CA lands when no path is given: the working
@@ -205,15 +230,21 @@ func runCA(args []string) {
 
 func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	port := fs.Int("port", 3001, "WebSocket listen port")
+	listen := fs.String("listen", envOr("VTUNNEL_LISTEN", "ws://:3001/"), "Tunnel listen URL: ws://:3001/ or tcp://:3001")
 	proxyPort := fs.Int("proxy", 0, "HTTP CONNECT proxy port (0 = disabled)")
-	clientKey := fs.String("client-key", os.Getenv("VTUNNEL_CLIENT_KEY"), "Client public key (vt-pub-...)")
+	secret := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
+	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the client")
 	fs.Parse(args)
 
-	var opts []vtunnel.ServerOption
-	if *clientKey != "" {
-		opts = append(opts, vtunnel.WithClientKey(*clientKey))
-		log.Println("[vtunnel] Client key authentication enabled")
+	listenURL, err := url.Parse(*listen)
+	if err != nil || listenURL.Scheme == "" {
+		log.Fatalf("[vtunnel] bad -listen %q: want ws://:3001/ or tcp://:3001", *listen)
+	}
+
+	opts := []vtunnel.ServerOption{vtunnel.WithServerProtocol(parseProtocol(*protocol))}
+	if *secret != "" {
+		opts = append(opts, vtunnel.WithServerSecret(readSecret(*secret)))
+		log.Println("[vtunnel] Tunnel authentication enabled")
 	}
 	srv = vtunnel.NewServer(opts...)
 
@@ -225,27 +256,39 @@ func runServer(args []string) {
 		log.Printf("[vtunnel] Routing proxy on %s (no TLS interception here)", proxyAddr)
 	}
 
+	log.Printf("[vtunnel] Starting server on %s", *listen)
+
+	if listenURL.Scheme != "ws" {
+		// Nothing to share the port with, so the transport's own listener is
+		// the whole server. /health has no place on a raw socket.
+		ln, err := vtunnel.Listen(*listen)
+		if err != nil {
+			log.Fatalf("[vtunnel] %v", err)
+		}
+		log.Fatal(vtunnel.Serve(ln, srv))
+	}
+
+	// WebSocket shares a mux with the health endpoint, so the HTTP server is
+	// ours rather than the transport's.
 	http.HandleFunc("/", handleWebSocket)
 	http.HandleFunc("/health", handleHealth)
-
-	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("[vtunnel] Starting server on %s", addr)
 
 	// ReadHeaderTimeout so a peer that opens a connection and dawdles over the
 	// request line cannot pin a goroutine indefinitely. No write or read
 	// timeout: once upgraded, this connection is a long-lived tunnel.
-	srv := &http.Server{
-		Addr:              addr,
+	httpSrv := &http.Server{
+		Addr:              listenURL.Host,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Fatal(srv.ListenAndServe())
+	log.Fatal(httpSrv.ListenAndServe())
 }
 
 func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	server := fs.String("server", "", "WebSocket server URL")
-	key := fs.String("key", os.Getenv("VTUNNEL_KEY"), "Private key (vt-priv-...)")
+	key := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
 	mitmCAFile := fs.String("mitm-ca", os.Getenv("VTUNNEL_MITM_CA"), "PEM file with CA cert+key for HTTPS MITM (created if missing); unset = no interception")
+	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the sandbox")
 	var forwards forwardList
 	fs.Var(&forwards, "forward", "Port forward: remotePort=localAddr (repeatable)")
 	headers := headerList{forwards: &forwards}
@@ -260,10 +303,10 @@ func runClient(args []string) {
 		log.Fatal("[vtunnel] at least one -forward is required")
 	}
 
-	var opts []vtunnel.Option
+	opts := []vtunnel.Option{vtunnel.WithProtocol(parseProtocol(*protocol))}
 	if *key != "" {
-		opts = append(opts, vtunnel.WithKey(*key))
-		log.Println("[vtunnel] Key authentication enabled")
+		opts = append(opts, vtunnel.WithSecret(readSecret(*key)))
+		log.Println("[vtunnel] Tunnel authentication enabled")
 	}
 
 	// No CA, no interception. Headers can only be injected into traffic we
@@ -316,6 +359,36 @@ func runClient(args []string) {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Println("[vtunnel] Shutting down")
+}
+
+// envOr returns the environment variable, or def when it is unset or empty.
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+// parseProtocol resolves -protocol / $VTUNNEL_PROTOCOL.
+//
+// An unrecognised value is fatal rather than a fallback to the default. The
+// two ends must agree, and a typo that quietly leaves one of them on ssh would
+// present as a handshake that never completes.
+func parseProtocol(v string) vtunnel.Protocol {
+	switch vtunnel.Protocol(v) {
+	case "":
+		return vtunnel.ProtocolSSH
+	case vtunnel.ProtocolSSH:
+		return vtunnel.ProtocolSSH
+	case vtunnel.ProtocolYamux:
+		return vtunnel.ProtocolYamux
+	case vtunnel.ProtocolYamuxInsecure:
+		return vtunnel.ProtocolYamuxInsecure
+	default:
+		log.Fatalf("[vtunnel] unknown -protocol %q: expected %q, %q or %q",
+			v, vtunnel.ProtocolSSH, vtunnel.ProtocolYamux, vtunnel.ProtocolYamuxInsecure)
+		return ""
+	}
 }
 
 // forward represents a single forward mapping (port-based or domain-based)
@@ -411,7 +484,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	srv.HandleConn(conn)
+	srv.HandleWebSocket(conn)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {

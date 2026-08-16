@@ -30,7 +30,7 @@
 //
 // # Sandbox side
 //
-//	server := vtunnel.NewServer(vtunnel.WithClientKey(publicKey))
+//	server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
 //	server.StartProxy(":9090") // the application's HTTPS_PROXY
 //
 //	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -39,7 +39,7 @@
 //	        return
 //	    }
 //	    defer conn.Close()
-//	    server.HandleConn(conn)
+//	    server.HandleWebSocket(conn)
 //	})
 //	http.ListenAndServe(":3001", nil)
 //
@@ -48,7 +48,7 @@
 //	ca, _ := vtunnel.LoadCA(pemBytes) // cert+key from ca.pem; the key stays here
 //
 //	client := vtunnel.NewClient("ws://sandbox:3001/",
-//	    vtunnel.WithKey(privateKey),
+//	    vtunnel.WithSecret(secret),
 //	    vtunnel.WithMitm(ca),
 //	)
 //	client.Connect()

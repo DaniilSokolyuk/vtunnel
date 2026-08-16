@@ -37,12 +37,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- Generate keys ---
-log "generating vtunnel keys..."
-KEYGEN=$(vtunnel keygen)
-VTUNNEL_KEY=$(echo "$KEYGEN" | grep "Private" | awk '{print $NF}')
-VTUNNEL_PUBLIC_KEY=$(echo "$KEYGEN" | grep "Public" | awk '{print $NF}')
-export VTUNNEL_KEY VTUNNEL_PUBLIC_KEY
+# --- Generate the tunnel secret ---
+# One shared string, both ends. There is no key format; anything hard to guess
+# works, and in production this comes from whatever creates the sandbox.
+log "generating tunnel secret..."
+VTUNNEL_SECRET=$(openssl rand -base64 32)
+export VTUNNEL_SECRET
 
 # --- Generate the MITM CA on THIS machine ---
 # The private key never leaves the host; only the certificate is mounted.
@@ -59,7 +59,7 @@ docker build -t vtunnel-test-sandbox sandbox/ -q
 log "starting sandbox container..."
 docker run --rm -d --name vtunnel-test-sandbox \
   -p 3001:3001 \
-  -e VTUNNEL_PUBLIC_KEY="$VTUNNEL_PUBLIC_KEY" \
+  -e VTUNNEL_SECRET="$VTUNNEL_SECRET" \
   -v "$CA_DIR/ca.crt:/etc/vtunnel-ca.crt:ro" \
   vtunnel-test-sandbox > /dev/null
 
