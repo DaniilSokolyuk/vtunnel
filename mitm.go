@@ -1,9 +1,11 @@
 package vtunnel
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -129,6 +131,42 @@ func (c *certCache) getCert(hello *tls.ClientHelloInfo, fallbackHost string) (*t
 		host = "localhost"
 	}
 
+	cert, err := c.leafFor(host, keyECDSA)
+	if err != nil || hello == nil || len(hello.CipherSuites) == 0 {
+		// No hello worth asking: a caller that synthesised one, or a peer whose
+		// offer says nothing about what it can verify.
+		return cert, err
+	}
+	// ECDSA is the default: the key is cheap to generate and every current
+	// client can use it. A client whose cipher suites are all RSA — a TLS 1.2
+	// stack old enough to predate ECDSA, which in practice means an old JVM or
+	// an embedded HTTP client — cannot use that leaf at all, and used to be
+	// locked out of every intercepted domain with nothing but an opaque
+	// handshake failure to go on. Asking the hello is how that is noticed;
+	// minting RSA only when it is keeps the ~50ms keygen off the common path.
+	if hello.SupportsCertificate(cert) == nil {
+		return cert, nil
+	}
+	rsaCert, rsaErr := c.leafFor(host, keyRSA)
+	if rsaErr != nil {
+		return cert, nil // the ECDSA leaf is still the better answer than none
+	}
+	return rsaCert, nil
+}
+
+// leafKind is which kind of key a generated leaf carries. Both are cached, so a
+// mixed client population costs one certificate each rather than one per
+// handshake.
+type leafKind string
+
+const (
+	keyECDSA leafKind = "ec"
+	keyRSA   leafKind = "rsa"
+)
+
+func (c *certCache) leafFor(hostname string, kind leafKind) (*tls.Certificate, error) {
+	host := string(kind) + "|" + hostname
+
 	now := time.Now()
 
 	c.mu.Lock()
@@ -148,7 +186,7 @@ func (c *certCache) getCert(hello *tls.ClientHelloInfo, fallbackHost string) (*t
 	c.inflight[host] = req
 	c.mu.Unlock()
 
-	cert, notAfter, err := c.signHost(host, now)
+	cert, notAfter, err := c.signHost(hostname, kind, now)
 
 	c.mu.Lock()
 	// Cleared in both outcomes: a failure must not pin the host to that error,
@@ -210,8 +248,21 @@ func (c *certCache) sweepLocked(now time.Time) {
 // public key and hands out the CA private key with every leaf
 // (x/internal/util/tls/tls.go:451); that saves a keygen per host at the cost of
 // every leaf sharing the CA keypair, which is not a trade worth taking.
-func (c *certCache) signHost(hostname string, now time.Time) (*tls.Certificate, time.Time, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+func (c *certCache) signHost(hostname string, kind leafKind, now time.Time) (*tls.Certificate, time.Time, error) {
+	var (
+		key   crypto.Signer
+		usage = x509.KeyUsageDigitalSignature
+		err   error
+	)
+	switch kind {
+	case keyRSA:
+		// KeyEncipherment as well: the RSA leaf exists for clients old enough
+		// to use RSA key transport, where it is what authorises the exchange.
+		usage |= x509.KeyUsageKeyEncipherment
+		key, err = rsa.GenerateKey(rand.Reader, 2048)
+	default:
+		key, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	}
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -229,10 +280,10 @@ func (c *certCache) signHost(hostname string, now time.Time) (*tls.Certificate, 
 		Subject:      pkix.Name{CommonName: hostname},
 		NotBefore:    now.Add(-leafBackdate),
 		NotAfter:     notAfter,
-		// DigitalSignature only: the leaf key is ECDSA, and there is no key
-		// transport in ECDHE for KeyEncipherment to authorise. Setting it is
+		// DigitalSignature alone for an ECDSA leaf: there is no key transport in
+		// ECDHE for KeyEncipherment to authorise, and setting it anyway is
 		// harmless in practice but strict validators object.
-		KeyUsage:    x509.KeyUsageDigitalSignature,
+		KeyUsage:    usage,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
@@ -244,7 +295,7 @@ func (c *certCache) signHost(hostname string, now time.Time) (*tls.Certificate, 
 
 	// SignatureAlgorithm is deliberately left unset so it is derived from the
 	// CA key. Pinning it (gost hardcodes SHA256WithRSA) would reject EC CAs.
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, c.caX509, &key.PublicKey, c.ca.PrivateKey)
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, c.caX509, key.Public(), c.ca.PrivateKey)
 	if err != nil {
 		return nil, time.Time{}, err
 	}

@@ -172,3 +172,95 @@ func TestMixedCloseStopsAccepting(t *testing.T) {
 		t.Fatal("the port is still open after Close")
 	}
 }
+
+// flakyListener fails its first n Accepts with a temporary error, the way a
+// listener does when the process is out of descriptors or a client hangs up
+// between the SYN and the accept.
+type flakyListener struct {
+	net.Listener
+	remaining int
+}
+
+type temporaryError struct{}
+
+func (temporaryError) Error() string   { return "accept: too many open files" }
+func (temporaryError) Timeout() bool   { return false }
+func (temporaryError) Temporary() bool { return true }
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	if l.remaining > 0 {
+		l.remaining--
+		return nil, temporaryError{}
+	}
+	return l.Listener.Accept()
+}
+
+// A temporary Accept error is not the end of the listener. It used to be: the
+// loop returned, and every later Accept blocked forever on channels nobody
+// would ever write to again — so one burst of descriptor exhaustion, which any
+// client can cause, took the sandbox proxy down until the process restarted.
+// http.Server.Serve retries these for exactly this reason, and wrapping the
+// listener took that away.
+func TestTemporaryAcceptErrorDoesNotKillTheListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	m := NewMixed(&flakyListener{Listener: ln, remaining: 2}, time.Second, nil)
+	defer m.Close()
+
+	go func() {
+		conn, err := net.DialTimeout("tcp", ln.Addr().String(), 2*time.Second)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		conn.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+		time.Sleep(500 * time.Millisecond)
+	}()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := m.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	select {
+	case conn := <-accepted:
+		conn.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("no connection was ever accepted: a temporary Accept error ended the loop, " +
+			"and the listener is now permanently deaf")
+	}
+}
+
+// A permanent error still ends it, and keeps saying so rather than blocking.
+func TestPermanentAcceptErrorIsReportedRepeatedly(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewMixed(ln, time.Second, nil)
+	ln.Close()
+
+	for i := range 3 {
+		done := make(chan error, 1)
+		go func() {
+			_, err := m.Accept()
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Fatalf("Accept %d returned no error after the listener was closed", i)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Accept %d blocked instead of reporting the closed listener", i)
+		}
+	}
+	m.Close()
+}

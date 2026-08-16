@@ -6,7 +6,9 @@ package proxy
 
 import (
 	"bufio"
+	"errors"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/vivid-money/vtunnel/internal/proxy/socks5"
@@ -27,8 +29,14 @@ type MixedListener struct {
 	socks   func(net.Conn)
 	peek    time.Duration
 	conns   chan net.Conn
-	errs    chan error
 	closing chan struct{}
+
+	// dead is closed when the accept loop has given up, and failed says why.
+	// Both are read by Accept, which must keep reporting the failure rather
+	// than block once it has happened.
+	dead   chan struct{}
+	mu     sync.Mutex
+	failed error
 }
 
 // NewMixed starts sorting connections arriving on ln. peek bounds how long a
@@ -43,8 +51,8 @@ func NewMixed(ln net.Listener, peek time.Duration, socks func(net.Conn)) *MixedL
 		socks:   socks,
 		peek:    peek,
 		conns:   make(chan net.Conn),
-		errs:    make(chan error, 1),
 		closing: make(chan struct{}),
+		dead:    make(chan struct{}),
 	}
 	go m.acceptLoop()
 	return m
@@ -54,16 +62,65 @@ func NewMixed(ln net.Listener, peek time.Duration, socks func(net.Conn)) *MixedL
 // goroutine, so one client that connects and then thinks about it does not hold
 // up the queue behind it.
 func (m *MixedListener) acceptLoop() {
+	// A temporary failure is not the end of a listener. Descriptor exhaustion
+	// and a client that hangs up between the SYN and the accept both surface
+	// here, and both pass; returning on them left every later Accept blocked on
+	// channels nothing would ever write to again, so one burst — which any
+	// client can cause — deafened the proxy for the life of the process.
+	// http.Server.Serve backs off and retries for this exact reason, and
+	// wrapping its listener is what took that away.
+	var backoff time.Duration
 	for {
 		conn, err := m.ln.Accept()
 		if err != nil {
-			select {
-			case m.errs <- err:
-			default:
+			if !isTemporary(err) {
+				m.fail(err)
+				return
 			}
-			return
+			backoff = nextBackoff(backoff)
+			select {
+			case <-time.After(backoff):
+				continue
+			case <-m.closing:
+				return
+			}
 		}
+		backoff = 0
 		go m.sort(conn)
+	}
+}
+
+// fail records the error that ended the loop. Accept keeps answering with it
+// rather than blocking: a listener that has stopped has to say so every time it
+// is asked, not once.
+func (m *MixedListener) fail(err error) {
+	m.mu.Lock()
+	if m.failed == nil {
+		m.failed = err
+	}
+	m.mu.Unlock()
+	close(m.dead)
+}
+
+func isTemporary(err error) bool {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	//nolint:staticcheck // Temporary is deprecated, but it is still what a
+	// listener reports for the recoverable cases, and net/http reads it too.
+	var te interface{ Temporary() bool }
+	return errors.As(err, &te) && te.Temporary()
+}
+
+func nextBackoff(current time.Duration) time.Duration {
+	switch {
+	case current == 0:
+		return 5 * time.Millisecond
+	case current >= time.Second:
+		return time.Second
+	default:
+		return current * 2
 	}
 }
 
@@ -108,8 +165,10 @@ func (m *MixedListener) Accept() (net.Conn, error) {
 	select {
 	case conn := <-m.conns:
 		return conn, nil
-	case err := <-m.errs:
-		return nil, err
+	case <-m.dead:
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return nil, m.failed
 	case <-m.closing:
 		return nil, net.ErrClosed
 	}

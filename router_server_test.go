@@ -98,15 +98,30 @@ func TestRouterCloseEndsLiveConnections(t *testing.T) {
 }
 
 // Close before Start, twice over, and Start after Close: the same shapes the
-// MITM proxy already refuses to fall over on.
+// MITM proxy already refuses to fall over on, answered the same way.
+//
+// Start after Close is refused rather than honoured. Honouring it is what left
+// a listener nothing could close: Close had already spent its guard on a router
+// that had none, so the one installed afterwards outlived every later Close.
 func TestRouterCloseIsIdempotent(t *testing.T) {
 	router := newRouter()
 	router.Close()
 	router.Close()
 
-	if err := router.Start("127.0.0.1:0"); err != nil {
-		t.Fatalf("Start after Close: %v", err)
+	if err := router.Start("127.0.0.1:0"); err == nil {
+		t.Fatal("Start after Close was accepted")
 	}
-	router.Close()
-	router.Close()
+
+	fresh := newRouter()
+	if err := fresh.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	addr := fresh.Addr().String()
+	fresh.Close()
+	fresh.Close()
+
+	if conn, err := net.DialTimeout("tcp", addr, time.Second); err == nil {
+		conn.Close()
+		t.Fatalf("%s is still accepting after Close", addr)
+	}
 }

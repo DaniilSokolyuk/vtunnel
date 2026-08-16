@@ -46,14 +46,14 @@ func TestProbeH2CDoesNotCacheTransientFailure(t *testing.T) {
 	if h.probeH2C(target) {
 		t.Fatal("first probe hit a transient failure and must report not-h2c")
 	}
-	if _, cached := h.h2cProbed.Load(target); cached {
+	if _, cached := h.h2cProbes.remembered(target); cached {
 		t.Fatal("transient failure must not be cached")
 	}
 
 	if !h.probeH2C(target) {
 		t.Fatal("second probe must detect h2c once the target responds")
 	}
-	if v, cached := h.h2cProbed.Load(target); !cached || v.(bool) != true {
-		t.Fatalf("deterministic h2c result must be cached true, got cached=%v v=%v", cached, v)
+	if answer, cached := h.h2cProbes.remembered(target); !cached || !answer {
+		t.Fatalf("deterministic h2c result must be cached true, got cached=%v answer=%v", cached, answer)
 	}
 }

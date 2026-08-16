@@ -98,8 +98,16 @@ func TestDirectH2CKeepsTrailersAndProtocol(t *testing.T) {
 	}
 }
 
-// The HTTP/1.1 half of the same path must not change: a plain request still
-// goes out as HTTP/1.1, and TE stays hop-by-hop and is dropped.
+// The HTTP/1.1 half of the same path: a plain request still goes out as
+// HTTP/1.1, and its TE: trailers still reaches the origin.
+//
+// TE is hop-by-hop, so this hop has to re-state it rather than pass it along —
+// and it does, because it is willing to accept trailers and does forward them
+// (copyResponse announces them and writes them out over chunked). The version
+// of the client has nothing to do with it: RFC 9110 §10.1.4 is how any client
+// says trailers are acceptable, and gating the re-statement on HTTP/2 meant an
+// HTTP/1.1 client asking for trailers had the question deleted on the way, so
+// the origin sent none.
 func TestDirectHTTP1RequestsAreUnchanged(t *testing.T) {
 	type seen struct {
 		proto string
@@ -145,9 +153,9 @@ func TestDirectHTTP1RequestsAreUnchanged(t *testing.T) {
 	if got.proto != "HTTP/1.1" {
 		t.Errorf("upstream saw %s, want HTTP/1.1", got.proto)
 	}
-	if got.te != "" {
-		t.Errorf("upstream saw Te=%q on an HTTP/1.1 request; it is hop-by-hop and this hop "+
-			"is not asking for trailers", got.te)
+	if got.te != "trailers" {
+		t.Errorf("upstream saw Te=%q, want trailers: an HTTP/1.1 client may ask for them "+
+			"too, and this hop forwards them", got.te)
 	}
 }
 

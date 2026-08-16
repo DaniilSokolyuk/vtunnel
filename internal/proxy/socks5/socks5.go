@@ -106,8 +106,11 @@ func Accept(conn net.Conn, timeout time.Duration) (*Request, error) {
 
 	host, err := readAddress(conn, head[3])
 	if err != nil {
-		if errors.Is(err, errAddrType) {
+		switch {
+		case errors.Is(err, errAddrType):
 			reply(conn, RepAddrTypeNotSupported)
+		case errors.Is(err, errBadDomain):
+			reply(conn, RepNotAllowed)
 		}
 		return nil, err
 	}
@@ -156,7 +159,53 @@ func greet(conn net.Conn) error {
 	return errors.New("socks5: client offered no authentication method this proxy accepts")
 }
 
-var errAddrType = errors.New("socks5: unsupported address type")
+var (
+	errAddrType  = errors.New("socks5: unsupported address type")
+	errBadDomain = errors.New("socks5: domain name is not a hostname")
+)
+
+// isHostname reports whether the domain field holds something that is actually
+// a name.
+//
+// The field is 255 arbitrary bytes and nothing downstream re-checks them: they
+// become the hostname the allowlist is matched against, the request line and
+// Host header of the CONNECT the router writes into the tunnel, and a line in
+// the log. A client that can put a CRLF in a hostname can write a second
+// request inside the first, and a wildcard route is enough to make such a name
+// match — so the characters a hostname may contain are checked here, once,
+// where the bytes come in.
+//
+// Deliberately a little wider than the letter of RFC 1123: underscores appear
+// in real service-discovery names, and a single trailing dot is how a fully
+// qualified name is written. Anything non-ASCII is refused rather than guessed
+// at — an IDNA-aware client sends punycode, which is ASCII.
+func isHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	s = strings.TrimSuffix(s, ".")
+	if s == "" {
+		return false
+	}
+	for label := range strings.SplitSeq(s, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := range len(label) {
+			c := label[i]
+			switch {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case c == '-' || c == '_':
+			default:
+				return false
+			}
+		}
+	}
+	return true
+}
 
 func readAddress(conn net.Conn, atyp byte) (string, error) {
 	switch atyp {
@@ -183,7 +232,11 @@ func readAddress(conn net.Conn, atyp byte) (string, error) {
 		if _, err := io.ReadFull(conn, b); err != nil {
 			return "", fmt.Errorf("socks5: read domain: %w", err)
 		}
-		return string(b), nil
+		host := string(b)
+		if !isHostname(host) {
+			return "", fmt.Errorf("%w: %q", errBadDomain, host)
+		}
+		return host, nil
 
 	default:
 		return "", fmt.Errorf("%w: %#x", errAddrType, atyp)

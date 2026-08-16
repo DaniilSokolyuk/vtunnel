@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/idna"
 )
 
 // bestDomainMatch picks the key of patterns that best matches hostPort.
@@ -35,8 +39,11 @@ func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, boo
 		return hostPort, true
 	}
 
-	lower := strings.ToLower(hostPort)
-	host, port, err := net.SplitHostPort(lower)
+	canonical, ok := canonicalHostPort(hostPort)
+	if !ok {
+		return "", false
+	}
+	host, port, err := net.SplitHostPort(canonical)
 	if err != nil {
 		return "", false
 	}
@@ -44,11 +51,14 @@ func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, boo
 	var bestPattern string
 	var bestLeft bool
 	for pattern := range patterns {
-		lowered := strings.ToLower(pattern)
-		if lowered == lower {
-			return pattern, true // exact modulo case; nothing outranks it
+		canonicalPattern, ok := canonicalHostPort(pattern)
+		if !ok {
+			continue
 		}
-		isLeft, ok := wildcardMatches(lowered, host, port)
+		if canonicalPattern == canonical {
+			return pattern, true // the same name, spelled differently
+		}
+		isLeft, ok := wildcardMatches(canonicalPattern, host, port)
 		if !ok {
 			continue
 		}
@@ -60,6 +70,129 @@ func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, boo
 		}
 	}
 	return bestPattern, bestPattern != ""
+}
+
+// canonicalHostPort rewrites an authority into the one spelling route tables
+// are keyed by, so that every way of writing a name resolves to the same route.
+// It reports false for an authority with no host to speak of, which must never
+// be treated as a match: an empty host is a dialable address in Go, and it
+// means the local machine.
+//
+// This is what keeps the allowlist honest. A miss fails closed on the
+// controlplane but fails open on the sandbox router, where it is dialled
+// directly — past the tunnel, past interception and past the injected
+// credential. Every spelling that reaches the same server therefore has to
+// reach the same route, or the allowlist is one keystroke wide.
+func canonicalHostPort(hostPort string) (string, bool) {
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return "", false
+	}
+	host = canonicalHost(host)
+	if host == "" {
+		return "", false
+	}
+	return net.JoinHostPort(host, canonicalPort(port)), true
+}
+
+// canonicalHost folds the spellings of a hostname that all reach the same
+// server: letter case (RFC 4343), the trailing dot of a fully qualified name,
+// and unicode, which every IDNA-aware client puts on the wire as punycode
+// however it was configured.
+func canonicalHost(host string) string {
+	host = strings.ToLower(host)
+	host = strings.TrimSuffix(host, ".")
+	if strings.Trim(host, ".") == "" {
+		return ""
+	}
+	if isASCII(host) {
+		return host
+	}
+	// Punycode only: this has to survive the `*` of a wildcard pattern, which
+	// the stricter lookup profile rejects as an invalid hostname.
+	if ascii, err := idna.ToASCII(host); err == nil {
+		return ascii
+	}
+	return host
+}
+
+// canonicalPort folds the zero padding net.Dial ignores: ":0443" reaches port
+// 443, so it must not be a different route from ":443". Anything that is not a
+// plain number — a service name — is left as written.
+func canonicalPort(port string) string {
+	trimmed := strings.TrimLeft(port, "0")
+	if trimmed == "" {
+		return port
+	}
+	for i := range len(trimmed) {
+		if trimmed[i] < '0' || trimmed[i] > '9' {
+			return port
+		}
+	}
+	return trimmed
+}
+
+func isASCII(s string) bool {
+	for i := range len(s) {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+// isRoutableAuthority reports whether hostPort names somewhere a client could
+// actually be asking to reach.
+//
+// The authority of a CONNECT is written by the client, and on the sandbox side
+// the client is the untrusted party. It is matched against the route table and
+// is the key under which anything learned about the connection is stored, so an
+// authority that is not a name is one that can be aimed at more than one route:
+// `CONNECT *.corp:443` matched the key a `*.corp` route is stored under exactly,
+// and everything learned from that connection then sat where the ordinary
+// wildcard lookup finds it for every domain underneath.
+func isRoutableAuthority(hostPort string) bool {
+	host, port, err := net.SplitHostPort(hostPort)
+	if err != nil || port == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	return isHostname(host)
+}
+
+// isHostname reports whether s is a hostname rather than merely a string.
+//
+// A little wider than the letter of RFC 1123: underscores turn up in real
+// service-discovery names, and a single trailing dot is how a fully qualified
+// name is written. Non-ASCII is refused rather than guessed at — an IDNA-aware
+// client sends punycode, which is ASCII, and canonicalHost converts the rest.
+func isHostname(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	s = strings.TrimSuffix(s, ".")
+	if s == "" {
+		return false
+	}
+	for label := range strings.SplitSeq(s, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := range len(label) {
+			switch c := label[i]; {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			case c == '-' || c == '_':
+			default:
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // wildcardMatches reports whether a domain map key is a wildcard pattern
@@ -89,13 +222,21 @@ func wildcardMatches(pattern, host, port string) (bool, bool) {
 }
 
 // serveHijack handles HTTP/1.x CONNECT by hijacking the connection.
-func serveHijack(w http.ResponseWriter, targetConn net.Conn) {
+//
+// track registers the hijacked connection with whoever needs to be able to end
+// it: net/http stops managing a connection the moment it is hijacked, so a
+// server shutdown cannot reach this one. It may be nil.
+func serveHijack(w http.ResponseWriter, targetConn net.Conn, track func(io.Closer) func()) {
 	clientConn, brw, err := hijack(w)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer clientConn.Close()
+
+	if track != nil {
+		defer track(clientConn)()
+	}
 
 	brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 	brw.Flush()
@@ -133,17 +274,58 @@ const maxConnectPadding = 4
 // Only what is already buffered is examined. Peeking further would wait, and
 // the whole point is that the next thing may be a ClientHello nobody has sent
 // yet.
+//
+// Telling padding from payload is the other half. A tunnel that goes on to
+// carry something recognisable — a TLS record, the h2c preface, a request line
+// — cannot have meant those blank lines, so they go. A tunnel whose next bytes
+// are none of those is about to be piped through untouched, and there the
+// blank lines may be the payload's own first bytes, so they stay. When nothing
+// follows them yet there is nothing to go on, and a client that writes a blank
+// line and then waits is the padding case the bug report described.
 func discardConnectPadding(br *bufio.Reader) {
-	for range maxConnectPadding {
-		if br.Buffered() < 2 {
-			return
+	padding := 0
+	for padding < 2*maxConnectPadding && br.Buffered() >= padding+2 {
+		head, err := br.Peek(padding + 2)
+		if err != nil || string(head[padding:]) != "\r\n" {
+			break
 		}
-		head, err := br.Peek(2)
-		if err != nil || string(head) != "\r\n" {
-			return
-		}
-		br.Discard(2)
+		padding += 2
 	}
+	if padding == 0 {
+		return
+	}
+
+	if following := br.Buffered() - padding; following > 0 {
+		head, err := br.Peek(padding + min(following, connectPaddingLookahead))
+		if err != nil || !startsLikeTunnelledHTTP(head[padding:]) {
+			return
+		}
+	}
+	br.Discard(padding)
+}
+
+// connectPaddingLookahead is how far past the padding discardConnectPadding
+// looks to decide what it is looking at. A TLS record header is three bytes and
+// the longest method this needs to recognise is shorter than that; the rest is
+// slack.
+const connectPaddingLookahead = 8
+
+// startsLikeTunnelledHTTP reports whether b opens something this proxy would
+// terminate rather than pipe. It is deliberately loose — it runs only to decide
+// whether blank lines in front of b were padding, and b is a prefix that may
+// still be growing.
+func startsLikeTunnelledHTTP(b []byte) bool {
+	if len(b) == 0 {
+		return false
+	}
+	if startsLikeTLSRecord(b) {
+		return true
+	}
+	if strings.HasPrefix(http2.ClientPreface, string(b)) || bytes.HasPrefix(b, []byte(http2.ClientPreface)) {
+		return true
+	}
+	// Or a request line, by the same rule the tunnel classification uses.
+	return couldBeRequestLine(b)
 }
 
 // hijack takes over the underlying connection from the ResponseWriter.
@@ -298,6 +480,15 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	}
 
 	w.WriteHeader(resp.StatusCode)
+	// The head is knowable now; the first body byte may be a minute away. A
+	// streaming answer — a model thinking before its first token, a long poll,
+	// an idle event stream — arrives head first and body later, and net/http
+	// buffers the head until something flushes it, so the client saw nothing at
+	// all and its response-header timeout fired on a request that was being
+	// served correctly. A failed flush means the client is gone, which the copy
+	// below discovers on its own write.
+	_ = http.NewResponseController(w).Flush()
+
 	copyErr := flushingCopy(w, resp.Body)
 	forwardTrailers(w, resp, announced)
 
@@ -433,10 +624,51 @@ var hopByHopHeaders = []string{
 // values configured on the corresponding domain forward. Set-not-Add: the
 // controlplane is authoritative, so any value the sandbox application sent
 // for the same name is replaced. A nil inject map is a no-op.
-func injectConfiguredHeaders(dst, inject http.Header) {
+func injectConfiguredHeaders(r *http.Request, inject http.Header) {
 	for name, values := range inject {
-		dst[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
+		switch key := http.CanonicalHeaderKey(name); key {
+		case "Cookie":
+			// Cookie is additive in the protocol and singular on the wire: RFC
+			// 6265 §5.4 allows at most one Cookie line, with the pairs joined
+			// by "; ". Assigning it like any other header wrote one line per
+			// configured value and threw away whatever cookies the application
+			// was already carrying — there is no way to add a cookie by
+			// replacing the jar.
+			r.Header.Set(key, mergeCookies(r.Header.Values(key), values))
+
+		case "Host":
+			// net/http keeps the Host in a field of its own and ignores the
+			// header map, so this used to do nothing at all, silently — and a
+			// route pointed at a virtual-hosted internal target had no way to
+			// name the vhost. Set after the authority check, which reads what
+			// the client claimed, so nothing here widens what the sandbox may
+			// aim a credential at.
+			if len(values) > 0 {
+				r.Host = values[len(values)-1]
+				if r.URL != nil {
+					r.URL.Host = r.Host
+				}
+			}
+
+		default:
+			r.Header[key] = append([]string(nil), values...)
+		}
 	}
+}
+
+// mergeCookies folds cookie pairs from several header lines into the one line
+// the protocol allows, keeping the client's own pairs in front of the injected
+// ones.
+func mergeCookies(existing, injected []string) string {
+	var pairs []string
+	for _, line := range append(append([]string(nil), existing...), injected...) {
+		for pair := range strings.SplitSeq(line, ";") {
+			if pair = strings.TrimSpace(pair); pair != "" {
+				pairs = append(pairs, pair)
+			}
+		}
+	}
+	return strings.Join(pairs, "; ")
 }
 
 // isUpgradeRequest reports whether r asks to switch protocols — a WebSocket
@@ -574,7 +806,7 @@ func serveUpgrade(w http.ResponseWriter, r *http.Request, upstream net.Conn, pro
 	dualStream(newBufferedConn(upstream, br), clientConn, clientConn)
 }
 
-func removeHopByHop(h http.Header, preserveTeTrailers bool) {
+func removeHopByHop(h http.Header, isRequest bool) {
 	// Values, not Get: Connection may arrive as several header lines, and
 	// reading only the first forwarded everything named on the rest to the next
 	// hop. removeHopByHopForUpgrade already reads them all.
@@ -587,7 +819,13 @@ func removeHopByHop(h http.Header, preserveTeTrailers bool) {
 		h.Del(key)
 	}
 
-	if preserveTeTrailers && hasOnlyTrailersToken(h.Values("Te")) {
+	// TE is hop-by-hop, so it has to be re-stated rather than passed on — but
+	// "trailers" is the one token that is not about this hop at all. It is how a
+	// client tells the origin that trailers are acceptable, and HTTP/1.1 clients
+	// say it too (RFC 9110 §10.1.4). Gating the re-statement on the client's
+	// protocol version instead of on what it actually asked for deleted the
+	// request on every HTTP/1.1 connection, and the origin sent no trailers.
+	if isRequest && hasOnlyTrailersToken(h.Values("Te")) {
 		h.Set("Te", "trailers")
 		return
 	}

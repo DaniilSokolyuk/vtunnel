@@ -67,7 +67,7 @@ func TestLoadCARejectsNonCA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newCertCache: %v", err)
 	}
-	leaf, _, err := cache.signHost("leaf.test", time.Now())
+	leaf, _, err := cache.signHost("leaf.test", keyECDSA, time.Now())
 	if err != nil {
 		t.Fatalf("signHost: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestLeafKeyUsageSuitsAnECDSAKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newCertCache: %v", err)
 	}
-	cert, _, err := cache.signHost("usage.test", time.Now())
+	cert, _, err := cache.signHost("usage.test", keyECDSA, time.Now())
 	if err != nil {
 		t.Fatalf("signHost: %v", err)
 	}

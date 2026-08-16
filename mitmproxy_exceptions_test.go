@@ -342,7 +342,7 @@ func tlsEchoServerConfig(t *testing.T, hostname string, ca tls.Certificate, body
 	if err != nil {
 		t.Fatalf("newCertCache: %v", err)
 	}
-	leaf, _, err := cache.signHost(hostname, time.Now())
+	leaf, _, err := cache.signHost(hostname, keyECDSA, time.Now())
 	if err != nil {
 		t.Fatalf("signHost(%s): %v", hostname, err)
 	}

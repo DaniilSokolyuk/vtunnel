@@ -430,9 +430,17 @@ func parseForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS bool
 		}
 		return after, host, true
 	}
+	if after, ok := strings.CutPrefix(addr, "http://"); ok {
+		// Said outright: reach this one in the clear, do not ask.
+		return after, "", false
+	}
 	if host, port, err := net.SplitHostPort(addr); err == nil && port == "443" {
 		return addr, host, true
 	}
+	// No scheme and no well-known port. Whether this upstream speaks TLS is
+	// decided by asking it — see MITMProxy.upstreamTLSName — because reading it
+	// off the port number is what sent a credential to an HTTPS backend on 8443
+	// in plaintext.
 	return addr, "", false
 }
 

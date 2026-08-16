@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -46,11 +47,59 @@ type Router struct {
 	chainedMu sync.Mutex
 
 	// lifecycleMu guards what Start installs; Addr and Close read it from other
-	// goroutines. The once is created with the Router and never reassigned.
+	// goroutines.
+	//
+	// stopped is a flag rather than a sync.Once because Close is documented as
+	// safe before Start: spending a once there left the guard disarmed for the
+	// listener installed afterwards, which nothing could then close. The proxy
+	// carries the same flag, added after the same bug.
 	lifecycleMu sync.Mutex
 	listener    net.Listener
 	srv         *http.Server
-	once        sync.Once
+	stopped     bool
+
+	// detached holds the connections net/http stops managing the moment they
+	// are hijacked, plus every SOCKS5 connection, which never reaches net/http
+	// at all. Between them that is nearly everything the router carries, and
+	// without a registry Close could not reach any of it.
+	detachedMu sync.Mutex
+	detached   map[io.Closer]struct{}
+}
+
+// track registers a connection Close must be able to reach, and returns the
+// function that forgets it again.
+func (r *Router) track(c io.Closer) func() {
+	r.detachedMu.Lock()
+	if r.detached == nil {
+		r.detached = make(map[io.Closer]struct{})
+	}
+	r.detached[c] = struct{}{}
+	r.detachedMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.detachedMu.Lock()
+			delete(r.detached, c)
+			r.detachedMu.Unlock()
+		})
+	}
+}
+
+// closeDetached drops every tracked connection. The map is emptied first so the
+// untrack functions still running have nothing left to find.
+func (r *Router) closeDetached() {
+	r.detachedMu.Lock()
+	conns := make([]io.Closer, 0, len(r.detached))
+	for c := range r.detached {
+		conns = append(conns, c)
+	}
+	clear(r.detached)
+	r.detachedMu.Unlock()
+
+	for _, c := range conns {
+		c.Close()
+	}
 }
 
 // connectReplyTimeout bounds the wait for a chained proxy to answer a CONNECT.
@@ -58,10 +107,18 @@ type Router struct {
 var connectReplyTimeout = dialTimeout
 
 func newRouter() *Router {
-	return &Router{
+	r := &Router{
 		routes:  make(map[string]int),
 		chained: make(map[int]*http.Transport),
 	}
+	// The same bounds the proxy's transport carries, and for the same reasons:
+	// a zero http.Transport dials with no timeout at all and keeps idle
+	// connections forever, so every distinct host a sandbox application touches
+	// over cleartext left two sockets and their goroutines parked until the
+	// process exited.
+	r.transport.DialContext = (&net.Dialer{Timeout: dialTimeout}).DialContext
+	r.transport.IdleConnTimeout = idleConnTimeout
+	return r
 }
 
 // chainedTransport returns the transport that proxies through a tunnel port,
@@ -150,6 +207,21 @@ func (r *Router) Start(addr string) error {
 		return fmt.Errorf("router: %w", err)
 	}
 
+	// Checked before the listener exists, so a refused call leaves nothing
+	// behind. A second Start used to overwrite the first listener and orphan
+	// it: still accepting, with nobody holding a reference to close it.
+	r.lifecycleMu.Lock()
+	switch {
+	case r.stopped:
+		r.lifecycleMu.Unlock()
+		return errors.New("router: already closed")
+	case r.listener != nil:
+		current := r.listener.Addr()
+		r.lifecycleMu.Unlock()
+		return fmt.Errorf("router: already listening on %s", current)
+	}
+	r.lifecycleMu.Unlock()
+
 	ln, err := net.Listen("tcp", hostPort)
 	if err != nil {
 		return fmt.Errorf("router listen on %s: %w", hostPort, err)
@@ -160,6 +232,9 @@ func (r *Router) Start(addr string) error {
 	srv := &http.Server{
 		Handler:           h2c.NewHandler(r, &http2.Server{}),
 		ReadHeaderTimeout: serverReadHeaderTimeout,
+		// `OPTIONS *` is forwarded like any other request; net/http would
+		// otherwise answer it here, on behalf of a server it is not.
+		DisableGeneralOptionsHandler: true,
 	}
 
 	if mode == proxyHTTP {
@@ -230,6 +305,9 @@ func (r *Router) refuseNonSocks5(ln net.Listener) {
 // exactly as an unrouted CONNECT is.
 func (r *Router) handleSocks5(conn net.Conn) {
 	defer conn.Close()
+	// A SOCKS5 connection never passes through the http.Server, so Close has no
+	// other way to reach it.
+	defer r.track(conn)()
 
 	req, err := socks5.Accept(conn, peekTimeout)
 	if err != nil {
@@ -318,14 +396,23 @@ func (r *Router) Addr() net.Addr {
 // pool from the application, a CONNECT tunnel mid-transfer — with nothing the
 // caller could reach them through.
 func (r *Router) Close() {
-	r.once.Do(func() {
-		ln, srv := r.lifecycle()
+	r.lifecycleMu.Lock()
+	ln, srv, already := r.listener, r.srv, r.stopped
+	r.stopped = true
+	r.lifecycleMu.Unlock()
+
+	if !already {
 		if srv != nil {
 			srv.Close() // closes the listener too
 		} else if ln != nil {
 			ln.Close()
 		}
-	})
+	}
+
+	// net/http drops a connection from its own tracking the instant it is
+	// hijacked, and a SOCKS5 connection never enters that tracking at all, so
+	// srv.Close reaches neither. Both are here.
+	r.closeDetached()
 
 	r.transport.CloseIdleConnections()
 	r.chainedMu.Lock()
@@ -386,6 +473,12 @@ func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request) {
 		hostPort = req.URL.Host
 	}
 
+	if !isRoutableAuthority(hostPort) {
+		log.Printf("[vtunnel-router] CONNECT %q: not a host and port; refused", hostPort)
+		http.Error(w, "vtunnel: CONNECT authority is not a host and port", http.StatusBadRequest)
+		return
+	}
+
 	if chainPort, ok := r.route(hostPort); ok {
 		r.chainConnect(w, req, hostPort, chainPort)
 		return
@@ -401,7 +494,7 @@ func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request) {
 
 	switch req.ProtoMajor {
 	case 1:
-		serveHijack(w, targetConn)
+		serveHijack(w, targetConn, r.track)
 	default: // HTTP/2, HTTP/3
 		serveH2Connect(w, req, targetConn)
 	}
@@ -421,7 +514,7 @@ func (r *Router) chainConnect(w http.ResponseWriter, req *http.Request, hostPort
 
 	switch req.ProtoMajor {
 	case 1:
-		serveHijack(w, upstreamConn)
+		serveHijack(w, upstreamConn, r.track)
 	default:
 		serveH2Connect(w, req, upstreamConn)
 	}
@@ -513,10 +606,23 @@ func (r *Router) serveUpgrade(w http.ResponseWriter, req *http.Request, hostPort
 	setTCPOptions(upstream)
 
 	removeHopByHopForUpgrade(req.Header)
-	serveUpgrade(w, req, upstream, proxyForm, nil)
+	// Tracked for the same reason a CONNECT is: an upgrade hijacks the
+	// connection, and net/http stops managing it the moment it does.
+	serveUpgrade(w, req, upstream, proxyForm, r.track)
 }
 
 func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
+	// A request with no Host names no destination. Synthesising one produced
+	// ":80" — a perfectly dialable address in Go, meaning the local machine —
+	// so a request nobody could route became a connection to this host's own
+	// loopback. Inside a CONNECT the authority is known and routeHandler fills
+	// it in; here there is nothing to fill it in from.
+	if req.Host == "" && req.URL.Host == "" {
+		w.Header().Set("Connection", "close")
+		http.Error(w, "vtunnel: request has no Host header, destination unknown", http.StatusBadRequest)
+		return
+	}
+
 	hostPort := req.Host
 	if _, _, err := net.SplitHostPort(hostPort); err != nil {
 		port := "80"
@@ -554,12 +660,11 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	// that downgrade, though, and has to — it is what tells the far end trailers
 	// are wanted, and a gRPC call that arrived here as h2c reports its status in
 	// one. HTTP/1.1 carries trailers with chunked encoding, so asking is valid.
-	keepTE := req.ProtoMajor == 2
 	req.Proto = "HTTP/1.1"
 	req.ProtoMajor = 1
 	req.ProtoMinor = 1
 	req.RequestURI = ""
-	removeHopByHop(req.Header, keepTE)
+	removeHopByHop(req.Header, true)
 
 	resp, err := transport.RoundTrip(req)
 	if err != nil {

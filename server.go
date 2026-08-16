@@ -46,6 +46,10 @@ type Server struct {
 	routerPorts map[int]bool
 	listenersMu sync.Mutex
 
+	// done is closed by Close, so anything parked waiting for the client to
+	// come back learns that it never will.
+	done chan struct{}
+
 	// closed is set once, by Close. It is atomic rather than guarded because
 	// every stage of accepting a client consults it — the handshake that is
 	// still running when Close lands must not end up publishing its session.
@@ -117,6 +121,7 @@ func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
 		keepAlive:   defaultKeepAlive,
 		connReady:   make(chan struct{}),
+		done:        make(chan struct{}),
 		listeners:   make(map[int]net.Listener),
 		routerPorts: make(map[int]bool),
 	}
@@ -261,6 +266,12 @@ func (s *Server) getSession() session.Session {
 		c = s.activeConn
 		s.activeConnMu.RUnlock()
 		return c
+	case <-s.done:
+		// Close has run, and setSession refuses everything from here on, so
+		// this wait can no longer end in a session. Waiting out the timeout
+		// anyway kept the socket, its goroutine and its descriptor alive for
+		// another half minute after the server was told to stop.
+		return nil
 	case <-time.After(sessionWaitTimeout):
 		log.Printf("[vtunnel-server] getSession timeout (%v)", sessionWaitTimeout)
 		return nil
@@ -297,12 +308,17 @@ func (s *Server) handleStream(stream net.Conn, h streamHeader) {
 func (s *Server) handleListen(stream net.Conn, h streamHeader) {
 	port := h.Port
 
+	s.listenersMu.Lock()
+	// Read under the same lock Close empties the listener map with. Checked
+	// outside it, a request that passed just before Close took the lock
+	// registered its listener into a map already emptied, and started an accept
+	// loop nothing would ever stop.
 	if s.closed.Load() {
+		s.listenersMu.Unlock()
 		writeFrame(stream, streamReply{Error: "server is closed"})
 		return
 	}
 
-	s.listenersMu.Lock()
 	// Reuse existing listener on reconnect (client replays its forwards).
 	if port != 0 {
 		if _, exists := s.listeners[port]; exists {
@@ -379,6 +395,7 @@ func (s *Server) Close() error {
 	if !s.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	close(s.done)
 
 	s.listenersMu.Lock()
 	listeners := make([]net.Listener, 0, len(s.listeners))

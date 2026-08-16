@@ -182,7 +182,7 @@ func TestCertCacheRenewsAndStaysBounded(t *testing.T) {
 
 	// Push the entry past its renewal point; the next lookup must reissue.
 	cache.mu.Lock()
-	cache.certs["cache.test"].renewAt = time.Now().Add(-time.Second)
+	cache.certs["ec|cache.test"].renewAt = time.Now().Add(-time.Second)
 	cache.mu.Unlock()
 
 	renewed, err := cache.getCert(hello, "")

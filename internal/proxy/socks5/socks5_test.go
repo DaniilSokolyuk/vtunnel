@@ -356,3 +356,113 @@ func TestReplyCodeForError(t *testing.T) {
 type errConnRefused struct{}
 
 func (errConnRefused) Error() string { return "connection refused" }
+
+// The domain field is 255 arbitrary bytes, and nothing between the socket and
+// the allowlist looked at them. Whatever the client wrote travelled on as a
+// hostname: into the request line and Host header of the CONNECT the router
+// synthesises for the controlplane, and into the logs. A name is a name — the
+// characters a hostname may contain are not a matter of taste here, they are
+// what keeps a client from writing a second request inside the first.
+func TestAcceptRefusesDomainsThatAreNotHostnames(t *testing.T) {
+	bad := map[string]string{
+		"embedded CRLF":     "a\r\n\r\nCONNECT 10.0.0.1:22 HTTP/1.1\r\nHost: 10.0.0.1:22\r\n\r\n.corp",
+		"bare CR":           "a\r.corp",
+		"bare LF":           "a\n.corp",
+		"space":             "a b.corp",
+		"tab":               "a\t.corp",
+		"NUL":               "a\x00.corp",
+		"colon":             "a:22.corp",
+		"empty":             "",
+		"only dots":         "..",
+		"empty label":       "a..corp",
+		"label starts bad":  "-a.corp",
+		"non-ASCII":         "тест.example",
+		"leading dot":       ".corp",
+		"control character": "a\x7f.corp",
+	}
+
+	for name, domain := range bad {
+		t.Run(name, func(t *testing.T) {
+			cli, server := newPair(t)
+
+			failed := make(chan error, 1)
+			accepted := make(chan *Request, 1)
+			go func() {
+				req, err := Accept(server, time.Second)
+				if err != nil {
+					failed <- err
+					return
+				}
+				accepted <- req
+			}()
+
+			cli.greet()
+			cli.write(Version, CmdConnect, 0x00, AddrDomain, byte(len(domain)))
+			if len(domain) > 0 {
+				cli.write([]byte(domain)...)
+			}
+			cli.write(0x01, 0xbb) // 443
+
+			select {
+			case req := <-accepted:
+				t.Fatalf("accepted %q as a hostname (target %q)", domain, req.Target)
+			case err := <-failed:
+				if err == nil {
+					t.Fatal("no error")
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("Accept neither returned nor refused")
+			}
+
+			if got := cli.read(2); got[0] != Version || got[1] == RepSuccess {
+				t.Fatalf("reply = % x, want a refusal", got)
+			}
+		})
+	}
+}
+
+// What a hostname may look like, so the check above is not quietly stricter
+// than the names people actually use.
+func TestAcceptAllowsOrdinaryHostnames(t *testing.T) {
+	for _, domain := range []string{
+		"db.corp",
+		"a.b.c.d.example.com",
+		"api-gateway.internal",
+		"host_with_underscore.corp", // common in service discovery
+		"xn--e1aybc.example",        // punycode
+		"localhost",
+		"api.corp.",  // fully qualified
+		"9front.org", // a label may start with a digit
+	} {
+		t.Run(domain, func(t *testing.T) {
+			cli, server := newPair(t)
+
+			accepted := make(chan *Request, 1)
+			failed := make(chan error, 1)
+			go func() {
+				req, err := Accept(server, time.Second)
+				if err != nil {
+					failed <- err
+					return
+				}
+				accepted <- req
+			}()
+
+			cli.greet()
+			cli.write(Version, CmdConnect, 0x00, AddrDomain, byte(len(domain)))
+			cli.write([]byte(domain)...)
+			cli.write(0x01, 0xbb)
+
+			select {
+			case req := <-accepted:
+				if req.Target != net.JoinHostPort(domain, "443") {
+					t.Fatalf("target = %q", req.Target)
+				}
+			case err := <-failed:
+				t.Fatalf("refused an ordinary hostname: %v", err)
+			case <-time.After(3 * time.Second):
+				t.Fatal("Accept neither returned nor refused")
+			}
+		})
+	}
+}

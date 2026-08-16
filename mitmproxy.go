@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -31,9 +32,17 @@ const tlsHandshakeRecordType = 0x16
 // content type + the two-byte legacy record version.
 const tlsRecordHeaderLen = 3
 
+// tunnelSilenceGrace bounds the wait for the first byte of a tunnel that may be
+// piped. Silence there means the server speaks first, which a pipe serves
+// correctly, so there is no reason to sit out the whole peekTimeout to find out.
+const tunnelSilenceGrace = 3 * time.Second
+
 // peekTimeout bounds the wait for the client's first tunnel byte, so an idle
-// CONNECT can't park a goroutine and fd indefinitely.
-const peekTimeout = 30 * time.Second
+// CONNECT can't park a goroutine and fd indefinitely. It bounds the sandbox
+// router's SOCKS5 handshake too — a greeting that stops halfway is the same
+// shape of idle client. A variable rather than a constant so a test can prove
+// the bound is applied instead of waiting one out.
+var peekTimeout = 30 * time.Second
 
 // dialTimeout bounds every upstream dial the proxy makes.
 const dialTimeout = 10 * time.Second
@@ -119,6 +128,16 @@ type route struct {
 	handler http.Handler
 	target  string
 	headers http.Header
+	// cleartext records that the target was declared cleartext ("http://"),
+	// rather than merely written without a scheme. The difference matters only
+	// for a route that injects headers: an unstated scheme is asked about
+	// before the credential is written, a stated one is taken at its word.
+	cleartext bool
+	// generation tells one revision of a route from another, so a connection
+	// that resolved this route when it opened can notice that the answer has
+	// changed since. Comparing the routes themselves would not do: a handler is
+	// not comparable, and two revisions may differ only in a header map.
+	generation uint64
 	// tlsHost is the server name to present when opening TLS to target, empty
 	// when the target is reached in the clear.
 	//
@@ -133,11 +152,23 @@ type route struct {
 // TLS, which requires a CA.
 func (r route) terminates() bool { return r.handler != nil || r.target != "" }
 
-// canFallBack reports whether this route may quietly degrade to a byte pipe when
-// interception turns out to be impossible. It needs somewhere to pipe to, and it
-// must not be carrying headers — a route that stopped injecting a credential but
-// kept working would hide the failure instead of surfacing it.
-func (r route) canFallBack() bool { return r.target != "" && len(r.headers) == 0 }
+// canFallBack reports whether this route may quietly degrade to a byte pipe
+// when interception turns out to be impossible. It needs somewhere to pipe to,
+// it must not be carrying headers — a route that stopped injecting a credential
+// but kept working would hide the failure instead of surfacing it — and it must
+// not be renaming the server, which a pipe cannot do.
+func (r route) canFallBack(authority string) bool {
+	if r.target == "" || len(r.headers) > 0 {
+		return false
+	}
+	// A route that renames the server cannot be piped either. The pipe carries
+	// the client's own name, not the configured one, so it goes to an upstream
+	// whose TLS identity was never negotiated for it — it cannot succeed, and
+	// it replaces an accurate and fixable error ("this upstream's certificate
+	// does not check out") with a misleading one about a domain that is not the
+	// problem.
+	return r.tlsHost == "" || strings.EqualFold(r.tlsHost, hostFromAuthority(authority))
+}
 
 // MITMProxy is an HTTP/CONNECT forward proxy that routes domains to in-process
 // handlers, to other addresses, or straight through, and dials anything
@@ -156,6 +187,9 @@ type MITMProxy struct {
 	unmapped   http.Handler // nil = dial the requested host directly
 	onChange   []func()
 	domainMu   sync.RWMutex
+	// routeGeneration stamps every revision of every route, so a connection can
+	// tell that the route it resolved when it opened is no longer the answer.
+	routeGeneration atomic.Uint64
 
 	// mitmCA is the CA used to sign generated leaf certificates
 	// (nil = transparent tunnel, no interception).
@@ -165,12 +199,21 @@ type MITMProxy struct {
 	certCacheErr  error
 
 	transport http.Transport
-	h2cProbed sync.Map // target → bool
+	h2cProbes probeCache
 
-	// h2cInflight deduplicates probes in progress, so a burst of requests for
-	// an unprobed target costs one probe rather than one each.
-	h2cMu       sync.Mutex
-	h2cInflight map[string]*h2cProbe
+	// tlsProbes remembers which upstreams answered a ClientHello, for targets
+	// written without a scheme on routes that carry a credential.
+	tlsProbes probeCache
+
+	tlsBaseMu    sync.Mutex
+	tlsBaseCfg   *tls.Config
+	ticketKeys   [][32]byte
+	ticketKeysAt time.Time
+
+	// preDial bounds the upstream connections opened from inside client
+	// handshakes; see maxPendingUpstreamDials.
+	preDialOnce sync.Once
+	preDial     chan struct{}
 
 	// upstreams holds one transport per distinct upstream. Building one per
 	// request looked harmless and leaked: a clone of a zero-value
@@ -304,6 +347,12 @@ func (p *MITMProxy) Start(addr string) error {
 	srv := &http.Server{
 		Handler:           h2c.NewHandler(p, h2s),
 		ReadHeaderTimeout: serverReadHeaderTimeout,
+		// net/http answers `OPTIONS *` itself unless told not to. That request
+		// asks about the server the client is talking to, and inside an
+		// intercepted connection that server is the origin, not this proxy — so
+		// a built-in 200 here is the proxy answering on the origin's behalf,
+		// with no route lookup, no injected credential and no upstream.
+		DisableGeneralOptionsHandler: true,
 	}
 
 	p.listener = ln
@@ -407,18 +456,23 @@ func (p *MITMProxy) Shutdown(ctx context.Context) error {
 func (p *MITMProxy) closeIdleUpstreams() {
 	p.transport.CloseIdleConnections()
 
+	closeIdleTransports(p.snapshotUpstreams(false))
+}
+
+// snapshotUpstreams copies the cached transports out from under the lock so
+// they can be closed without holding it, emptying the cache when drop is set.
+func (p *MITMProxy) snapshotUpstreams(drop bool) []http.RoundTripper {
 	p.upstreamsMu.Lock()
+	defer p.upstreamsMu.Unlock()
+
 	transports := make([]http.RoundTripper, 0, len(p.upstreams))
 	for _, t := range p.upstreams {
 		transports = append(transports, t)
 	}
-	p.upstreamsMu.Unlock()
-
-	for _, t := range transports {
-		if idler, ok := t.(interface{ CloseIdleConnections() }); ok {
-			idler.CloseIdleConnections()
-		}
+	if drop {
+		clear(p.upstreams)
 	}
+	return transports
 }
 
 // trackNested registers a server running on a detached connection, returning the
@@ -564,6 +618,7 @@ func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) erro
 			domain, len(cfg.headers), errNoMitmCA)
 	}
 
+	cleartext := strings.HasPrefix(target, "http://")
 	addr, tlsHost, upstreamIsTLS := parseForwardTarget(target)
 	if cfg.sni != "" {
 		tlsHost, upstreamIsTLS = cfg.sni, true
@@ -571,21 +626,60 @@ func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) erro
 	if !upstreamIsTLS {
 		tlsHost = ""
 	}
-	p.setRoute(domain, route{target: addr, headers: cfg.headers, tlsHost: tlsHost}, addr)
+	p.setRoute(domain, route{target: addr, headers: cfg.headers, tlsHost: tlsHost, cleartext: cleartext}, addr)
 	return nil
 }
 
 // Remove drops a domain's route.
 func (p *MITMProxy) Remove(domain string) {
 	p.domainMu.Lock()
+	var targets []string
 	for _, key := range domainKeys(domain) {
+		if rt, ok := p.routes[key]; ok && rt.target != "" {
+			targets = append(targets, rt.target)
+		}
 		delete(p.routes, key)
 	}
 	changed := p.changedLocked()
 	p.domainMu.Unlock()
 
+	// The pooled connections to that target go with it. Left behind they are a
+	// socket and a read goroutine held open for somewhere nothing routes to any
+	// more — and for an h2c upstream, one that is never retired for idleness
+	// either, since a bare http2.Transport has no idle timeout to reach.
+	p.dropUpstreams(targets)
+
 	log.Printf("[vtunnel-proxy] Route removed: %s", domain)
 	notify(changed)
+}
+
+// dropUpstreams closes and forgets the cached transports for the given targets.
+func (p *MITMProxy) dropUpstreams(targets []string) {
+	if len(targets) == 0 {
+		return
+	}
+
+	p.upstreamsMu.Lock()
+	var stale []http.RoundTripper
+	for key, transport := range p.upstreams {
+		if slices.Contains(targets, key.target) {
+			stale = append(stale, transport)
+			delete(p.upstreams, key)
+		}
+	}
+	p.upstreamsMu.Unlock()
+
+	closeIdleTransports(stale)
+}
+
+// closeIdleTransports drops the idle connections each transport is holding. Not
+// every RoundTripper can — a caller-supplied one need not be an http.Transport.
+func closeIdleTransports(transports []http.RoundTripper) {
+	for _, t := range transports {
+		if idler, ok := t.(interface{ CloseIdleConnections() }); ok {
+			idler.CloseIdleConnections()
+		}
+	}
 }
 
 // Routes returns the domains this proxy serves, as "host:port" keys.
@@ -671,6 +765,8 @@ func notify(callbacks []func()) {
 }
 
 func (p *MITMProxy) setRoute(domain string, rt route, describe string) {
+	rt.generation = p.routeGeneration.Add(1)
+
 	p.domainMu.Lock()
 	for _, key := range domainKeys(domain) {
 		p.routes[key] = rt
@@ -704,19 +800,7 @@ func forwardHeaders(opts []ForwardOption) http.Header {
 func (p *MITMProxy) SetTransportTLSConfig(cfg *tls.Config) {
 	p.transport.TLSClientConfig = cfg
 
-	p.upstreamsMu.Lock()
-	stale := make([]http.RoundTripper, 0, len(p.upstreams))
-	for _, transport := range p.upstreams {
-		stale = append(stale, transport)
-	}
-	clear(p.upstreams)
-	p.upstreamsMu.Unlock()
-
-	for _, transport := range stale {
-		if idler, ok := transport.(interface{ CloseIdleConnections() }); ok {
-			idler.CloseIdleConnections()
-		}
-	}
+	closeIdleTransports(p.snapshotUpstreams(true))
 }
 
 // MITMExceptions marks domains that must never be intercepted, whatever their
@@ -790,7 +874,7 @@ func (p *MITMProxy) noteMITMFailure(authority string, rt route, err error) {
 		return
 	}
 
-	if !rt.canFallBack() {
+	if !rt.canFallBack(authority) {
 		if len(rt.headers) > 0 {
 			log.Printf("[vtunnel-proxy] MITM %s refused (%v); still intercepting, because %d configured header(s) would otherwise stop being injected without saying so",
 				authority, err, len(rt.headers))
@@ -915,6 +999,12 @@ func (p *MITMProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		hostPort = r.URL.Host
 	}
 
+	if !isRoutableAuthority(hostPort) {
+		log.Printf("[vtunnel-proxy] CONNECT %q: not a host and port; refused", hostPort)
+		http.Error(w, "vtunnel: CONNECT authority is not a host and port", http.StatusBadRequest)
+		return
+	}
+
 	// A CONNECT taken over now would outlive the shutdown: once detached it is no
 	// longer the server's to close, so refuse before that happens.
 	if p.closed() {
@@ -947,7 +1037,7 @@ func (p *MITMProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("[vtunnel-proxy] CONNECT %s: configured MITM exception, piping to %s", hostPort, rt.target)
 			intercept = false
-		case rt.canFallBack():
+		case rt.canFallBack(hostPort):
 			log.Printf("[vtunnel-proxy] CONNECT %s: interception is off for this domain, piping to %s", hostPort, rt.target)
 			intercept = false
 		}
@@ -1028,11 +1118,23 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 
 	// Bound the wait for the opening bytes so an idle CONNECT can't park a
 	// goroutine and fd; cleared once the tunnel kind is decided.
-	rawConn.SetReadDeadline(time.Now().Add(peekTimeout))
-	br := bufio.NewReader(rawConn)
-	// Read once before deciding anything, so the padding check below has
-	// something to look at without waiting for more than the client sent.
-	if _, err := br.Peek(1); err != nil {
+	//
+	// How long that wait may be depends on what silence would mean here. A
+	// route that may be piped reads silence as "the server speaks first" —
+	// SMTP, IMAP, POP3, MySQL and postgres all open that way, and a pipe serves
+	// every one of them correctly — so it need not wait long to find out. A
+	// route that may not be piped has nothing to guess early for, so it waits
+	// out the full timeout before giving up.
+	grace := peekTimeout
+	if rt.canFallBack(connectAuthority) {
+		grace = tunnelSilenceGrace
+	}
+	rawConn.SetReadDeadline(time.Now().Add(grace))
+	br := bufio.NewReaderSize(rawConn, maxRequestLinePeek)
+
+	// Read once before deciding anything, so the padding check has something to
+	// look at without waiting for more than the client sent.
+	if _, err := br.Peek(1); err != nil && !isTimeout(err) {
 		rawConn.SetReadDeadline(time.Time{})
 		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
 		rawConn.Close()
@@ -1040,19 +1142,7 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 	}
 	discardConnectPadding(br)
 
-	first, err := br.Peek(tlsRecordHeaderLen)
-	if err != nil {
-		rawConn.SetReadDeadline(time.Time{})
-		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
-		rawConn.Close()
-		return
-	}
-
-	// A TLS ClientHello opens with a handshake record header; cleartext carrying
-	// the HTTP/2 client preface is h2c, which we can terminate and inject into
-	// just like MITM.
-	isTLS := startsLikeTLSRecord(first)
-	isH2C := !isTLS && isH2CPreface(br)
+	kind := classifyTunnel(br)
 	rawConn.SetReadDeadline(time.Time{})
 	tunnelConn := newBufferedConn(rawConn, br)
 
@@ -1065,15 +1155,15 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 	overHijackedSocket := r.ProtoMajor == 1
 
 	switch {
-	case isTLS:
+	case kind == tunnelTLS:
 		p.serveMITMTLS(tunnelConn, connectAuthority, rt, certs)
-	case isH2C && overHijackedSocket:
+	case kind == tunnelH2C && overHijackedSocket:
 		defer tunnelConn.Close()
 		log.Printf("[vtunnel-proxy] CONNECT %s: cleartext h2c, terminating", connectAuthority)
 		// No pre-established upstream here: the client came in cleartext, so
 		// there was no client handshake to mirror an upstream ALPN onto.
 		p.serveH2(tunnelConn, connectAuthority, rt, nil)
-	case overHijackedSocket && startsLikeHTTP1Request(br):
+	case kind == tunnelHTTP1 && overHijackedSocket:
 		// Cleartext HTTP/1.1 inside the tunnel. Every SOCKS5 client arrives
 		// this way — it has no CONNECT of its own, so the router makes one, and
 		// `curl http://api.corp/` becomes CONNECT api.corp:80 followed by an
@@ -1096,12 +1186,30 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 		// A handler route has no address to fall back to.
 		defer tunnelConn.Close()
 		log.Printf("[vtunnel-proxy] CONNECT %s: cleartext, but the route is served in process and this is not HTTP", connectAuthority)
+	case !rt.canFallBack(connectAuthority):
+		// A route carrying headers is never quietly downgraded to a pipe. The
+		// same rule already governs the other way interception can turn out to
+		// be impossible — an upstream that refuses it, see canFallBack — and
+		// for the same reason: a request that works without the credential it
+		// was configured to carry hides the failure instead of reporting it.
+		defer tunnelConn.Close()
+		log.Printf("[vtunnel-proxy] CONNECT %s: not HTTP, and this route injects %d header(s) a raw pipe cannot add; refused rather than forwarded without them",
+			connectAuthority, len(rt.headers))
 	default:
 		defer tunnelConn.Close()
-		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw pipe)", connectAuthority, rt.target)
-		if len(rt.headers) > 0 {
-			// Raw byte pipe can't inject headers; only HTTP/1.1-CONNECT h2c is terminated.
-			log.Printf("[vtunnel-proxy] WARNING: %s: %d header(s) NOT injected (raw pipe)", connectAuthority, len(rt.headers))
+		if br.Buffered() == 0 {
+			// Nothing was ever said, so nothing identified this tunnel: it is
+			// being piped on the assumption that the server speaks first. That
+			// assumption is right for SMTP, IMAP and the database protocols,
+			// and wrong for a TLS client that was simply slow — in which case
+			// this connection is not intercepted and no middleware will see it.
+			// Worth a line either way, because the alternative is finding out
+			// from the absence of something.
+			log.Printf("[vtunnel-proxy] CONNECT %s -> %s: the client said nothing in %v, "+
+				"piping on the assumption that the server speaks first",
+				connectAuthority, rt.target, tunnelSilenceGrace)
+		} else {
+			log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw pipe)", connectAuthority, rt.target)
 		}
 		p.dialAndPipe(rt.target, tunnelConn)
 	}
@@ -1122,31 +1230,50 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 	target := rt.target
 	sniHost, upstreamIsTLS := rt.tlsHost, rt.tlsHost != ""
 
-	base := &tls.Config{
-		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return certs.getCert(hello, connectHost)
-		},
-		// Both clones below inherit this, so the client half of every
-		// intercepted session is covered by one assignment.
-		KeyLogWriter: tlsKeyLogWriter(),
-		// The floor the mirroring below starts from. An upstream that negotiates
-		// no ALPN at all leaves nothing to mirror, and without this the proxy
-		// would answer ServerHello with no ALPN extension — which a client that
-		// requires one, gRPC among them, cannot use.
-		NextProtos: []string{"h2", "http/1.1"},
+	// Cloned from one long-lived config so session tickets outlive the
+	// connection that issued them. Built fresh each time, the server's ticket
+	// keys were new on every connection, so no client could ever resume and
+	// every one of them paid a full handshake.
+	base := p.tlsBase().Clone()
+	base.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+		return certs.getCert(hello, connectHost)
 	}
 
 	var up *upstreamTLSConn
 	cfg := base.Clone()
 	if upstreamIsTLS {
 		cfg.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			// Dialling here is what lets the client be offered exactly what the
+			// upstream negotiated — and it happens before the client has proved
+			// anything, on nothing more than a ClientHello. A sandbox that sends
+			// one and then stops therefore makes this proxy hold a connection
+			// open into the controlplane's network, and with no cap it could
+			// hold as many as it liked. Past the cap the mirroring is simply
+			// skipped: the base ALPN stands and the request path dials as it
+			// does for any cleartext route.
+			release, ok := p.acquirePreDial()
+			if !ok {
+				log.Printf("[vtunnel-proxy] MITM %s: %d upstream handshakes already pending, "+
+					"not pre-dialling this one", connectAuthority, cap(p.preDial))
+				return nil, nil
+			}
+			defer release()
+
 			u, err := p.dialTLSUpstream(hello.Context(), target, sniHost, hello.SupportedProtos)
 			if err != nil {
 				log.Printf("[vtunnel-proxy] MITM %s: upstream TLS to %s failed: %v", connectAuthority, target, err)
 				// Noted here rather than only at the handshake below: the client
 				// error this turns into says nothing about the upstream cause.
 				p.noteMITMFailure(connectAuthority, rt, err)
-				return nil, err
+				// The client's handshake completes anyway. Failing it here is
+				// the only thing this hook can do with an error, and it turns
+				// every upstream-side problem — refused, unreachable, cleartext
+				// where TLS was expected, a certificate that does not check out
+				// — into one opaque `tls: internal error`, which no retry-on-5xx
+				// and no circuit breaker can act on. Terminating and letting the
+				// request path answer 502 says what actually happened, and is
+				// what the same outage on a cleartext route already did.
+				return nil, nil
 			}
 			up = u
 			mirrored := base.Clone()
@@ -1172,7 +1299,21 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 			return mirrored, nil
 		}
 	} else {
-		cfg.NextProtos = []string{"h2", "http/1.1"}
+		// No upstream to mirror, so the client's own order is what there is to
+		// go on. Answering from a fixed list instead gave h2 to a client that
+		// had asked for http/1.1 first and left it no way to say otherwise.
+		cfg.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+			narrowed := httpALPN(hello.SupportedProtos)
+			if len(narrowed) == 0 {
+				// Nothing this proxy can carry, or no ALPN at all. The base
+				// list stands: a client that offered nothing must still be
+				// answered with something it can use.
+				return nil, nil
+			}
+			c := base.Clone()
+			c.NextProtos = narrowed
+			return c, nil
+		}
 	}
 
 	// The peek deadline was cleared once the tunnel kind was decided, so the
@@ -1209,6 +1350,78 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 		return
 	}
 	p.serveH1(tlsConn, connectAuthority, rt, up)
+}
+
+// maxPendingUpstreamDials caps how many upstream connections may be open on
+// behalf of client handshakes that have not completed. A variable so tests need
+// not open hundreds of connections to reach it.
+var maxPendingUpstreamDials = 64
+
+// acquirePreDial takes a slot for an upstream dial made during a client
+// handshake, reporting false when there is none to take.
+func (p *MITMProxy) acquirePreDial() (release func(), ok bool) {
+	p.preDialOnce.Do(func() {
+		p.preDial = make(chan struct{}, maxPendingUpstreamDials)
+	})
+	select {
+	case p.preDial <- struct{}{}:
+		return func() { <-p.preDial }, true
+	default:
+		return nil, false
+	}
+}
+
+// sessionTicketKeyLifetime is how long one key is used to issue new session
+// tickets, and sessionTicketKeysKept how many older ones stay around to decrypt
+// tickets already handed out. The same shape Go uses when it manages the keys
+// itself, which taking them over here would otherwise have turned off: one key
+// for the life of the process means a ticket recorded today is decryptable by
+// anyone who obtains that key tomorrow.
+const (
+	sessionTicketKeyLifetime = 8 * time.Hour
+	sessionTicketKeysKept    = 3
+)
+
+// tlsBase is the one server config every intercepted connection is cloned from.
+//
+// It exists so session ticket keys have somewhere to live. Go stores them on
+// the Config and initialises them on first use, so a config built fresh per
+// connection issued tickets nobody could ever redeem: every client fell back to
+// a full handshake, every time. The keys are set explicitly rather than left to
+// that first use, because a clone taken before it would get its own.
+//
+// Rotating the parent does not disturb clones already in flight — each carries
+// the keys it was cloned with — and a new clone still holds the older keys, so
+// a ticket issued before a rotation is honoured until it ages out.
+func (p *MITMProxy) tlsBase() *tls.Config {
+	p.tlsBaseMu.Lock()
+	defer p.tlsBaseMu.Unlock()
+
+	if p.tlsBaseCfg == nil {
+		p.tlsBaseCfg = &tls.Config{
+			// Every clone inherits this, so the client half of every
+			// intercepted session is covered by one assignment.
+			KeyLogWriter: tlsKeyLogWriter(),
+			// The floor ALPN selection starts from. An upstream that negotiates
+			// nothing leaves nothing to mirror, and without this the proxy would
+			// answer ServerHello with no ALPN extension — which a client that
+			// requires one, gRPC among them, cannot use.
+			NextProtos: []string{"h2", "http/1.1"},
+		}
+	}
+
+	if time.Since(p.ticketKeysAt) >= sessionTicketKeyLifetime {
+		var key [32]byte
+		if _, err := rand.Read(key[:]); err == nil {
+			p.ticketKeys = append([][32]byte{key}, p.ticketKeys...)
+			if len(p.ticketKeys) > sessionTicketKeysKept {
+				p.ticketKeys = p.ticketKeys[:sessionTicketKeysKept]
+			}
+			p.tlsBaseCfg.SetSessionTicketKeys(p.ticketKeys)
+			p.ticketKeysAt = time.Now()
+		}
+	}
+	return p.tlsBaseCfg
 }
 
 // httpALPN narrows an ALPN offer to the protocols this proxy can actually
@@ -1415,47 +1628,102 @@ func (p *MITMProxy) cachedTransport(key upstreamKey, build func() http.RoundTrip
 // nobody has probed yet used to run one each, every one of them blocking its
 // own request to learn the same fact.
 func (p *MITMProxy) probeH2C(target string) bool {
-	if v, ok := p.h2cProbed.Load(target); ok {
-		return v.(bool)
+	return p.h2cProbes.do(target, func() (bool, bool) { return p.dialProbeH2C(target) })
+}
+
+// probe is one probe in progress; answer is written before done is closed, so
+// everyone waiting on it sees the finished value.
+type probe struct {
+	done   chan struct{}
+	answer bool
+}
+
+// probeCache remembers what was learned about an upstream by asking it, and
+// lets only one question at a time be asked of the same one: a probe costs a
+// dial across the whole tunnel, and a burst of requests for an unprobed target
+// used to run one each, every one of them blocking its own request to learn the
+// same fact.
+type probeCache struct {
+	answers  sync.Map // target → probeAnswer
+	mu       sync.Mutex
+	inflight map[string]*probe
+}
+
+// probeAnswer is a remembered answer and when it was learned.
+type probeAnswer struct {
+	value bool
+	at    time.Time
+}
+
+// probeTTL is how long an answer about an upstream is trusted. What was learned
+// was learned about an upstream as it was: a backend keeps its address across a
+// redeploy that adds or drops h2c, or that puts TLS in front of it, so an answer
+// with no expiry pins it to the wrong protocol until the process restarts.
+// noMITM expires its own for exactly this reason. A variable so tests need not
+// wait it out.
+var probeTTL = 10 * time.Minute
+
+// known reports whether an unexpired answer has been remembered for target.
+func (c *probeCache) known(target string) bool {
+	_, ok := c.remembered(target)
+	return ok
+}
+
+func (c *probeCache) remembered(target string) (bool, bool) {
+	v, ok := c.answers.Load(target)
+	if !ok {
+		return false, false
+	}
+	answer := v.(probeAnswer)
+	if time.Since(answer.at) > probeTTL {
+		c.answers.CompareAndDelete(target, v)
+		return false, false
+	}
+	return answer.value, true
+}
+
+// do returns what is known about target, running ask once if nothing is. ask
+// reports the answer and whether it is worth remembering — a transient failure
+// says nothing about the peer, and pinning one would outlive its cause.
+func (c *probeCache) do(target string, ask func() (answer, remember bool)) bool {
+	if answer, ok := c.remembered(target); ok {
+		return answer
 	}
 
-	p.h2cMu.Lock()
-	if inflight, ok := p.h2cInflight[target]; ok {
-		p.h2cMu.Unlock()
+	c.mu.Lock()
+	if inflight, ok := c.inflight[target]; ok {
+		c.mu.Unlock()
 		<-inflight.done
-		return inflight.h2c
+		return inflight.answer
 	}
 	// Re-read under the lock: the probe this call would have joined may have
 	// finished and published between the Load above and here.
-	if v, ok := p.h2cProbed.Load(target); ok {
-		p.h2cMu.Unlock()
-		return v.(bool)
+	if answer, ok := c.remembered(target); ok {
+		c.mu.Unlock()
+		return answer
 	}
-	inflight := &h2cProbe{done: make(chan struct{})}
-	if p.h2cInflight == nil {
-		p.h2cInflight = make(map[string]*h2cProbe)
+	inflight := &probe{done: make(chan struct{})}
+	if c.inflight == nil {
+		c.inflight = make(map[string]*probe)
 	}
-	p.h2cInflight[target] = inflight
-	p.h2cMu.Unlock()
+	c.inflight[target] = inflight
+	c.mu.Unlock()
 
-	inflight.h2c = p.dialProbeH2C(target)
+	answer, remember := ask()
+	inflight.answer = answer
+	if remember {
+		c.answers.Store(target, probeAnswer{value: answer, at: time.Now()})
+	}
 
-	p.h2cMu.Lock()
-	delete(p.h2cInflight, target)
-	p.h2cMu.Unlock()
+	c.mu.Lock()
+	delete(c.inflight, target)
+	c.mu.Unlock()
 	close(inflight.done)
 
-	return inflight.h2c
+	return answer
 }
 
-// h2cProbe is one probe in progress; h2c is written before done is closed, so
-// everyone waiting on it sees the finished value.
-type h2cProbe struct {
-	done chan struct{}
-	h2c  bool
-}
-
-func (p *MITMProxy) dialProbeH2C(target string) bool {
+func (p *MITMProxy) dialProbeH2C(target string) (h2c, remember bool) {
 	// The dial and round-trip travel the whole tunnel (server -> SSH -> client
 	// -> upstream), so a transient failure — tunnel reconnecting, slow hop —
 	// says nothing about whether the target speaks h2c. Cache only a
@@ -1463,22 +1731,95 @@ func (p *MITMProxy) dialProbeH2C(target string) bool {
 	// request re-probes instead of pinning the target to HTTP/1.1 forever.
 	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
-		return false
+		return false, false
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(3 * time.Second))
 	// HTTP/2 connection preface
 	if _, err := conn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
-		return false
+		return false, false
 	}
 	buf := make([]byte, 9) // h2 frame header
 	if _, err := io.ReadFull(conn, buf); err != nil {
-		return false
+		return false, false
 	}
-	ok := buf[3] == 0x04 // SETTINGS frame type
-	p.h2cProbed.Store(target, ok)
-	return ok
+	return buf[3] == 0x04, true // SETTINGS frame type
 }
+
+// upstreamTLSName decides how to reach a target whose scheme nobody stated,
+// for a route that carries a credential. It returns the name to present as SNI,
+// or "" when the upstream is confirmed to speak cleartext.
+//
+// The credential is never written speculatively. Reading TLS off the port
+// number — the only signal there used to be, and only for 443 — sent it to an
+// HTTPS backend on 8443 as plaintext, on the first attempt and on every retry,
+// with nothing but a 502 to show for it. A ClientHello gives away nothing, so
+// asking is safe where guessing is not.
+func (p *MITMProxy) upstreamTLSName(target string) (string, error) {
+	answered := false
+	speaksTLS := p.tlsProbes.do(target, func() (bool, bool) {
+		tls, remember := dialProbeTLS(target)
+		answered = remember
+		return tls, remember
+	})
+	if !speaksTLS {
+		if !answered && !p.tlsProbes.known(target) {
+			// Neither a handshake nor a refusal: the upstream said nothing to
+			// a ClientHello. Cleartext is a guess, and the thing being guessed
+			// about is whether to put a credential on the wire unencrypted.
+			return "", fmt.Errorf("upstream %s did not answer either way when asked whether it speaks TLS; "+
+				"write tls://%s or http://%s to say which it is", target, target, target)
+		}
+		return "", nil
+	}
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", fmt.Errorf("upstream %s speaks TLS but is not a host:port", target)
+	}
+	if net.ParseIP(host) != nil {
+		// An IP is not a name: Go will not send it as SNI and cannot verify a
+		// certificate against it, so there is no honest way to open TLS here.
+		return "", fmt.Errorf("upstream %s speaks TLS but was configured by address and without a scheme; "+
+			"write tls://%s together with WithSNI(<the name its certificate is issued for>)", target, target)
+	}
+	return host, nil
+}
+
+// upstreamProbeTimeout bounds the question "does this speak TLS". It is short
+// on purpose: an answer either way arrives in one round trip, and anything
+// slower is not an answer but a hang.
+const upstreamProbeTimeout = 2 * time.Second
+
+func dialProbeTLS(target string) (speaksTLS, remember bool) {
+	conn, err := net.DialTimeout("tcp", target, upstreamProbeTimeout)
+	if err != nil {
+		return false, false
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(upstreamProbeTimeout))
+
+	// Only the question "does a handshake complete at all" is being asked here;
+	// whether the certificate checks out is the real connection's business.
+	tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec // not a trust decision
+	if err := tc.Handshake(); err != nil {
+		// A cleartext server answers a ClientHello with an error, a plain HTTP
+		// response or a close, none of which look like a handshake. Any of them
+		// is a deterministic "not TLS"; only never getting there is not.
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return false, false
+		}
+		return false, true
+	}
+	return true, true
+}
+
+// refusingTransport answers every request with the same configuration error,
+// so a route the proxy cannot honestly serve fails as a 502 that names the fix
+// instead of putting the credential on the wire to find out.
+type refusingTransport struct{ err error }
+
+func (t refusingTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, t.err }
 
 // serveH2 serves an already-established HTTP/2 client connection — TLS-terminated
 // or cleartext h2c — through the route's handler. It works on any net.Conn, so
@@ -1497,7 +1838,12 @@ func (p *MITMProxy) serveH2(clientConn net.Conn, authority string, rt route, up 
 	// very path — and a Shutdown landing in that window would not know this
 	// session existed, leaving it to be cut off at the deadline instead of
 	// drained.
-	h1srv := &http.Server{ReadHeaderTimeout: serverReadHeaderTimeout}
+	h1srv := &http.Server{
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		// See the proxy listener: an intercepting proxy forwards `OPTIONS *`
+		// rather than answering it.
+		DisableGeneralOptionsHandler: true,
+	}
 	h2srv := &http2.Server{}
 	if err := http2.ConfigureServer(h1srv, h2srv); err != nil {
 		log.Printf("[vtunnel-proxy] MITM %s: configure HTTP/2 server: %v", authority, err)
@@ -1505,7 +1851,7 @@ func (p *MITMProxy) serveH2(clientConn net.Conn, authority string, rt route, up 
 	}
 	defer p.trackNested(h1srv)()
 
-	handler, release := p.routeHandler(authority, rt, up, true)
+	handler, release := p.routeHandler(authority, rt, up, true, true)
 	defer release()
 
 	// Building that handler can take a while — probing an unknown target for
@@ -1529,7 +1875,125 @@ func (p *MITMProxy) serveH2(clientConn net.Conn, authority string, rt route, up 
 // handler for an in-process route, or a reverse proxy to its target. Both are
 // wrapped in the configured middleware, so a Use hook sees every request the
 // proxy terminates regardless of where it ends up.
-func (p *MITMProxy) routeHandler(authority string, rt route, up *upstreamTLSConn, preferH2 bool) (http.Handler, func()) {
+// reresolve tells routeHandler whether to look the route up again for every
+// request. Inside a CONNECT tunnel it must: the connection outlives any number
+// of configuration changes, and the sandbox decides how long. The cleartext
+// entry point passes false because it has already resolved this request itself
+// — and because what it hands over may be a synthesised route for a domain
+// nobody mapped, which a second lookup would not find.
+func (p *MITMProxy) routeHandler(authority string, rt route, up *upstreamTLSConn, preferH2, reresolve bool) (http.Handler, func()) {
+	// Built once for the route the CONNECT resolved to, which is the one almost
+	// every request on this connection will also resolve to. The pre-dialled
+	// upstream belongs to it, so this pair is the only one that may use it.
+	connectHandlers, release := p.buildRouteHandlers(authority, rt, up, preferH2)
+
+	// Whatever revision this connection ends up serving after a config change.
+	// Only the newest is kept: a connection follows the route table, and the
+	// table has one answer at a time.
+	var rebuilt revisionCache
+
+	// The route — and with it the target and the credential — was chosen from
+	// the authority this connection was opened for. Every request inside it
+	// carried its own Host, so a sandbox could open one CONNECT to a domain it
+	// is allowed to reach and then aim the injected credential at any other
+	// virtual host that upstream serves. RFC 9110 §7.2 requires the two to
+	// agree, and 421 is the answer for when they do not.
+	expectHost := hostFromAuthority(authority)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The route is read again for every request, not captured with the
+		// connection. A tunnel is long-lived — an h2 session or an HTTP/1.1
+		// keep-alive lasts as long as the sandbox chooses to hold it — so a
+		// route captured at CONNECT time is one the sandbox can pin: a rotated
+		// credential kept being injected, a repointed domain kept reaching the
+		// old backend, and a withdrawn one kept being served, all of them
+		// looking correct from the route table's side. The cleartext path
+		// always did this; only the CONNECT path did not.
+		current, routed := rt, true
+		if reresolve {
+			current, routed = p.resolveDomain(authority)
+		}
+		if !routed {
+			if unmapped := p.unmappedHandler(); unmapped != nil {
+				unmapped.ServeHTTP(w, r)
+				return
+			}
+			log.Printf("[vtunnel-proxy] %s %s: the route was withdrawn while this connection was open", r.Method, authority)
+			http.Error(w, "vtunnel: domain not allowed", http.StatusForbidden)
+			return
+		}
+
+		handlers := connectHandlers
+		if current.generation != rt.generation {
+			// Something about this route changed under the open connection. The
+			// pre-dialled upstream was negotiated for the old revision, so it
+			// is not offered to the new one: dial afresh. Kept for as long as
+			// the revision lasts rather than rebuilt per request — a connection
+			// that outlives one config change would otherwise pay for it on
+			// every request it has left.
+			handlers = rebuilt.get(current.generation, func() (routeHandlers, func()) {
+				return p.buildRouteHandlers(authority, current, nil, preferH2)
+			})
+		}
+
+		// Read per request too, so a middleware registered after the connection
+		// opened applies to it.
+		p.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			p.serveRouted(w, r, handlers, current.headers, expectHost, authority, preferH2)
+		})).ServeHTTP(w, r)
+	}), func() { release(); rebuilt.close() }
+}
+
+// revisionCache holds the handlers built for one revision of a route, so a
+// long-lived connection rebuilds them when the route changes rather than for
+// every request after it. Requests on an h2 session arrive concurrently, hence
+// the lock.
+type revisionCache struct {
+	mu         sync.Mutex
+	generation uint64
+	handlers   routeHandlers
+	release    func()
+	built      bool
+}
+
+func (c *revisionCache) get(generation uint64, build func() (routeHandlers, func())) routeHandlers {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.built && c.generation == generation {
+		return c.handlers
+	}
+	c.releaseLocked()
+	c.handlers, c.release = build()
+	c.generation = generation
+	c.built = true
+	return c.handlers
+}
+
+// close releases whatever the last revision held. Called when the connection
+// ends, alongside the release for the route it opened with.
+func (c *revisionCache) close() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.releaseLocked()
+	c.built = false
+}
+
+func (c *revisionCache) releaseLocked() {
+	if c.release != nil {
+		c.release()
+		c.release = nil
+	}
+}
+
+// routeHandlers is the pair of handlers a route resolves to: the ordinary one,
+// and the one that takes over the connection for a protocol upgrade.
+type routeHandlers struct {
+	serve   http.Handler
+	upgrade http.Handler
+}
+
+func (p *MITMProxy) buildRouteHandlers(authority string, rt route, up *upstreamTLSConn, preferH2 bool) (routeHandlers, func()) {
 	release := func() {}
 	var h http.Handler
 	if rt.handler != nil {
@@ -1544,54 +2008,46 @@ func (p *MITMProxy) routeHandler(authority string, rt route, up *upstreamTLSConn
 	if rt.handler == nil {
 		upgrade = p.upgradeHandler(authority, rt, up)
 	}
+	return routeHandlers{serve: h, upgrade: upgrade}, release
+}
 
-	inject := rt.headers
-	// The route — and with it the target and the credential — was chosen from
-	// the authority this connection was opened for. Every request inside it
-	// carried its own Host, so a sandbox could open one CONNECT to a domain it
-	// is allowed to reach and then aim the injected credential at any other
-	// virtual host that upstream serves. RFC 9110 §7.2 requires the two to
-	// agree, and 421 is the answer for when they do not.
-	expectHost := hostFromAuthority(authority)
+func (p *MITMProxy) serveRouted(w http.ResponseWriter, r *http.Request, handlers routeHandlers, inject http.Header, expectHost, authority string, preferH2 bool) {
+	r.RequestURI = ""
 
-	return p.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.RequestURI = ""
-
-		// HTTP/1.0 has no Host header, and net/http hands such a request to the
-		// handler as it stands (it answers 400 itself for HTTP/1.1). An empty
-		// Host is not a different host — it is no claim at all — so the
-		// authority this connection was opened for is filled in. Nothing is
-		// widened by that: it is the very value the comparison below would have
-		// demanded.
-		if r.Host == "" && expectHost != "" {
-			r.Host = authority
-			if r.URL != nil {
-				r.URL.Host = authority
-			}
+	// HTTP/1.0 has no Host header, and net/http hands such a request to the
+	// handler as it stands (it answers 400 itself for HTTP/1.1). An empty
+	// Host is not a different host — it is no claim at all — so the
+	// authority this connection was opened for is filled in. Nothing is
+	// widened by that: it is the very value the comparison below would have
+	// demanded.
+	if r.Host == "" && expectHost != "" {
+		r.Host = authority
+		if r.URL != nil {
+			r.URL.Host = authority
 		}
+	}
 
-		if expectHost != "" && !strings.EqualFold(hostFromAuthority(r.Host), expectHost) {
-			log.Printf("[vtunnel-proxy] %s %s: Host %q does not match the authority this connection was opened for; refused",
-				r.Method, authority, r.Host)
-			http.Error(w, "vtunnel: request Host does not match the connection authority", http.StatusMisdirectedRequest)
-			return
-		}
+	if expectHost != "" && !strings.EqualFold(hostFromAuthority(r.Host), expectHost) {
+		log.Printf("[vtunnel-proxy] %s %s: Host %q does not match the authority this connection was opened for; refused",
+			r.Method, authority, r.Host)
+		http.Error(w, "vtunnel: request Host does not match the connection authority", http.StatusMisdirectedRequest)
+		return
+	}
 
-		// HTTP/2 has no Upgrade mechanism — Connection and Upgrade are forbidden
-		// (RFC 7540 §8.1.2.2) and x/net/http2 rejects such a request before it
-		// reaches here — so this is an HTTP/1.1 concern only. That also settles
-		// the ResponseWriter question: only the HTTP/1.1 path can hijack.
-		if !preferH2 && isUpgradeRequest(r) {
-			removeHopByHopForUpgrade(r.Header)
-			injectConfiguredHeaders(r.Header, inject)
-			upgrade.ServeHTTP(w, r)
-			return
-		}
+	// HTTP/2 has no Upgrade mechanism — Connection and Upgrade are forbidden
+	// (RFC 7540 §8.1.2.2) and x/net/http2 rejects such a request before it
+	// reaches here — so this is an HTTP/1.1 concern only. That also settles
+	// the ResponseWriter question: only the HTTP/1.1 path can hijack.
+	if !preferH2 && isUpgradeRequest(r) {
+		removeHopByHopForUpgrade(r.Header)
+		injectConfiguredHeaders(r, inject)
+		handlers.upgrade.ServeHTTP(w, r)
+		return
+	}
 
-		removeHopByHop(r.Header, preferH2)
-		injectConfiguredHeaders(r.Header, inject)
-		h.ServeHTTP(w, r)
-	})), release
+	removeHopByHop(r.Header, true)
+	injectConfiguredHeaders(r, inject)
+	handlers.serve.ServeHTTP(w, r)
 }
 
 // upgradeHandler splices a protocol upgrade through to the route's target.
@@ -1694,19 +2150,48 @@ func (p *MITMProxy) forwardingHandler(authority string, rt route, up *upstreamTL
 					return nil
 				}
 
+				// The hint's headers belong to the hint: left in place they
+				// would be written again as part of the real response. Only
+				// they go, though. Clearing the whole map took the response
+				// headers a Use middleware had already set with them, so a
+				// stamp that was on every answer vanished from all of them the
+				// day an upstream started sending 103.
 				h := w.Header()
+				restore := make(map[string][]string, len(header))
+				for k := range header {
+					k = textproto.CanonicalMIMEHeaderKey(k)
+					if _, seen := restore[k]; !seen {
+						restore[k] = h[k]
+					}
+				}
 				for k, vv := range header {
 					for _, v := range vv {
 						h.Add(k, v)
 					}
 				}
 				w.WriteHeader(code)
-				// The hint's headers belong to the hint. Left in place they
-				// would be written again as part of the real response.
-				clear(h)
+				for k, before := range restore {
+					if before == nil {
+						delete(h, k)
+						continue
+					}
+					h[k] = before
+				}
 				return nil
 			},
 		}))
+
+		// An HTTP/2 server hands its handler a non-nil body even for a request
+		// that ended on its HEADERS frame, where net/http's HTTP/1 server uses
+		// http.NoBody. Re-issued as it stands, such a request has an outgoing
+		// length net/http reads as unknown: chunked framing to an HTTP/1
+		// upstream, an extra empty DATA frame to an HTTP/2 one, and — because a
+		// request with an unknown body is not replayable — no retry when a
+		// pooled connection turns out to have been closed at the other end. An
+		// h1 client survived that race and an h2 client got a 502.
+		if r.ContentLength == 0 {
+			r.Body = nil
+		}
 
 		resp, err := transport.RoundTrip(r)
 		roundTripMu.Lock()
@@ -1727,6 +2212,21 @@ func (p *MITMProxy) forwardingHandler(authority string, rt route, up *upstreamTL
 			return
 		}
 		defer resp.Body.Close()
+
+		// A 101 answers a request that asked to switch protocols, and such a
+		// request never reaches here — isUpgradeRequest sends it down the splice
+		// path instead. So this one was not asked for, and there is nothing on
+		// this path that can act on it: the hop-by-hop sweep strips the very
+		// headers that say what was switched to, net/http refuses to write a
+		// body for a 101, and the upstream's bytes after it are dropped. The
+		// client used to be handed a bare 101 and a connection that then said
+		// nothing ever again.
+		if resp.StatusCode == http.StatusSwitchingProtocols {
+			log.Printf("[vtunnel-proxy] %s %s -> %s: upstream switched protocols without being asked to; refusing",
+				r.Method, authority, target)
+			http.Error(w, "vtunnel: upstream switched protocols unexpectedly", http.StatusBadGateway)
+			return
+		}
 
 		// Trailers, announced and unannounced alike, are copyResponse's job:
 		// announcing here would put the names in the header map just before the
@@ -1749,7 +2249,18 @@ func (p *MITMProxy) upstreamTransport(rt route, up *upstreamTLSConn, preferH2 bo
 
 	noRelease := func() {}
 
-	if tlsHost := rt.tlsHost; tlsHost != "" {
+	tlsHost := rt.tlsHost
+	if tlsHost == "" && len(rt.headers) > 0 && !rt.cleartext {
+		// Nobody said how to reach this upstream, and this route carries a
+		// credential. Ask before writing it.
+		name, err := p.upstreamTLSName(target)
+		if err != nil {
+			return refusingTransport{err}, "https", noRelease
+		}
+		tlsHost = name
+	}
+
+	if tlsHost != "" {
 		// Proxy-side TLS: dial the target, then handshake using the real
 		// server's hostname for SNI.
 		transport := p.cachedTransport(upstreamKey{target: target, tlsHost: tlsHost, h2: preferH2}, func() http.RoundTripper {
@@ -1799,7 +2310,7 @@ func (p *MITMProxy) upstreamTransport(rt route, up *upstreamTLSConn, preferH2 bo
 // keep-alive, chunking and trailer handling with it, and lets a handler route
 // and a forwarded one run through exactly the same code.
 func (p *MITMProxy) serveH1(clientConn net.Conn, authority string, rt route, up *upstreamTLSConn) {
-	handler, release := p.routeHandler(authority, rt, up, false)
+	handler, release := p.routeHandler(authority, rt, up, false, true)
 	defer release()
 
 	// net/http reports TLS state by asserting the concrete *tls.Conn, and the
@@ -1821,6 +2332,9 @@ func (p *MITMProxy) serveH1(clientConn net.Conn, authority string, rt route, up 
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: serverReadHeaderTimeout,
+		// See the proxy listener: an intercepting proxy forwards `OPTIONS *`
+		// rather than answering it.
+		DisableGeneralOptionsHandler: true,
 	}
 	// Registered so Shutdown can end this connection between requests instead of
 	// cutting a response in half. Serve returns once the server closes the
@@ -1924,6 +2438,17 @@ func (c *notifyConn) Close() error {
 }
 
 func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	// A request with no Host names no destination. Synthesising one produced
+	// ":80" — a perfectly dialable address in Go, meaning the local machine —
+	// so a request nobody could route became a connection to this host's own
+	// loopback. Inside a CONNECT the authority is known and routeHandler fills
+	// it in; here there is nothing to fill it in from.
+	if r.Host == "" && r.URL.Host == "" {
+		w.Header().Set("Connection", "close")
+		http.Error(w, "vtunnel: request has no Host header, destination unknown", http.StatusBadRequest)
+		return
+	}
+
 	hostPort := r.Host
 	if _, _, err := net.SplitHostPort(hostPort); err != nil {
 		port := "80"
@@ -1974,7 +2499,7 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("[vtunnel-proxy] %s %s %s -> handled in process", r.URL.Scheme, r.Method, hostPort)
 	}
-	handler, release := p.routeHandler(hostPort, rt, nil, keepH2)
+	handler, release := p.routeHandler(hostPort, rt, nil, keepH2, false)
 	defer release()
 	handler.ServeHTTP(w, r)
 }
@@ -2041,33 +2566,149 @@ func startsLikeTLSRecord(d []byte) bool {
 		d[1] == 0x03 && d[2] <= 0x03
 }
 
-// isH2CPreface reports whether the buffered stream opens with the HTTP/2 client
-// connection preface (RFC 7540 §3.5) — the marker of cleartext h2c, which sends
-// it over CONNECT in place of a TLS ClientHello.
-// startsLikeHTTP1Request reports whether the buffered bytes open with a
-// complete HTTP/1.x request line.
+// tunnelKind is what the bytes inside a CONNECT tunnel turn out to be.
+type tunnelKind int
+
+const (
+	// tunnelOpaque is anything this proxy does not terminate: a protocol it
+	// does not speak, or a client that is waiting for the server to speak
+	// first and has therefore said nothing to go on.
+	tunnelOpaque tunnelKind = iota
+	tunnelTLS
+	tunnelH2C
+	tunnelHTTP1
+)
+
+// classifyTunnel decides what a CONNECT tunnel carries from its opening bytes.
 //
-// The whole line is required, version and all, rather than a method-looking
-// word: "GET key\r\n" is a valid redis inline command, and mistaking one for
-// HTTP would mean parsing a connection that should have been piped. Every real
-// HTTP client writes the request line and its headers in one go, so the strict
-// reading costs nothing.
+// The hard part is not recognising each protocol, it is knowing when to stop
+// waiting. Deciding from one read misreads a request line that TCP split across
+// two segments — and the sandbox router's tunnel hop re-segments everything it
+// carries, so the same client, sending the same bytes, was injected into on one
+// connection and piped on the next. Waiting for a whole line instead hangs every
+// protocol whose server greets first, which says nothing at all until it is
+// greeted.
 //
-// Only what has already arrived is examined. Peeking further would wait, and
-// the protocols this most needs to tell apart are the ones that send a short
-// opening and then expect the other side to speak.
-func startsLikeHTTP1Request(br *bufio.Reader) bool {
-	head, _ := br.Peek(min(br.Buffered(), maxRequestLinePeek))
-	line, _, ok := bytes.Cut(head, []byte("\r\n"))
-	if !ok {
-		return false
+// So the buffer grows only while what has arrived could still become something
+// this proxy terminates, and the decision is made the moment it could not.
+// Anything binary settles it on the first byte; a redis inline command settles
+// it at its first line ending; a request line split down the middle is waited
+// for, because it is still a viable request line.
+func classifyTunnel(br *bufio.Reader) tunnelKind {
+	for {
+		head, _ := br.Peek(min(max(br.Buffered(), 1), maxRequestLinePeek))
+		if len(head) == 0 {
+			return tunnelOpaque
+		}
+		if startsLikeTLSRecord(head) {
+			return tunnelTLS
+		}
+		if isH2CPreface(br) {
+			return tunnelH2C
+		}
+		if line, ok := firstLine(head); ok {
+			// The whole line is required, version and all, rather than a
+			// method-looking word: "GET key\r\n" is a valid redis inline
+			// command, and mistaking one for HTTP would mean parsing a
+			// connection that should have been piped.
+			return classifyRequestLine(line)
+		}
+		if len(head) >= maxRequestLinePeek || !viableTunnelPrefix(head) {
+			return tunnelOpaque
+		}
+		if _, err := br.Peek(len(head) + 1); err != nil {
+			return tunnelOpaque
+		}
 	}
-	version := bytes.LastIndex(line, []byte(" HTTP/1."))
-	return version > 0
 }
 
-// maxRequestLinePeek bounds how much of a first line is examined. A request
-// line longer than this is one net/http would refuse anyway.
+func classifyRequestLine(line []byte) tunnelKind {
+	if couldBeRequestLine(line) && bytes.LastIndex(line, []byte(" HTTP/1.")) > 0 {
+		return tunnelHTTP1
+	}
+	return tunnelOpaque
+}
+
+// couldBeRequestLine reports whether b is a request line, or the start of one.
+// Everything that asks the question asks it here — two nearly-identical rules
+// is what the fuzzer found first, twice: one accepted a one-letter method where
+// the other demanded three, and one tolerated a byte outside printable ASCII
+// where the other did not. Either way the same bytes were read differently
+// depending on where TCP split them.
+func couldBeRequestLine(b []byte) bool {
+	return requestLinePrefix(b) && printableASCII(b)
+}
+
+// maxMethodLen is how long a method token may be before this stops reading like
+// a request line. Longer than any method anyone registered — PROPPATCH is nine
+// — with room to spare, because being generous here costs a bounded wait and
+// being strict costs a misclassification.
+const maxMethodLen = 16
+
+// requestLinePrefix reports whether b opens with a method token, whole or still
+// arriving.
+func requestLinePrefix(b []byte) bool {
+	space := bytes.IndexByte(b, ' ')
+	if space < 0 {
+		return len(b) <= maxMethodLen && isUpperASCII(b)
+	}
+	return space >= 1 && space <= maxMethodLen && isUpperASCII(b[:space])
+}
+
+func isUpperASCII(b []byte) bool {
+	for _, c := range b {
+		if c < 'A' || c > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
+// firstLine splits off the first line of head, if all of it has arrived. A bare
+// LF ends it: RFC 9112 §2.2 lets a recipient accept one, net/http's own parser
+// does, and refusing it here made the sniffer stricter than the parser behind
+// it — so a request that would have been served and injected into was piped
+// through instead.
+func firstLine(head []byte) ([]byte, bool) {
+	line, _, ok := bytes.Cut(head, []byte("\n"))
+	if !ok {
+		return nil, false
+	}
+	return bytes.TrimSuffix(line, []byte("\r")), true
+}
+
+// viableTunnelPrefix reports whether head, which is not yet a decision, could
+// still grow into one. Everything else is opaque right now rather than after a
+// wait nobody is going to satisfy.
+func viableTunnelPrefix(head []byte) bool {
+	if head[0] == tlsHandshakeRecordType {
+		// A TLS record header still arriving. Two clients out of three send all
+		// five bytes at once, but a prefix is not evidence against.
+		return len(head) < tlsRecordHeaderLen && (len(head) < 2 || head[1] == 0x03)
+	}
+	// A request line still arriving, whose ending has not come yet.
+	return couldBeRequestLine(head)
+}
+
+func printableASCII(b []byte) bool {
+	for _, c := range b {
+		if (c < 0x20 || c > 0x7e) && c != '\r' && c != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// maxRequestLinePeek bounds how much of a first line is examined, and is the
+// size the tunnel's reader is given so that the bound is the real one: a peek
+// past the end of a bufio buffer fails rather than growing it, so a smaller
+// buffer would have capped the classification somewhere this constant does not
+// mention. A request line longer than this is one net/http would refuse anyway.
 const maxRequestLinePeek = 8 << 10
 
 // isH2CPreface reports whether the connection opens with the HTTP/2 client
