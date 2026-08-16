@@ -5,8 +5,10 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -363,5 +365,73 @@ func TestTrackingRefusesAfterShutdownHasBegun(t *testing.T) {
 		release()
 		t.Fatal("a connection registered itself after Close; whether that panics " +
 			"depends on how far Shutdown's Wait had got")
+	}
+}
+
+// When Close returns, the listener is closed.
+//
+// It was not, occasionally. http.Server closes the listeners Serve has
+// registered with it, and Start hands this one to a goroutine — so a Close that
+// landed before that goroutine was scheduled found nothing to close, and the
+// port went on accepting until the runtime got round to it. About one time in
+// a thousand: too rare to notice, too common to never happen.
+//
+// Catching that needs the interleaving to be the rare one, and then needs it
+// observed without letting go of the processor — Serve closes the listener
+// itself on the way out, so anything that yields first sees the window already
+// healed. Hence both halves here: one processor, so the Serve goroutine cannot
+// have run, and a second Close as the question, because closing an open
+// listener succeeds and closing a closed one does not.
+func TestClosingClosesTheListener(t *testing.T) {
+	t.Run("proxy", func(t *testing.T) {
+		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+		p := NewMITMProxy()
+		if err := p.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		ln, _ := p.lifecycle()
+		p.Close()
+		assertAlreadyClosed(t, ln)
+	})
+
+	t.Run("router", func(t *testing.T) {
+		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+
+		r := newRouter()
+		if err := r.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		ln, _ := r.lifecycle()
+		r.Close()
+		assertAlreadyClosed(t, ln)
+	})
+
+	t.Run("proxy shutdown", func(t *testing.T) {
+		p := NewMITMProxy()
+		if err := p.Start("127.0.0.1:0"); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		ln, _ := p.lifecycle()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.Shutdown(ctx); err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+		assertAlreadyClosed(t, ln)
+	})
+}
+
+// assertAlreadyClosed asks the listener whether it is closed by closing it: an
+// open one says yes and a closed one says it cannot. Neither answer blocks, and
+// not blocking is the point — see the note above.
+func assertAlreadyClosed(t *testing.T, ln net.Listener) {
+	t.Helper()
+	if ln == nil {
+		t.Fatal("no listener was installed")
+	}
+	if err := ln.Close(); err == nil {
+		t.Fatal("the call that stopped this proxy returned while the port it had opened " +
+			"was still accepting")
 	}
 }

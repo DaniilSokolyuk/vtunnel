@@ -175,10 +175,15 @@ func (m *MixedListener) Accept() (net.Conn, error) {
 }
 
 // Close stops accepting. Connections already handed out are the caller's.
+//
+// A second call reports that it is closed rather than reporting success, which
+// is what every other net.Listener does and what anyone asking a listener about
+// its state has to be able to rely on: answering nil the second time is a
+// listener claiming it has just closed a port it closed some time ago.
 func (m *MixedListener) Close() error {
 	select {
 	case <-m.closing:
-		return nil
+		return net.ErrClosed
 	default:
 		close(m.closing)
 	}

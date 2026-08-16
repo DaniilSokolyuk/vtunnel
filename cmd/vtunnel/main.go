@@ -42,8 +42,15 @@ Server flags:
                          9090                      loopback only  (do this)
                          127.0.0.1:9090            the same, spelled out
                          :9090                     every interface — see below
+                         mixed://127.0.0.1:9090    both, spelled out
                          socks5://127.0.0.1:1080   one protocol only
                          http://127.0.0.1:8080
+                       A scheme needs the whole host:port — the bare-port form
+                       and its loopback default do not carry over, so
+                       socks5://1080 is an error and socks5://:1080 is every
+                       interface. Point SOCKS5 clients at socks5h:// so the
+                       name arrives unresolved; an address is refused unless
+                       it is forwarded by address too.
                        It authenticates nobody, so a port reachable from
                        outside the sandbox hands whoever finds it an open
                        relay and the controlplane's injected credentials.
@@ -244,7 +251,8 @@ func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	listen := fs.String("listen", envOr("VTUNNEL_LISTEN", "ws://:3001/"), "Tunnel listen URL: ws://:3001/ or tcp://:3001")
 	proxyAddr := fs.String("proxy", os.Getenv("VTUNNEL_PROXY"),
-		"Routing proxy address: 9090 (loopback), 127.0.0.1:9090, or :9090 for every interface (empty = disabled)")
+		"Routing proxy address: 9090 (loopback), 127.0.0.1:9090, :9090 for every interface, "+
+			"or mixed|http|socks5://host:port for one front end (empty = disabled)")
 	secret := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
 	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the client")
 	fs.Parse(args)

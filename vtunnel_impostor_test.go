@@ -21,7 +21,7 @@ import (
 )
 
 // The tunnel secret is the only thing that lets a server be the server. Before
-// 0.8 the host key was derived from the client's PUBLIC key — a value published
+// 1.0 the host key was derived from the client's PUBLIC key — a value published
 // on purpose, in sandbox images, compose files and CI variables — so anyone who
 // read it could compute the server's private host key and the client's pinning
 // check verified nothing.

@@ -134,7 +134,7 @@ go install github.com/vivid-money/vtunnel/cmd/vtunnel@latest
 
 Or grab a binary from [Releases](https://github.com/vivid-money/vtunnel/releases).
 
-Upgrading from 0.6.x? Interception moved out of the sandbox and the wire protocol changed — see [MIGRATING.md](MIGRATING.md).
+Upgrading from 0.6.x? Interception moved out of the sandbox, the tunnel keypair became a shared secret, and the wire protocol changed — see [MIGRATING.md](MIGRATING.md).
 
 ---
 
@@ -570,7 +570,7 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-listen` | Where to accept the tunnel: `ws://:3001/` (also serves `/health`) or `tcp://:3001` | `$VTUNNEL_LISTEN`, else `ws://:3001/` |
-| `-proxy` | Where the routing proxy listens, serving HTTP and SOCKS5 on one port: `9090` (loopback), `127.0.0.1:9090`, `:9090` for every interface, or a scheme to serve one protocol only (`socks5://127.0.0.1:1080`, `http://127.0.0.1:8080`). Empty disables it. It authenticates nobody, so keep it on loopback unless something else guards the port | `$VTUNNEL_PROXY`, else empty |
+| `-proxy` | Where the routing proxy listens, serving HTTP and SOCKS5 on one port: `9090` (loopback), `127.0.0.1:9090`, `:9090` for every interface, or a scheme in front of a full `host:port` to pick the front ends — `mixed://` (both, the default), `http://127.0.0.1:8080`, `socks5://127.0.0.1:1080`. A scheme does not carry the bare-port shorthand or its loopback default: `socks5://1080` is an error, `socks5://:1080` is every interface. SOCKS5 clients want `socks5h://`, see [SOCKS5](#socks5). Empty disables it. It authenticates nobody, so keep it on loopback unless something else guards the port | `$VTUNNEL_PROXY`, else empty |
 | `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
 | `-protocol` | Session protocol: `ssh`, `yamux`, `yamux-insecure`. Must match the client | `$VTUNNEL_PROTOCOL`, else `ssh` |
 

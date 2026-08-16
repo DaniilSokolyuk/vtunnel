@@ -420,7 +420,13 @@ func (p *MITMProxy) Close() {
 	ln, srv := p.lifecycle()
 	if srv != nil {
 		srv.Close()
-	} else if ln != nil {
+	}
+	// The listener is closed here as well as by the server. http.Server only
+	// knows the listeners Serve has registered with it, and Start hands this one
+	// to a goroutine — so a Close that lands before that goroutine is scheduled
+	// finds nothing to close, and the port goes on accepting until it is. Rare,
+	// and rare is worse than never: the call returned saying it had stopped.
+	if ln != nil {
 		ln.Close()
 	}
 	p.closeDetached()
@@ -461,7 +467,10 @@ func (p *MITMProxy) Shutdown(ctx context.Context) error {
 	var err error
 	if srv != nil {
 		err = srv.Shutdown(ctx)
-	} else if ln != nil {
+	}
+	// For the same reason Close does it: a listener Serve has not registered yet
+	// is not one the server can be asked to stop.
+	if ln != nil {
 		ln.Close()
 	}
 	<-nestedDone

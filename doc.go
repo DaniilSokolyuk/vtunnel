@@ -134,8 +134,9 @@
 //
 // # Migrating
 //
-// 0.8 replaced the tunnel keypair with one shared secret — [WithSecret] and
-// [WithServerSecret] — and split the transport from the session. Both ends
-// upgrade together; see MIGRATING.md for the details and for why every
-// pre-0.8 keypair should be treated as compromised.
+// 1.0 moved TLS interception out of the sandbox, replaced the tunnel keypair
+// with one shared secret — [WithSecret] and [WithServerSecret] — and split the
+// transport from the session. Both ends upgrade together; see MIGRATING.md for
+// the details and for why every pre-1.0 keypair should be treated as
+// compromised.
 package vtunnel

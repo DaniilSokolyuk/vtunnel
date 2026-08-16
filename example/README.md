@@ -43,8 +43,8 @@ the controlplane.
 ./example/test.sh
 ```
 
-The sandbox image pulls a released `vtunnel` binary, and 0.7 changed the
-configuration protocol — so this needs a published v0.7.0 to run against the
+The sandbox image pulls a released `vtunnel` binary, and 1.0 changed the
+configuration protocol — so this needs a published v1.0.0 to run against the
 current source. Until then, point `VTUNNEL_VERSION` at a tag whose client you
 also have locally, or build the binary into the image from this checkout.
 

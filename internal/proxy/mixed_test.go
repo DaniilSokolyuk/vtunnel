@@ -264,3 +264,22 @@ func TestPermanentAcceptErrorIsReportedRepeatedly(t *testing.T) {
 	}
 	m.Close()
 }
+
+// A listener is asked about its state by closing it: an open one closes, a
+// closed one says it cannot. Answering nil both times makes the second answer
+// indistinguishable from the first.
+func TestCloseIsIdempotentAndSaysSo(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := NewMixed(ln, time.Second, nil)
+
+	if err := m.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := m.Close(); err == nil {
+		t.Fatal("the second Close reported success, as though it had just closed " +
+			"a port that was already closed")
+	}
+}

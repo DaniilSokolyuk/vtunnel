@@ -403,8 +403,14 @@ func (r *Router) Close() {
 
 	if !already {
 		if srv != nil {
-			srv.Close() // closes the listener too
-		} else if ln != nil {
+			srv.Close()
+		}
+		// The listener is closed here as well as by the server. http.Server only
+		// knows the listeners Serve has registered with it, and Start hands this one
+		// to a goroutine — so a Close that lands before that goroutine is scheduled
+		// finds nothing to close, and the port goes on accepting until it is. Rare,
+		// and rare is worse than never: the call returned saying it had stopped.
+		if ln != nil {
 			ln.Close()
 		}
 	}
