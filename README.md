@@ -1,12 +1,37 @@
 # vtunnel
 
-Route container/sandbox traffic to private services through a reverse tunnel, and intercept it on a machine the sandbox cannot reach.
+[![Go Reference](https://pkg.go.dev/badge/github.com/vivid-money/vtunnel.svg)](https://pkg.go.dev/github.com/vivid-money/vtunnel)
 
-Set `HTTPS_PROXY` in your sandbox — vtunnel routes configured domains through a tunnel to services only your machine can reach, and injects credentials the container never holds.
+A reverse tunnel with a full TLS-intercepting proxy on the far end. Set `HTTPS_PROXY` in a container and the domains you choose come out on your machine, decrypted, as ordinary Go requests. The CA, the real targets and the credentials stay there; the container gets a list of domain names and a CA certificate, nothing else.
 
-- **Control all outbound traffic** — route, inspect, rewrite or block any request leaving the container; only allowlisted domains go through the tunnel
-- **Inject credentials outside the container** — API keys, tokens and the MITM CA private key live on the controlplane and never enter the sandbox. The container holds a domain allowlist and a CA certificate, nothing more
-- **Expose corporate resources** — make internal services (Nexus, Artifactory, GitLab) reachable inside the sandbox without VPN or network changes
+## Features
+
+**Tunnel**
+
+* Reverse — the client dials in; the sandbox needs no route back out
+* Transports: WebSocket, `wss`, TCP, or a `net.Conn` of your own
+* Sessions: SSH, or yamux over TLS 1.3 pinned to a shared secret
+* Domain routing in the sandbox, without decrypting anything
+* Only domain names cross the tunnel — no targets, no credentials, no CA
+* Raw TCP port forwards
+* Reconnect with backoff; listeners and routes replayed
+
+**MITM proxy**
+
+* Full TLS interception, leaf certificates signed on the fly and cached
+* HTTP/1.1, HTTP/2, cleartext h2c over `CONNECT`
+* ALPN mirrored from the real upstream, translated on mismatch
+* gRPC with trailer forwarding, announced and unannounced
+* SSE streamed event by event, on every route shape
+* WebSocket spliced, not re-terminated — subprotocol, `permessage-deflate` and fragmentation intact
+* Header injection per domain, `tls://` targets, SNI override
+* Wildcard domains with nginx-like precedence
+* Routes: your `http.Handler` in-process, another target, a raw pipe, or a refusal
+* Middleware on every terminated request — read or rewrite bodies, SSE and WebSocket frames
+* gzip handled correctly whether or not the client asked for it
+* Automatic passthrough for pinning and mTLS upstreams
+* `Close` / `Shutdown(ctx)`, `SSLKEYLOGFILE` on both legs
+* Works standalone, with no tunnel at all
 
 ```
  SANDBOX / CONTAINER             CONTROLPLANE (your machine)
@@ -30,13 +55,11 @@ Set `HTTPS_PROXY` in your sandbox — vtunnel routes configured domains through 
 
 Mapped domains go through the tunnel. Everything else egresses from the sandbox directly.
 
-vtunnel is two pieces that work together and ship in one binary, documented separately below because they are separable in practice:
-
-- **[The tunnel](#the-tunnel)** — a reverse tunnel between the sandbox and your machine, plus a router in the sandbox that dispatches by domain name and never decrypts anything.
-- **[The MITM proxy](#the-mitm-proxy)** — an intercepting forward proxy on the controlplane. It holds the CA, the real targets and the credentials. It depends on neither side of the tunnel and [runs perfectly well on its own](#using-it-without-a-tunnel).
+One binary, two pieces — **[the tunnel](#the-tunnel)** and **[the MITM proxy](#the-mitm-proxy)** — documented separately below, because neither needs the other.
 
 ## Contents
 
+- [Features](#features)
 - [Quick start](#quick-start)
 - [Install](#install)
 - [**The tunnel**](#the-tunnel)
