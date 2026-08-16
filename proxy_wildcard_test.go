@@ -144,7 +144,7 @@ func TestProxyWildcardMatching(t *testing.T) {
 			proxy, proxyAddr := startProxyForTest(t)
 
 			for pattern, tgt := range tc.mappings {
-				proxy.SetDomainMapping(pattern, tgt)
+				proxy.ForwardTo(pattern, tgt)
 			}
 
 			got200 := connectReturns200(t, proxyAddr, tc.host)
@@ -220,7 +220,7 @@ func TestProxyWildcardPriorityPicksCorrectTarget(t *testing.T) {
 
 			proxy, proxyAddr := startProxyForTest(t)
 			for pattern, target := range tc.mappings(winner.Listener.Addr().String(), loser.Listener.Addr().String()) {
-				proxy.SetDomainMapping(pattern, target)
+				proxy.ForwardTo(pattern, target)
 			}
 
 			body := httpViaProxy(t, proxyAddr, tc.host)
@@ -249,7 +249,7 @@ func TestProxyWildcardMitm(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("*.secure.test:443", backend.Listener.Addr().String())
+	proxy.ForwardTo("*.secure.test:443", backend.Listener.Addr().String())
 
 	proxyConn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {

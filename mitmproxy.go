@@ -32,32 +32,42 @@ const peekTimeout = 30 * time.Second
 // dialTimeout bounds every upstream dial the proxy makes.
 const dialTimeout = 10 * time.Second
 
-// MITMProxy is an HTTP/CONNECT forward proxy that routes mapped domains to
-// configured targets and passes everything else through directly.
+// route is how one domain is served. Exactly one of three shapes:
 //
-// With a MITM CA configured it terminates TLS for mapped domains, generating
-// leaf certificates on the fly, so per-domain headers can be injected into the
-// forwarded requests. Without one it falls back to a raw byte pipe and the
-// client's TLS travels end-to-end.
-//
-// The type owns all of its routing state and depends on neither Server nor
-// Client, so it can run on either side of a tunnel.
-// domainRoute is what a mapped domain resolves to.
-//
-// An empty target means the domain is routed to itself: the proxy dials the
-// host the client asked for and pipes bytes, without terminating TLS. That is
-// the only way to serve upstreams that pin certificates, and it needs no CA.
-// A non-empty target means the request is decrypted and re-issued, which is
-// what makes header injection possible.
-type domainRoute struct {
+//   - handler set — served in this process, no upstream connection at all
+//     ([MITMProxy.Handle]).
+//   - target set — TLS is terminated and the request re-issued to that address
+//     ([MITMProxy.ForwardTo]). This is the only shape that can inject headers.
+//   - neither — piped to the host the client asked for, TLS untouched
+//     ([MITMProxy.Forward]). Needs no CA, and is the only way to reach an
+//     upstream that pins certificates.
+type route struct {
+	handler http.Handler
 	target  string
 	headers http.Header
 }
 
+// terminates reports whether serving this route means decrypting the client's
+// TLS, which requires a CA.
+func (r route) terminates() bool { return r.handler != nil || r.target != "" }
+
+// MITMProxy is an HTTP/CONNECT forward proxy that routes domains to in-process
+// handlers, to other addresses, or straight through, and dials anything
+// unrouted directly.
+//
+// With a MITM CA configured it terminates TLS for routes that ask for it,
+// generating leaf certificates on the fly, which is what makes in-process
+// handlers and header injection possible.
+//
+// The type owns all of its routing state and depends on neither Server nor
+// Client: it works as a plain intercepting proxy on its own, and a [Client]
+// mirrors its routes into a sandbox when there is a tunnel.
 type MITMProxy struct {
-	domainMap     map[string]string
-	domainHeaders map[string]http.Header // same keys as domainMap
-	domainMu      sync.RWMutex
+	routes     map[string]route
+	middleware []func(http.Handler) http.Handler
+	unmapped   http.Handler // nil = dial the requested host directly
+	onChange   func()
+	domainMu   sync.RWMutex
 
 	// mitmCA is the CA used to sign generated leaf certificates
 	// (nil = transparent tunnel, no interception).
@@ -89,12 +99,11 @@ func WithMitmCA(cert tls.Certificate) MITMProxyOption {
 	}
 }
 
-// NewMITMProxy creates a proxy with no domain mappings.
+// NewMITMProxy creates a proxy with no routes.
 func NewMITMProxy(opts ...MITMProxyOption) *MITMProxy {
 	p := &MITMProxy{
-		domainMap:     make(map[string]string),
-		domainHeaders: make(map[string]http.Header),
-		tlsUpstream:   make(map[string]string),
+		routes:      make(map[string]route),
+		tlsUpstream: make(map[string]string),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -151,34 +160,133 @@ func (p *MITMProxy) Close() {
 	})
 }
 
-func (p *MITMProxy) SetDomainMapping(domain, target string) {
-	p.domainMu.Lock()
-	p.domainMap[domain] = target
-	p.domainMu.Unlock()
-	log.Printf("[vtunnel-proxy] Domain mapping added: %s -> %s", domain, target)
+// Handle serves a domain from this process. The proxy terminates the client's
+// TLS and calls h with the decrypted request, so no upstream connection is made
+// at all — which is how a service that needs custom authentication, rewriting
+// or mocking is implemented without standing up a second proxy for it to reach.
+//
+// A handler route needs a CA: there is no way to hand a decrypted request to a
+// handler without decrypting it first.
+func (p *MITMProxy) Handle(domain string, h http.Handler, opts ...ForwardOption) {
+	p.setRoute(domain, route{handler: h, headers: forwardHeaders(opts)},
+		"handled in process")
 }
 
-func (p *MITMProxy) RemoveDomainMapping(domain string) {
-	p.domainMu.Lock()
-	delete(p.domainMap, domain)
-	delete(p.domainHeaders, domain)
-	p.domainMu.Unlock()
-	log.Printf("[vtunnel-proxy] Domain mapping removed: %s", domain)
+// Forward routes a domain through this proxy to the host the client asked for,
+// piping bytes without terminating TLS. It needs no CA and works with upstreams
+// that pin certificates — but nothing can be injected into it.
+func (p *MITMProxy) Forward(domain string) {
+	p.setRoute(domain, route{}, "itself, TLS untouched")
 }
 
-// SetDomainHeaders registers headers that the MITM proxy injects into every
-// request routed to the given domain mapping. The key must match a key already
-// (or later) passed to SetDomainMapping — typically "host:port" including
-// wildcard forms (e.g. "*.example.test:443").
-func (p *MITMProxy) SetDomainHeaders(domain string, headers http.Header) {
-	p.domainMu.Lock()
-	if headers == nil {
-		delete(p.domainHeaders, domain)
-	} else {
-		p.domainHeaders[domain] = headers.Clone()
+// ForwardTo terminates the client's TLS and re-issues the request to target,
+// which may be a plain address ("localhost:8080"), a TLS endpoint (":443" or an
+// explicit "tls://host:port"), and carries any headers declared with
+// [WithHeader].
+func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) error {
+	if target == "" {
+		return fmt.Errorf("forward %s: empty target; use Forward to route a domain to itself", domain)
 	}
+
+	cfg := forwardConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+
+	addr, tlsHost, upstreamIsTLS := parseForwardTarget(target)
+	if cfg.sni != "" {
+		tlsHost, upstreamIsTLS = cfg.sni, true
+	}
+	if upstreamIsTLS {
+		p.setTLSUpstream(addr, tlsHost)
+	}
+	p.setRoute(domain, route{target: addr, headers: cfg.headers}, addr)
+	return nil
+}
+
+// Remove drops a domain's route.
+func (p *MITMProxy) Remove(domain string) {
+	p.domainMu.Lock()
+	for _, key := range domainKeys(domain) {
+		delete(p.routes, key)
+	}
+	changed := p.onChange
 	p.domainMu.Unlock()
-	log.Printf("[vtunnel-proxy] Domain headers set: %s (%d)", domain, len(headers))
+
+	log.Printf("[vtunnel-proxy] Route removed: %s", domain)
+	if changed != nil {
+		changed()
+	}
+}
+
+// Routes returns the domains this proxy serves, as "host:port" keys.
+func (p *MITMProxy) Routes() []string {
+	p.domainMu.RLock()
+	defer p.domainMu.RUnlock()
+
+	domains := make([]string, 0, len(p.routes))
+	for domain := range p.routes {
+		domains = append(domains, domain)
+	}
+	return domains
+}
+
+// Use adds middleware wrapping every request the proxy terminates — handler
+// routes and forwarded ones alike. Middleware runs in the order given, outermost
+// first, and sees the request after decryption and before header injection.
+// Requests that are only piped through are never parsed, so they never reach it.
+func (p *MITMProxy) Use(mw ...func(http.Handler) http.Handler) {
+	p.domainMu.Lock()
+	p.middleware = append(p.middleware, mw...)
+	p.domainMu.Unlock()
+}
+
+// HandleUnmapped decides what happens to a request for a domain with no route.
+// The default dials the requested host directly, which is what a sandbox-side
+// proxy wants. A controlplane proxy usually wants to refuse instead, so that a
+// compromised tunnel cannot turn it into an open relay:
+//
+//	proxy.HandleUnmapped(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//	    http.Error(w, "unknown domain", http.StatusForbidden)
+//	}))
+//
+// The handler only sees requests the proxy can parse. A CONNECT for an unrouted
+// host is refused outright when one is set.
+func (p *MITMProxy) HandleUnmapped(h http.Handler) {
+	p.domainMu.Lock()
+	p.unmapped = h
+	p.domainMu.Unlock()
+}
+
+// OnChange registers a callback fired after any route change. A [Client] uses
+// it to mirror this proxy's domains into the sandbox as they are declared.
+func (p *MITMProxy) OnChange(f func()) {
+	p.domainMu.Lock()
+	p.onChange = f
+	p.domainMu.Unlock()
+}
+
+func (p *MITMProxy) setRoute(domain string, rt route, describe string) {
+	p.domainMu.Lock()
+	for _, key := range domainKeys(domain) {
+		p.routes[key] = rt
+	}
+	changed := p.onChange
+	p.domainMu.Unlock()
+
+	log.Printf("[vtunnel-proxy] Route: %s -> %s", domain, describe)
+	if changed != nil {
+		changed()
+	}
+}
+
+// forwardHeaders collapses ForwardOptions into the headers they declare.
+func forwardHeaders(opts []ForwardOption) http.Header {
+	cfg := forwardConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg.headers
 }
 
 // SetTransportTLSConfig sets the TLS settings used for upstream connections —
@@ -188,10 +296,10 @@ func (p *MITMProxy) SetTransportTLSConfig(cfg *tls.Config) {
 	p.transport.TLSClientConfig = cfg
 }
 
-// SetTLSUpstream records that target needs proxy-side TLS, using host as the
+// setTLSUpstream records that target needs proxy-side TLS, using host as the
 // SNI name. This lets the proxy control ALPN on the upstream connection
 // instead of relying on TLS being terminated further down the path.
-func (p *MITMProxy) SetTLSUpstream(target, host string) {
+func (p *MITMProxy) setTLSUpstream(target, host string) {
 	p.tlsUpstreamMu.Lock()
 	p.tlsUpstream[target] = host
 	p.tlsUpstreamMu.Unlock()
@@ -206,18 +314,35 @@ func (p *MITMProxy) tlsUpstreamHost(target string) (string, bool) {
 	return host, ok
 }
 
-func (p *MITMProxy) resolveDomain(host string) (domainRoute, bool) {
+func (p *MITMProxy) resolveDomain(host string) (route, bool) {
 	p.domainMu.RLock()
 	defer p.domainMu.RUnlock()
 
-	pattern, ok := bestDomainMatch(p.domainMap, host)
+	pattern, ok := bestDomainMatch(p.routes, host)
 	if !ok {
-		return domainRoute{}, false
+		return route{}, false
 	}
-	return domainRoute{
-		target:  p.domainMap[pattern],
-		headers: p.domainHeaders[pattern],
-	}, true
+	return p.routes[pattern], true
+}
+
+// unmappedHandler returns the handler for unrouted domains, or nil to dial the
+// requested host directly.
+func (p *MITMProxy) unmappedHandler() http.Handler {
+	p.domainMu.RLock()
+	defer p.domainMu.RUnlock()
+	return p.unmapped
+}
+
+// wrap applies the configured middleware, outermost first.
+func (p *MITMProxy) wrap(h http.Handler) http.Handler {
+	p.domainMu.RLock()
+	mw := p.middleware
+	p.domainMu.RUnlock()
+
+	for i := len(mw) - 1; i >= 0; i-- {
+		h = mw[i](h)
+	}
+	return h
 }
 
 func (p *MITMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -234,23 +359,39 @@ func (p *MITMProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		hostPort = r.URL.Host
 	}
 
-	// Check domain mapping
-	route, isMapped := p.resolveDomain(hostPort)
+	rt, isRouted := p.resolveDomain(hostPort)
 
-	// A mapped domain may carry cleartext h2c gRPC, not only TLS. A mapping
-	// with no target is routed to the host itself and never terminated.
-	if p.certCache != nil && isMapped && route.target != "" {
-		p.handleConnectMITM(w, r, hostPort, route.target, route.headers)
+	// A routed domain may carry cleartext h2c gRPC, not only TLS.
+	if isRouted && rt.terminates() && p.certCache != nil {
+		p.handleConnectMITM(w, r, hostPort, rt)
 		return
 	}
 
-	// Tunnel path: dial target and pipe bytes
+	// Without a CA nothing can be decrypted. A target route degrades to a byte
+	// pipe pointed at that target — routing still works, injection does not —
+	// but a handler route has no address to fall back to.
+	if isRouted && rt.handler != nil {
+		log.Printf("[vtunnel-proxy] CONNECT %s: handled in process, which needs a MITM CA", hostPort)
+		http.Error(w, "vtunnel: this route is served in process and requires a MITM CA", http.StatusBadGateway)
+		return
+	}
+
+	if !isRouted && p.unmappedHandler() != nil {
+		// A proxy that refuses unknown domains must refuse them here too:
+		// letting the tunnel open first would make it an open relay.
+		log.Printf("[vtunnel-proxy] CONNECT %s: no route", hostPort)
+		http.Error(w, "vtunnel: no route for this domain", http.StatusForbidden)
+		return
+	}
+
+	// Pipe bytes: to the route's target, to the requested host itself for a
+	// Forward route, or straight out for anything unrouted.
 	target := hostPort
 	switch {
-	case isMapped && route.target != "":
-		log.Printf("[vtunnel-proxy] CONNECT %s -> %s", hostPort, route.target)
-		target = route.target
-	case isMapped:
+	case isRouted && rt.target != "":
+		target = rt.target
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (TLS untouched, no CA)", hostPort, target)
+	case isRouted:
 		log.Printf("[vtunnel-proxy] CONNECT %s -> itself (TLS untouched)", hostPort)
 	default:
 		log.Printf("[vtunnel-proxy] CONNECT %s -> direct", hostPort)
@@ -274,7 +415,7 @@ func (p *MITMProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 // handleConnectMITM decides, from the client's opening bytes, how to serve a
 // mapped domain: TLS goes through MITM, cleartext h2c is terminated so headers
 // can still be injected, and any other cleartext is a raw byte pipe.
-func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority, mappedTarget string, injectHeaders http.Header) {
+func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, connectAuthority string, rt route) {
 	rawConn := acceptConnectTunnel(w, r)
 	if rawConn == nil {
 		return
@@ -310,21 +451,25 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 
 	switch {
 	case isTLS:
-		p.serveMITMTLS(tunnelConn, connectAuthority, mappedTarget, injectHeaders)
+		p.serveMITMTLS(tunnelConn, connectAuthority, rt)
 	case isH2C && overHijackedSocket:
 		defer tunnelConn.Close()
-		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext h2c, injecting headers)", connectAuthority, mappedTarget)
+		log.Printf("[vtunnel-proxy] CONNECT %s: cleartext h2c, terminating", connectAuthority)
 		// No pre-established upstream here: the client came in cleartext, so
 		// there was no client handshake to mirror an upstream ALPN onto.
-		p.serveInjectingH2(tunnelConn, mappedTarget, injectHeaders, nil)
+		p.serveH2(tunnelConn, rt, nil)
+	case rt.handler != nil:
+		// A handler route has no address to fall back to.
+		defer tunnelConn.Close()
+		log.Printf("[vtunnel-proxy] CONNECT %s: cleartext, but the route is served in process and this is not HTTP", connectAuthority)
 	default:
 		defer tunnelConn.Close()
-		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw pipe)", connectAuthority, mappedTarget)
-		if len(injectHeaders) > 0 {
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw pipe)", connectAuthority, rt.target)
+		if len(rt.headers) > 0 {
 			// Raw byte pipe can't inject headers; only HTTP/1.1-CONNECT h2c is terminated.
-			log.Printf("[vtunnel-proxy] WARNING: %s: %d header(s) NOT injected (raw pipe)", connectAuthority, len(injectHeaders))
+			log.Printf("[vtunnel-proxy] WARNING: %s: %d header(s) NOT injected (raw pipe)", connectAuthority, len(rt.headers))
 		}
-		dialAndPipe(mappedTarget, tunnelConn)
+		dialAndPipe(rt.target, tunnelConn)
 	}
 }
 
@@ -337,9 +482,10 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 // (x/internal/util/sniffing/sniffer_tls.go) and removes a whole class of
 // mismatch: previously the client was offered {h2, http/1.1} blind, so it could
 // pick h2 against an upstream that only speaks HTTP/1.1.
-func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority, target string, injectHeaders http.Header) {
+func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, rt route) {
 	log.Printf("[vtunnel-proxy] CONNECT MITM %s", connectAuthority)
 	connectHost := hostFromAuthority(connectAuthority)
+	target := rt.target
 	sniHost, upstreamIsTLS := p.tlsUpstreamHost(target)
 
 	base := &tls.Config{
@@ -396,10 +542,10 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority, target s
 	}()
 
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		p.serveInjectingH2(tlsConn, target, injectHeaders, up)
+		p.serveH2(tlsConn, rt, up)
 		return
 	}
-	p.serveMITMH1(tlsConn, target, injectHeaders, up)
+	p.serveH1(tlsConn, rt, up)
 }
 
 // httpALPN narrows an ALPN offer to the protocols this proxy can actually
@@ -549,25 +695,75 @@ func (p *MITMProxy) probeH2C(target string) bool {
 	return ok
 }
 
-// serveInjectingH2 serves an already-established HTTP/2 client connection —
-// TLS-terminated or cleartext h2c — and proxies each request to target with the
-// configured headers injected. It works on any net.Conn, so MITM'd TLS and raw
-// h2c share one path.
-func (p *MITMProxy) serveInjectingH2(clientConn net.Conn, target string, injectHeaders http.Header, up *upstreamTLSConn) {
-	var rt http.RoundTripper
-	scheme := "http"
+// serveH2 serves an already-established HTTP/2 client connection — TLS-terminated
+// or cleartext h2c — through the route's handler. It works on any net.Conn, so
+// MITM'd TLS and raw h2c share one path.
+func (p *MITMProxy) serveH2(clientConn net.Conn, rt route, up *upstreamTLSConn) {
+	h2srv := &http2.Server{}
+	h2srv.ServeConn(clientConn, &http2.ServeConnOpts{
+		Handler: p.routeHandler(rt, up, true),
+	})
+}
 
+// routeHandler turns a route into the handler that serves it: the caller's own
+// handler for an in-process route, or a reverse proxy to its target. Both are
+// wrapped in the configured middleware, so a Use hook sees every request the
+// proxy terminates regardless of where it ends up.
+func (p *MITMProxy) routeHandler(rt route, up *upstreamTLSConn, preferH2 bool) http.Handler {
+	var h http.Handler
+	if rt.handler != nil {
+		h = rt.handler
+	} else {
+		h = p.forwardingHandler(rt.target, up, preferH2)
+	}
+
+	inject := rt.headers
+	return p.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.RequestURI = ""
+		removeHopByHop(r.Header, preferH2)
+		injectConfiguredHeaders(r.Header, inject)
+		h.ServeHTTP(w, r)
+	}))
+}
+
+// forwardingHandler re-issues a decrypted request to target.
+func (p *MITMProxy) forwardingHandler(target string, up *upstreamTLSConn, preferH2 bool) http.Handler {
+	transport, scheme := p.upstreamTransport(target, up, preferH2)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.URL.Scheme = scheme
+		r.URL.Host = target
+
+		resp, err := transport.RoundTrip(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		// Trailer names have to be announced before the body when the client
+		// speaks HTTP/2.
+		for k := range resp.Trailer {
+			w.Header().Add("Trailer", k)
+		}
+		copyResponse(w, resp)
+	})
+}
+
+// upstreamTransport picks how to reach target and which scheme that implies.
+func (p *MITMProxy) upstreamTransport(target string, up *upstreamTLSConn, preferH2 bool) (http.RoundTripper, string) {
 	if up != nil {
 		// Upstream TLS is already up and negotiated; reuse it instead of
 		// handshaking a second time.
-		scheme = "https"
-		rt = p.upstreamRoundTripper(up)
-	} else if tlsHost, ok := p.tlsUpstreamHost(target); ok {
-		// Proxy-side TLS: connect to tunnel port, do TLS with real server's hostname.
-		scheme = "https"
+		return p.upstreamRoundTripper(up), "https"
+	}
+
+	if tlsHost, ok := p.tlsUpstreamHost(target); ok {
+		// Proxy-side TLS: dial the target, then handshake using the real
+		// server's hostname for SNI.
 		dialer := &net.Dialer{Timeout: dialTimeout}
 		transport := p.transport.Clone()
-		transport.ForceAttemptHTTP2 = true
+		transport.ForceAttemptHTTP2 = preferH2
 		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return dialer.DialContext(ctx, network, target)
 		}
@@ -579,119 +775,75 @@ func (p *MITMProxy) serveInjectingH2(clientConn net.Conn, target string, injectH
 			transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 		}
 		transport.TLSClientConfig.ServerName = tlsHost
-		transport.TLSClientConfig.NextProtos = []string{"h2", "http/1.1"}
+		if preferH2 {
+			transport.TLSClientConfig.NextProtos = []string{"h2", "http/1.1"}
+		} else {
+			transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		}
+		return transport, "https"
+	}
 
-		rt = transport
-	} else if p.probeH2C(target) {
-		rt = &http2.Transport{
+	if preferH2 && p.probeH2C(target) {
+		return &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 				return net.DialTimeout(network, addr, dialTimeout)
 			},
-		}
-	} else {
-		rt = &p.transport
+		}, "http"
 	}
 
-	h2srv := &http2.Server{}
-	h2srv.ServeConn(clientConn, &http2.ServeConnOpts{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			r.URL.Scheme = scheme
-			r.URL.Host = target
-			r.RequestURI = ""
-			removeHopByHop(r.Header, true)
-			injectConfiguredHeaders(r.Header, injectHeaders)
-
-			resp, err := rt.RoundTrip(r)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			defer resp.Body.Close()
-
-			for k, vv := range resp.Header {
-				for _, v := range vv {
-					w.Header().Add(k, v)
-				}
-			}
-			for k := range resp.Trailer {
-				w.Header().Add("Trailer", k)
-			}
-			removeHopByHop(w.Header(), false)
-			w.WriteHeader(resp.StatusCode)
-			flushingCopy(w, resp.Body)
-			forwardTrailers(w, resp)
-		}),
-	})
+	return &p.transport, "http"
 }
 
-func (p *MITMProxy) serveMITMH1(tlsConn *tls.Conn, target string, injectHeaders http.Header, up *upstreamTLSConn) {
-	var rt http.RoundTripper
-	upstreamIsTLS := true
+// serveH1 serves a decrypted HTTP/1.1 connection through net/http, which brings
+// keep-alive, chunking and trailer handling with it, and lets a handler route
+// and a forwarded one run through exactly the same code.
+func (p *MITMProxy) serveH1(clientConn net.Conn, rt route, up *upstreamTLSConn) {
+	ln := newOneShotListener(clientConn)
+	srv := &http.Server{Handler: p.routeHandler(rt, up, false)}
+	_ = srv.Serve(ln)
+}
 
-	if up != nil {
-		// Upstream TLS is already up and negotiated; reuse it.
-		rt = p.upstreamRoundTripper(up)
-	} else if tlsHost, ok := p.tlsUpstreamHost(target); ok {
-		// Proxy-side TLS: connect to tunnel port, do TLS with real server's hostname.
-		rt = &http.Transport{
-			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := net.DialTimeout(network, target, dialTimeout)
-				if err != nil {
-					return nil, err
-				}
-				tlsC := tls.Client(conn, &tls.Config{
-					ServerName: tlsHost,
-					NextProtos: []string{"http/1.1"},
-				})
-				if err := tlsC.HandshakeContext(ctx); err != nil {
-					conn.Close()
-					return nil, err
-				}
-				return tlsC, nil
-			},
-		}
-	} else {
-		rt = &p.transport
-		upstreamIsTLS = false
+// oneShotListener hands one already-established connection to net/http. The
+// second Accept blocks until that connection is done, so Serve does not return
+// while the connection is still being used.
+type oneShotListener struct {
+	conn net.Conn
+	once sync.Once
+	done chan struct{}
+}
+
+func newOneShotListener(conn net.Conn) *oneShotListener {
+	return &oneShotListener{conn: conn, done: make(chan struct{})}
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	var first net.Conn
+	l.once.Do(func() {
+		first = &notifyConn{Conn: l.conn, done: l.done}
+	})
+	if first != nil {
+		return first, nil
 	}
+	<-l.done
+	return nil, io.EOF
+}
 
-	br := bufio.NewReader(tlsConn)
-	for {
-		req, err := http.ReadRequest(br)
-		if err != nil {
-			return
-		}
+func (l *oneShotListener) Close() error { return nil }
 
-		if upstreamIsTLS {
-			req.URL.Scheme = "https"
-		} else {
-			req.URL.Scheme = "http"
-		}
-		req.URL.Host = target
-		req.RequestURI = ""
-		removeHopByHop(req.Header, false)
-		injectConfiguredHeaders(req.Header, injectHeaders)
+func (l *oneShotListener) Addr() net.Addr { return l.conn.LocalAddr() }
 
-		resp, err := rt.RoundTrip(req)
-		if err != nil {
-			resp = &http.Response{
-				StatusCode: http.StatusBadGateway,
-				Proto:      "HTTP/1.1",
-				ProtoMajor: 1,
-				ProtoMinor: 1,
-				Header:     make(http.Header),
-				Body:       http.NoBody,
-			}
-		}
+// notifyConn signals when net/http is finished with the connection.
+type notifyConn struct {
+	net.Conn
+	once sync.Once
+	done chan struct{}
+}
 
-		resp.Write(tlsConn)
-		resp.Body.Close()
-
-		if req.Close || resp.Close {
-			return
-		}
-	}
+func (c *notifyConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { close(c.done) })
+	return err
 }
 
 func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -704,15 +856,6 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		hostPort = net.JoinHostPort(hostPort, port)
 	}
 
-	if route, ok := p.resolveDomain(hostPort); ok && route.target != "" {
-		log.Printf("[vtunnel-proxy] %s %s %s -> %s", r.URL.Scheme, r.Method, hostPort, route.target)
-		r.URL.Host = route.target
-		r.URL.Scheme = "http"
-		// A targetless mapping is skipped above: with nothing to re-issue to,
-		// there is no request of ours to inject into.
-		injectConfiguredHeaders(r.Header, route.headers)
-	}
-
 	if r.URL.Scheme == "" {
 		r.URL.Scheme = "http"
 	}
@@ -722,17 +865,29 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Proto = "HTTP/1.1"
 	r.ProtoMajor = 1
 	r.ProtoMinor = 1
-	r.RequestURI = ""
-	removeHopByHop(r.Header, false)
 
-	resp, err := p.transport.RoundTrip(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+	rt, isRouted := p.resolveDomain(hostPort)
+	switch {
+	case !isRouted:
+		if unmapped := p.unmappedHandler(); unmapped != nil {
+			log.Printf("[vtunnel-proxy] %s %s: no route", r.Method, hostPort)
+			p.wrap(unmapped).ServeHTTP(w, r)
+			return
+		}
+		// Nothing routed and nothing to refuse with: send it where it asked to go.
+		rt = route{target: hostPort}
+	case rt.target == "" && rt.handler == nil:
+		// A Forward route is a pipe for TLS; in the clear there is nothing to
+		// pipe, so it behaves as "go to the host you asked for".
+		rt.target = hostPort
 	}
-	defer resp.Body.Close()
 
-	copyResponse(w, resp)
+	if rt.handler == nil {
+		log.Printf("[vtunnel-proxy] %s %s %s -> %s", r.URL.Scheme, r.Method, hostPort, rt.target)
+	} else {
+		log.Printf("[vtunnel-proxy] %s %s %s -> handled in process", r.URL.Scheme, r.Method, hostPort)
+	}
+	p.routeHandler(rt, nil, false).ServeHTTP(w, r)
 }
 
 // acceptConnectTunnel sends the CONNECT success response and returns a net.Conn

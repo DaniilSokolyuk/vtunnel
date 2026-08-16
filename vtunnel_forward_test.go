@@ -39,7 +39,7 @@ func TestDomainForwardHTTP(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("app.test", backend.Listener.Addr().String()); err != nil {
+	if err := client.Proxy().ForwardTo("app.test", backend.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -97,7 +97,7 @@ func TestDomainForwardCONNECT(t *testing.T) {
 	defer client.Close()
 
 	// Forward with explicit port
-	if err := client.ForwardTo("secure.test:443", echoLn.Addr().String()); err != nil {
+	if err := client.Proxy().ForwardTo("secure.test:443", echoLn.Addr().String()); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -149,7 +149,7 @@ func TestDomainForwardSameDomainTarget(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("google.com:443", "google.com:443"); err != nil {
+	if err := client.Proxy().ForwardTo("google.com:443", "google.com:443"); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -195,7 +195,7 @@ func TestDomainForwardHostnameOnly(t *testing.T) {
 	defer client.Close()
 
 	// Forward without port — should match :80 and :443
-	if err := client.ForwardTo("wild.test", backend.Listener.Addr().String()); err != nil {
+	if err := client.Proxy().ForwardTo("wild.test", backend.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -254,9 +254,9 @@ func TestDomainForwardMultipleSameTarget(t *testing.T) {
 	defer client.Close()
 
 	target := backend.Listener.Addr().String()
-	client.ForwardTo("a.test", target)
-	client.ForwardTo("b.test", target)
-	client.ForwardTo("c.test", target)
+	client.Proxy().ForwardTo("a.test", target)
+	client.Proxy().ForwardTo("b.test", target)
+	client.Proxy().ForwardTo("c.test", target)
 	time.Sleep(200 * time.Millisecond)
 
 	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
@@ -311,7 +311,7 @@ func TestDomainForwardReconnect(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("recon.test", backend.Listener.Addr().String()); err != nil {
+	if err := client.Proxy().ForwardTo("recon.test", backend.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)
@@ -374,7 +374,7 @@ func TestDomainForwardSameDomainTargetWithMitm(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("google.com:443", "google.com:443"); err != nil {
+	if err := client.Proxy().ForwardTo("google.com:443", "google.com:443"); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)

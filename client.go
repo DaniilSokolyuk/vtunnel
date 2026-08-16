@@ -43,12 +43,10 @@ type Client struct {
 	reconnectMax time.Duration
 	authSigner   ssh.Signer // nil = no auth
 
-	// Domain-based forwards (Forward method)
-	domainForwards map[string]*domainForward // domain -> forward config
-
-	// proxy is the controlplane-side MITM proxy. It holds every target, header
-	// and the MITM CA — none of which crosses the tunnel. The sandbox router
-	// chains allowlisted requests to it through routerPort.
+	// proxy is the controlplane-side MITM proxy and the single place routes are
+	// declared. It holds every target, header and the MITM CA — none of which
+	// crosses the tunnel; the sandbox is told domain names and nothing else.
+	// The sandbox router chains matching requests to it through routerPort.
 	//
 	// It listens on loopback because that is how tunnelled connections reach it:
 	// an incoming SSH channel is piped into a fresh TCP connection to this
@@ -57,17 +55,6 @@ type Client struct {
 	proxyStart sync.Once
 	proxyErr   error
 	routerPort int
-}
-
-// domainForward is the client-side record for a domain-based forward: where the
-// domain really points and which headers to inject. Neither ever leaves this
-// process — only the domain name is sent to the sandbox.
-//
-// An empty localAddr is the Forward case: route the domain to itself and never
-// terminate its TLS.
-type domainForward struct {
-	localAddr string
-	headers   http.Header
 }
 
 // Option configures a Client.
@@ -158,6 +145,18 @@ type ForwardOption func(*forwardConfig)
 
 type forwardConfig struct {
 	headers http.Header
+	sni     string
+}
+
+// WithSNI sets the server name the proxy presents when it opens TLS to the
+// forward's target, for upstreams whose certificate does not name the address
+// they are dialled at — behind a load balancer, or reached by IP.
+//
+//	proxy.ForwardTo("api.corp", "tls://10.0.0.7:443", vtunnel.WithSNI("api.corp"))
+func WithSNI(host string) ForwardOption {
+	return func(fc *forwardConfig) {
+		fc.sni = host
+	}
 }
 
 // WithHeader declares an HTTP header injected into every request this client
@@ -181,15 +180,14 @@ func WithHeader(name, value string) ForwardOption {
 func NewClient(wsURL string, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
-		wsURL:          wsURL,
-		forwards:       make(map[int]string),
-		domainForwards: make(map[string]*domainForward),
-		done:           make(chan struct{}),
-		ctx:            ctx,
-		cancel:         cancel,
-		keepAlive:      defaultKeepAlive,
-		reconnectMin:   defaultReconnectMin,
-		reconnectMax:   defaultReconnectMax,
+		wsURL:        wsURL,
+		forwards:     make(map[int]string),
+		done:         make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		keepAlive:    defaultKeepAlive,
+		reconnectMin: defaultReconnectMin,
+		reconnectMax: defaultReconnectMax,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -197,6 +195,11 @@ func NewClient(wsURL string, opts ...Option) *Client {
 	if c.proxy == nil {
 		c.proxy = NewMITMProxy()
 	}
+	// Routes are declared on the proxy; the client's job is to keep the sandbox
+	// in step with them. Subscribing here means a route added at any time — before
+	// Connect, or long after — reaches the sandbox without a second call.
+	c.proxy.OnChange(c.syncRoutes)
+
 	if c.authSigner == nil {
 		log.Println("[vtunnel-client] WARNING: No key configured. Authentication is DISABLED. Do NOT use in production! Use --key or VTUNNEL_KEY.")
 	}
@@ -229,99 +232,35 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 	return c.sendListen(sshConn, remotePort, localAddr)
 }
 
-// Forward registers a domain-based forward: the sandbox router allowlists the
-// domain and chains it through the tunnel to this client's proxy, which
-// resolves it to localAddr.
-//
-// The domain is routed to itself: the proxy dials the host the application
-// asked for and pipes bytes through, without terminating TLS. Nothing is
-// decrypted, so no CA is involved and upstreams that pin certificates work.
-//
-//	client.Forward("gitlab.corp") // reach the real gitlab.corp from here
-//
-// Use [Client.ForwardTo] to send a domain somewhere else, which is what makes
-// header injection possible. A wildcard has no single host to stand for, so it
-// only works with ForwardTo.
-func (c *Client) Forward(domain string) error {
-	if strings.Contains(domain, "*") {
-		return fmt.Errorf("forward %s: a wildcard has no host to stand for, use ForwardTo", domain)
+// syncRoutes brings the sandbox router in step with the proxy's routes. It runs
+// on connect and again whenever the proxy's routes change, which is how routes
+// declared on the proxy reach the sandbox without a second API to call.
+func (c *Client) syncRoutes() {
+	if len(c.proxy.Routes()) == 0 {
+		return
 	}
-	return c.forward(domain, "", nil)
-}
-
-// ForwardTo registers a domain-based forward that resolves to a different
-// address: the proxy terminates the application's TLS, re-issues the request to
-// target, and mirrors back the protocol target agreed to.
-//
-// target may be a plain address ("localhost:8080") or a TLS endpoint — either
-// ":443" or an explicit "tls://host:port" for TLS on another port. Pointing a
-// domain at its own real address is how you intercept it:
-//
-//	client.ForwardTo("api.corp", "api.corp:443", vtunnel.WithHeader("Authorization", token))
-//
-// Optional ForwardOptions declare headers (WithHeader) injected into requests
-// for this domain. Targets and headers are applied locally and never sent over
-// the tunnel — the sandbox only learns the domain name.
-func (c *Client) ForwardTo(domain, target string, opts ...ForwardOption) error {
-	if target == "" {
-		return fmt.Errorf("forward %s: empty target; use Forward to route a domain to itself", domain)
-	}
-	cfg := forwardConfig{}
-	for _, opt := range opts {
-		opt(&cfg)
-	}
-	return c.forward(domain, target, cfg.headers)
-}
-
-func (c *Client) forward(domain, localAddr string, headers http.Header) error {
-	c.mu.Lock()
-	c.domainForwards[domain] = &domainForward{localAddr: localAddr, headers: headers}
-	c.mu.Unlock()
-
-	c.applyForwardToProxy(domain, localAddr, headers)
-
-	log.Printf("[vtunnel-client] Requesting forward: %s -> %s", domain, localAddr)
-
 	if err := c.startProxy(); err != nil {
-		return err
+		log.Printf("[vtunnel-client] %v", err)
+		return
 	}
 
 	sshConn := c.getSSH()
 	if sshConn == nil {
-		return nil // will be replayed on reconnect
+		return // replayed once connected
 	}
-
-	return c.sendRouterListen(sshConn)
+	if err := c.sendRouterListen(sshConn); err != nil {
+		log.Printf("[vtunnel-client] Route sync failed: %v", err)
+	}
 }
 
-// Unforward drops a domain-based forward. The local proxy stops serving it and
-// the sandbox router stops allowlisting it, so its traffic goes direct again.
+// Proxy returns the controlplane-side proxy. Routes are declared on it, and
+// this client mirrors them into the sandbox:
 //
-// Forward and Unforward may be called any number of times while connected;
-// each one re-sends the full domain list, which the router applies wholesale.
-func (c *Client) Unforward(domain string) error {
-	c.mu.Lock()
-	_, existed := c.domainForwards[domain]
-	delete(c.domainForwards, domain)
-	c.mu.Unlock()
-
-	if !existed {
-		return nil
-	}
-	for _, key := range domainKeys(domain) {
-		c.proxy.RemoveDomainMapping(key)
-	}
-
-	log.Printf("[vtunnel-client] Dropping forward: %s", domain)
-
-	sshConn := c.getSSH()
-	if sshConn == nil {
-		return nil // will be replayed on reconnect
-	}
-	return c.sendRouterListen(sshConn)
-}
-
-// Proxy returns the controlplane-side proxy serving forwarded domains.
+//	client.Proxy().Handle("gitlab.corp", gitlabHandler)
+//	client.Proxy().Forward("nexus.corp")
+//
+// Changes take effect immediately while connected, and are replayed on
+// reconnect.
 func (c *Client) Proxy() *MITMProxy { return c.proxy }
 
 // startProxy brings the local proxy up once, on first use, on an ephemeral
@@ -338,23 +277,6 @@ func (c *Client) startProxy() error {
 		}
 	})
 	return c.proxyErr
-}
-
-// applyForwardToProxy configures the local proxy for one forward.
-func (c *Client) applyForwardToProxy(domain, localAddr string, headers http.Header) {
-	// An empty target is the mapping: the proxy dials the requested host and
-	// never terminates its TLS.
-	target, tlsHost, upstreamIsTLS := parseForwardTarget(localAddr)
-
-	for _, key := range domainKeys(domain) {
-		c.proxy.SetDomainMapping(key, target)
-		if headers != nil {
-			c.proxy.SetDomainHeaders(key, headers)
-		}
-	}
-	if upstreamIsTLS {
-		c.proxy.SetTLSUpstream(target, tlsHost)
-	}
 }
 
 // parseForwardTarget splits a forward target into a dialable address and, when
@@ -536,11 +458,9 @@ func (c *Client) sendListen(sshConn ssh.Conn, port int, localAddr string) error 
 // sendRouterListen asks the server for one tunnel port serving every forwarded
 // domain and points the sandbox router at it. Only domain names travel.
 func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
+	domains := c.proxy.Routes()
+
 	c.mu.RLock()
-	domains := make([]string, 0, len(c.domainForwards))
-	for domain := range c.domainForwards {
-		domains = append(domains, domain)
-	}
 	port := c.routerPort
 	c.mu.RUnlock()
 
@@ -637,10 +557,6 @@ func (c *Client) replayForwards() {
 	for port, addr := range c.forwards {
 		fwds[port] = addr
 	}
-	domFwds := make(map[string]*domainForward, len(c.domainForwards))
-	for domain, df := range c.domainForwards {
-		domFwds[domain] = df
-	}
 	c.mu.RUnlock()
 
 	sshConn := c.getSSH()
@@ -658,7 +574,7 @@ func (c *Client) replayForwards() {
 		}
 	}
 
-	if len(domFwds) > 0 {
+	if len(c.proxy.Routes()) > 0 {
 		if err := c.sendRouterListen(sshConn); err != nil {
 			log.Printf("[vtunnel-client] Re-forward failed: %v", err)
 		}

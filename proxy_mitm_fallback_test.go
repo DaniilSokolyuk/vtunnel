@@ -66,10 +66,9 @@ func TestProxyMITMHTTP2TLSUpstreamFallbackToHTTP11(t *testing.T) {
 		TLSClientConfig: &tls.Config{RootCAs: rootCAs},
 	}
 
-	target := upstream.Listener.Addr().String()
-	handler.SetDomainMapping("fallback.test:443", target)
-	// httptest TLS cert is issued for example.com.
-	handler.SetTLSUpstream(target, "example.com")
+	// httptest TLS cert is issued for example.com, so the SNI has to say so.
+	handler.ForwardTo("fallback.test:443", "tls://"+upstream.Listener.Addr().String(),
+		WithSNI("example.com"))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -35,7 +35,7 @@ import (
 func TestProxyConnectHTTP1H2CFallsBackFromMITM(t *testing.T) {
 	backendAddr := startH2CTrailerBackend(t, "h2c-fallback-ok")
 	proxy, proxyAddr := startMitmProxy(t)
-	proxy.SetDomainMapping("h2c-fallback.test:443", backendAddr)
+	proxy.ForwardTo("h2c-fallback.test:443", backendAddr)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestProxyConnectHTTP1H2CFallsBackFromMITM(t *testing.T) {
 func TestProxyConnectHTTP2H2CFallsBackFromMITM(t *testing.T) {
 	backendAddr := startH2CTrailerBackend(t, "h2-h2c-fallback-ok")
 	proxy, proxyAddr := startMitmProxy(t)
-	proxy.SetDomainMapping("h2-h2c-fallback.test:443", backendAddr)
+	proxy.ForwardTo("h2-h2c-fallback.test:443", backendAddr)
 
 	// HTTP/2 CONNECT to the proxy itself (RFC 8441 extended CONNECT via h2c).
 	h2t := &http2.Transport{
@@ -153,7 +153,7 @@ func TestProxyConnectTLSStillMITMAfterPeek(t *testing.T) {
 	t.Cleanup(backend.Close)
 
 	proxy, proxyAddr := startMitmProxy(t)
-	proxy.SetDomainMapping("tls-peek.test:443", backend.Listener.Addr().String())
+	proxy.ForwardTo("tls-peek.test:443", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -191,8 +191,8 @@ func TestProxyConnectH2CInjectsHeaders(t *testing.T) {
 	t.Cleanup(backend.Close)
 
 	proxy, proxyAddr := startMitmProxy(t)
-	proxy.SetDomainMapping("inject.test:443", backend.Listener.Addr().String())
-	proxy.SetDomainHeaders("inject.test:443", http.Header{"Authorization": []string{"Bearer secret"}})
+	proxy.ForwardTo("inject.test:443", backend.Listener.Addr().String(),
+		vtunnel.WithHeader("Authorization", "Bearer secret"))
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {
@@ -232,7 +232,7 @@ func TestProxyConnectH2CInjectsHeaders(t *testing.T) {
 func TestProxyConnectPeekErrorDoesNotWedgeProxy(t *testing.T) {
 	backendAddr := startH2CTrailerBackend(t, "still-alive")
 	proxy, proxyAddr := startMitmProxy(t)
-	proxy.SetDomainMapping("recover.test:443", backendAddr)
+	proxy.ForwardTo("recover.test:443", backendAddr)
 
 	// First client: CONNECT, read 200, close without any tunnel bytes → peek EOF.
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
@@ -285,7 +285,7 @@ func TestProxyConnectPeekErrorDoesNotWedgeProxy(t *testing.T) {
 func TestProxyConnectCleartext0x16IsNotMistakenForTLS(t *testing.T) {
 	backendAddr := startRawEchoBackend(t)
 	proxy, proxyAddr := startMitmProxy(t)
-	proxy.SetDomainMapping("raw16.test:443", backendAddr)
+	proxy.ForwardTo("raw16.test:443", backendAddr)
 
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
 	if err != nil {

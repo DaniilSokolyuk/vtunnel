@@ -254,20 +254,17 @@ func runClient(args []string) {
 
 	for _, f := range forwards {
 		if f.domain != "" {
-			var err error
+			// Routes live on the proxy; the client mirrors them into the sandbox.
 			if f.localAddr == "" {
 				// No target: route the domain to itself, TLS untouched.
-				err = client.Forward(f.domain)
-			} else {
-				var opts []vtunnel.ForwardOption
-				for _, h := range f.headers {
-					opts = append(opts, vtunnel.WithHeader(h.name, h.value))
-				}
-				err = client.ForwardTo(f.domain, f.localAddr, opts...)
+				client.Proxy().Forward(f.domain)
+				continue
 			}
-			if err != nil {
-				log.Fatalf("[vtunnel] Forward error for %s: %v", f.domain, err)
+			var opts []vtunnel.ForwardOption
+			for _, h := range f.headers {
+				opts = append(opts, vtunnel.WithHeader(h.name, h.value))
 			}
+			client.Proxy().ForwardTo(f.domain, f.localAddr, opts...)
 		} else {
 			if err := client.Listen(f.remotePort, f.localAddr); err != nil {
 				log.Fatalf("[vtunnel] Listen error for port %d: %v", f.remotePort, err)

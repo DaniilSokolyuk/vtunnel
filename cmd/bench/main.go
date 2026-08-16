@@ -151,14 +151,8 @@ func runProxy(srv *vtunnel.Server, client *vtunnel.Client, sinkLn, sourceLn net.
 	}
 	defer srv.CloseProxy()
 
-	if err := client.ForwardTo("sink.bench", sinkLn.Addr().String()); err != nil {
-		fmt.Printf("forward error: %v\n", err)
-		return
-	}
-	if err := client.ForwardTo("source.bench", sourceLn.Addr().String()); err != nil {
-		fmt.Printf("forward error: %v\n", err)
-		return
-	}
+	client.Proxy().ForwardTo("sink.bench", sinkLn.Addr().String())
+	client.Proxy().ForwardTo("source.bench", sourceLn.Addr().String())
 	time.Sleep(100 * time.Millisecond)
 
 	benchProxy("upload", totalBytes, numConns, proxyAddr,

@@ -81,7 +81,7 @@ func TestProxyMitmHTTP2PreservesTeTrailers(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("grpc-te.test:443", backend.Listener.Addr().String())
+	proxy.ForwardTo("grpc-te.test:443", backend.Listener.Addr().String())
 
 	conn, br := openHTTP1ConnectTunnel(t, proxyAddr, "grpc-te.test:443")
 	defer conn.Close()
@@ -151,7 +151,7 @@ func TestProxyMitmNoSNIIpLiteralUsesConnectAuthorityForCert(t *testing.T) {
 
 	targetIP := "203.0.113.10"
 	targetAuthority := net.JoinHostPort(targetIP, "443")
-	proxy.SetDomainMapping(targetAuthority, backend.Listener.Addr().String())
+	proxy.ForwardTo(targetAuthority, backend.Listener.Addr().String())
 
 	conn, br := openHTTP1ConnectTunnel(t, proxyAddr, targetAuthority)
 	defer conn.Close()

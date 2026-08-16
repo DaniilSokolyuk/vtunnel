@@ -49,7 +49,7 @@ func TestRouterChainsMappedAndBypassesUnmapped(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("mapped.test", mapped.Listener.Addr().String(),
+	if err := client.Proxy().ForwardTo("mapped.test", mapped.Listener.Addr().String(),
 		vtunnel.WithHeader("Authorization", "Bearer chained")); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	}
 
 	// First listen request: the authority now chains to a different backend.
-	if err := client.ForwardTo(decoyAuthority, chained.Listener.Addr().String()); err != nil {
+	if err := client.Proxy().ForwardTo(decoyAuthority, chained.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward decoyAuthority: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
@@ -149,7 +149,7 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	}
 
 	// Second listen request on the same tunnel port: both routes live.
-	if err := client.ForwardTo("bravo.test", bravo.Listener.Addr().String()); err != nil {
+	if err := client.Proxy().ForwardTo("bravo.test", bravo.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward bravo: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
@@ -162,12 +162,10 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 
 	// Third: dropping one route must restore direct egress for it while the
 	// other keeps working.
-	if err := client.Unforward(decoyAuthority); err != nil {
-		t.Fatalf("Unforward: %v", err)
-	}
+	client.Proxy().Remove(decoyAuthority)
 	time.Sleep(150 * time.Millisecond)
 	if got := getBody(t, httpClient, decoyURL); got != "decoy" {
-		t.Fatalf("after Unforward = %q, want decoy (direct egress restored)", got)
+		t.Fatalf("after Remove = %q, want decoy (direct egress restored)", got)
 	}
 	if got := getBody(t, httpClient, "https://bravo.test/"); got != "bravo" {
 		t.Fatalf("bravo after dropping the other route = %q", got)
@@ -199,7 +197,7 @@ func TestRouterWildcardThroughTunnel(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("*.wild.test", backend.Listener.Addr().String()); err != nil {
+	if err := client.Proxy().ForwardTo("*.wild.test", backend.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)

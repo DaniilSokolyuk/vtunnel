@@ -65,7 +65,7 @@ func TestProxyGitCloneHTTP(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("gitserver.test:80", gitAddr)
+	proxy.ForwardTo("gitserver.test:80", gitAddr)
 
 	cloneDir := filepath.Join(t.TempDir(), "clone")
 
@@ -111,7 +111,7 @@ func TestProxyGitCloneCONNECTMitm(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("gitsecure.test:443", gitAddr)
+	proxy.ForwardTo("gitsecure.test:443", gitAddr)
 
 	cloneDir := filepath.Join(t.TempDir(), "clone-mitm")
 
@@ -158,7 +158,7 @@ func TestProxyGitCloneCONNECTMitmHTTP2(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("gith2.test:443", gitAddr)
+	proxy.ForwardTo("gith2.test:443", gitAddr)
 
 	cloneDir := filepath.Join(t.TempDir(), "clone-mitm-h2")
 

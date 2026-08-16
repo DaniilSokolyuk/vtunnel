@@ -75,14 +75,11 @@ func TestProxyMitmHeaderInjection(t *testing.T) {
 			}
 			defer proxy.Close()
 
-			proxy.SetDomainMapping("api.test:443", backend.Listener.Addr().String())
-			if len(tc.configure) > 0 {
-				h := http.Header{}
-				for _, e := range tc.configure {
-					h.Add(e.name, e.value)
-				}
-				proxy.SetDomainHeaders("api.test:443", h)
+			var opts []vtunnel.ForwardOption
+			for _, e := range tc.configure {
+				opts = append(opts, vtunnel.WithHeader(e.name, e.value))
 			}
+			proxy.ForwardTo("api.test:443", backend.Listener.Addr().String(), opts...)
 
 			client := newMitmProxyClient(t, proxyAddr)
 			req, err := http.NewRequest(http.MethodGet, "https://api.test/", nil)
@@ -131,10 +128,8 @@ func TestProxyMitmDifferentHeadersPerForward(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("a.test:443", backendA.srv.Listener.Addr().String())
-	proxy.SetDomainHeaders("a.test:443", http.Header{"X-Who": []string{"alpha"}})
-	proxy.SetDomainMapping("b.test:443", backendB.srv.Listener.Addr().String())
-	proxy.SetDomainHeaders("b.test:443", http.Header{"X-Who": []string{"bravo"}})
+	proxy.ForwardTo("a.test:443", backendA.srv.Listener.Addr().String(), vtunnel.WithHeader("X-Who", "alpha"))
+	proxy.ForwardTo("b.test:443", backendB.srv.Listener.Addr().String(), vtunnel.WithHeader("X-Who", "bravo"))
 
 	client := newMitmProxyClient(t, proxyAddr)
 
@@ -169,8 +164,8 @@ func TestProxyPlainHTTPHeaderInjection(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("plain.test:80", b.srv.Listener.Addr().String())
-	proxy.SetDomainHeaders("plain.test:80", http.Header{"Authorization": []string{"Bearer plain"}})
+	proxy.ForwardTo("plain.test:80", b.srv.Listener.Addr().String(),
+		vtunnel.WithHeader("Authorization", "Bearer plain"))
 
 	proxyURL, _ := url.Parse("http://" + proxyAddr)
 	client := &http.Client{
@@ -222,12 +217,10 @@ func TestClientForwardWithHeader(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("api.test:443", b.srv.Listener.Addr().String(),
+	client.Proxy().ForwardTo("api.test:443", b.srv.Listener.Addr().String(),
 		vtunnel.WithHeader("Authorization", "Bearer e2e"),
 		vtunnel.WithHeader("X-Env", "preview"),
-	); err != nil {
-		t.Fatalf("Forward error: %v", err)
-	}
+	)
 	time.Sleep(100 * time.Millisecond)
 
 	// The application only ever sees the router.

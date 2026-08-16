@@ -73,9 +73,7 @@ func TestProxyPlainForwardPreservesGRPCTrailers(t *testing.T) {
 
 	const domain = "grpc-backend.example.test:50051"
 	upstreamHostPort := strings.TrimPrefix(upstream.URL, "http://")
-	if err := client.ForwardTo(domain, upstreamHostPort); err != nil {
-		t.Fatalf("Forward: %v", err)
-	}
+	client.Proxy().ForwardTo(domain, upstreamHostPort)
 	time.Sleep(200 * time.Millisecond)
 
 	// h2c client: cleartext HTTP/2 with prior knowledge, dialed at the proxy,

@@ -1,6 +1,7 @@
 package vtunnel_test
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -55,44 +56,61 @@ func Example_controlplane() {
 	}
 	defer client.Close()
 
-	// A private service, reached with a credential the sandbox never receives.
-	if err := client.ForwardTo("api.corp", "localhost:8081",
-		vtunnel.WithHeader("Authorization", "Bearer "+os.Getenv("API_TOKEN")),
-	); err != nil {
-		log.Fatal(err)
-	}
+	// Routes are declared on the proxy; the client mirrors their domains into
+	// the sandbox as they appear.
+	routes := client.Proxy()
 
-	// Passthrough: a :443 target is dialed over TLS, with the protocol the
-	// upstream really supports mirrored back to the application.
-	if err := client.ForwardTo("gitlab.corp", "gitlab.corp:443"); err != nil {
-		log.Fatal(err)
-	}
+	// A private service, reached with a credential the sandbox never receives.
+	routes.ForwardTo("api.corp", "localhost:8081",
+		vtunnel.WithHeader("Authorization", "Bearer "+os.Getenv("API_TOKEN")))
+
+	// Served from this process — no upstream connection, no second proxy.
+	routes.Handle("mock.corp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "hello from the controlplane")
+	}))
+
+	// Straight through to the real host: TLS is never terminated, so this works
+	// even against an upstream that pins certificates.
+	routes.Forward("gitlab.corp")
 
 	// Every subdomain to one service.
-	if err := client.ForwardTo("*.preview.corp", "localhost:8082"); err != nil {
-		log.Fatal(err)
-	}
+	routes.ForwardTo("*.preview.corp", "localhost:8082")
 
 	select {} // serve until killed
 }
 
-// Forwards can be changed while connected. Each call re-sends the full domain
-// list; the sandbox router replaces its allowlist with it.
-func ExampleClient_Unforward() {
+// Routes can be changed while connected: the sandbox is re-synced after every
+// change, so nothing else has to be called.
+func ExampleMITMProxy_Remove() {
 	client := vtunnel.NewClient("ws://sandbox:3001/")
 	if err := client.Connect(); err != nil {
 		log.Fatal(err)
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("api.corp", "localhost:8081"); err != nil {
-		log.Fatal(err)
-	}
+	client.Proxy().ForwardTo("api.corp", "localhost:8081")
 
 	// Later: stop serving it. api.corp now egresses from the sandbox directly.
-	if err := client.Unforward("api.corp"); err != nil {
-		log.Fatal(err)
-	}
+	client.Proxy().Remove("api.corp")
+}
+
+// Cross-cutting concerns — auth, audit, logging — attach once and wrap every
+// request the proxy terminates, whether it is handled here or forwarded on.
+func ExampleMITMProxy_Use() {
+	proxy := vtunnel.NewMITMProxy()
+
+	proxy.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("%s %s%s", r.Method, r.Host, r.URL.Path)
+			next.ServeHTTP(w, r)
+		})
+	})
+
+	// Refuse anything without a route, so a compromised sandbox cannot use this
+	// as an open relay. The default is to dial the requested host directly.
+	proxy.HandleUnmapped(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "unknown domain", http.StatusForbidden)
+	}))
 }
 
 // Raw TCP forwarding, with no HTTP or TLS handling: the server opens a port in

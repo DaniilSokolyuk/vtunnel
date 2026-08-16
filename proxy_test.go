@@ -38,7 +38,7 @@ func TestProxyPlainHTTPMapped(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("example.test:80", backend.Listener.Addr().String())
+	proxy.ForwardTo("example.test:80", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -92,7 +92,7 @@ func TestProxyConnectMapped(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("example.test:443", echoLn.Addr().String())
+	proxy.ForwardTo("example.test:443", echoLn.Addr().String())
 
 	conn, err := net.Dial("tcp", proxyAddr)
 	if err != nil {
@@ -153,7 +153,7 @@ func TestProxyHTTPSNoMitmFails(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("example.test:443", backend.Listener.Addr().String())
+	proxy.ForwardTo("example.test:443", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -192,7 +192,7 @@ func TestProxyHTTPSMitm(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("google.com:443", backend.Listener.Addr().String())
+	proxy.ForwardTo("google.com:443", backend.Listener.Addr().String())
 
 	proxyURL, err := url.Parse("http://" + proxyAddr)
 	if err != nil {
@@ -248,7 +248,7 @@ func TestProxyHTTP2PlainHTTP(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("example.test:80", backend.Listener.Addr().String())
+	proxy.ForwardTo("example.test:80", backend.Listener.Addr().String())
 
 	client := h2cClient(proxyAddr)
 
@@ -296,7 +296,7 @@ func TestProxyHTTP2Connect(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("echo.test:443", echoLn.Addr().String())
+	proxy.ForwardTo("echo.test:443", echoLn.Addr().String())
 
 	// HTTP/2 CONNECT via h2c
 	h2t := &http2.Transport{
@@ -350,7 +350,7 @@ func TestProxyHTTP2Mitm(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("secure.test:443", backend.Listener.Addr().String())
+	proxy.ForwardTo("secure.test:443", backend.Listener.Addr().String())
 
 	// HTTP/2 CONNECT to proxy via h2c, then TLS handshake inside the tunnel (MITM)
 	h2t := &http2.Transport{
@@ -426,7 +426,7 @@ func TestProxyMitmHTTP2Inner(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.SetDomainMapping("grpc.test:443", backend.Listener.Addr().String())
+	proxy.ForwardTo("grpc.test:443", backend.Listener.Addr().String())
 
 	// Connect to proxy, send CONNECT, get a raw tunnel
 	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)

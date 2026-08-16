@@ -98,10 +98,9 @@ func newMirrorTestProxy(t *testing.T, upstreamHTTP2 bool) (string, func()) {
 	proxy.certCache = certCache
 	proxy.transport = http.Transport{TLSClientConfig: &tls.Config{RootCAs: rootCAs}}
 
-	target := upstream.Listener.Addr().String()
-	proxy.SetDomainMapping("mirror.test:443", target)
-	// httptest TLS certs are issued for example.com.
-	proxy.SetTLSUpstream(target, "example.com")
+	// httptest TLS certs are issued for example.com, so the SNI has to say so.
+	proxy.ForwardTo("mirror.test:443", "tls://"+upstream.Listener.Addr().String(),
+		WithSNI("example.com"))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

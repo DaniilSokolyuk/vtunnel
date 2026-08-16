@@ -50,9 +50,7 @@ func TestProxyGrpcurlMITMTunnel(t *testing.T) {
 	defer client.Close()
 
 	target := grpcTestHost + ":443"
-	if err := client.ForwardTo(target, target); err != nil {
-		t.Fatalf("Forward: %v", err)
-	}
+	client.Proxy().ForwardTo(target, target)
 	time.Sleep(200 * time.Millisecond)
 
 	// Sanity check: plain HTTPS through MITM tunnel works.

@@ -74,9 +74,7 @@ func TestProxyHTTP_SSEStreamsEventByEvent(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.ForwardTo("sse.test", backend.Listener.Addr().String()); err != nil {
-		t.Fatalf("Forward: %v", err)
-	}
+	client.Proxy().ForwardTo("sse.test", backend.Listener.Addr().String())
 	time.Sleep(200 * time.Millisecond)
 
 	proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))

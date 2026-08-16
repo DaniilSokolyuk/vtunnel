@@ -35,9 +35,7 @@ func TestForwardWithoutTargetKeepsTLSEndToEnd(t *testing.T) {
 	routerAddr, ca, client, cleanup := startForwardFixture(t)
 	defer cleanup()
 
-	if err := client.Forward(authority); err != nil {
-		t.Fatalf("Forward: %v", err)
-	}
+	client.Proxy().Forward(authority)
 	time.Sleep(150 * time.Millisecond)
 
 	tlsConn := connectThroughRouter(t, routerAddr, authority, nil)
@@ -84,9 +82,7 @@ func TestForwardToMirrorsUpstreamALPN(t *testing.T) {
 
 			// An explicit tls:// target, because the upstream is TLS on a port
 			// that is not 443.
-			if err := client.ForwardTo("alpn.test:443", "tls://"+upstream.Listener.Addr().String()); err != nil {
-				t.Fatalf("ForwardTo: %v", err)
-			}
+			client.Proxy().ForwardTo("alpn.test:443", "tls://"+upstream.Listener.Addr().String())
 			time.Sleep(150 * time.Millisecond)
 
 			tlsConn := connectThroughRouter(t, routerAddr, "alpn.test:443", []string{"h2", "http/1.1"})
@@ -99,17 +95,21 @@ func TestForwardToMirrorsUpstreamALPN(t *testing.T) {
 	}
 }
 
-// A wildcard has no single host to stand for, so Forward must refuse it rather
-// than register a mapping that can never be dialled.
-func TestForwardRejectsWildcardWithoutTarget(t *testing.T) {
-	_, _, client, cleanup := startForwardFixture(t)
-	defer cleanup()
+// A wildcard Forward is fine: the host to dial comes from the request, not from
+// the pattern, so "let everything under this suffix through untouched" is one
+// call. A domain without a port covers both :80 and :443.
+func TestForwardWildcardRegistersBothPorts(t *testing.T) {
+	proxy := vtunnel.NewMITMProxy()
+	proxy.Forward("*.wild.test")
 
-	if err := client.Forward("*.wild.test"); err == nil {
-		t.Fatal("Forward accepted a wildcard with no target")
+	got := map[string]bool{}
+	for _, r := range proxy.Routes() {
+		got[r] = true
 	}
-	if err := client.ForwardTo("*.wild.test", ""); err == nil {
-		t.Fatal("ForwardTo accepted an empty target")
+	for _, want := range []string{"*.wild.test:80", "*.wild.test:443"} {
+		if !got[want] {
+			t.Fatalf("Routes() = %v, missing %s", proxy.Routes(), want)
+		}
 	}
 }
 
