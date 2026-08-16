@@ -461,7 +461,12 @@ Prints a fresh ed25519 pair: the private key for the client, the public key for 
 ### `-forward` formats
 
 ```bash
-# Passthrough: proxy → tunnel → client → real host as-is
+# Route the domain to itself, TLS untouched. No target means no interception,
+# which is what an upstream that pins certificates needs. -H does not apply.
+-forward gitlab.corp
+
+# Intercepted and re-issued to the real host — the form to use when you want
+# headers injected into it.
 -forward gitlab.corp=gitlab.corp:443
 
 # Route to a service on the controlplane

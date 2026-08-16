@@ -49,10 +49,10 @@ Client flags:
                     Port:   -forward 8080=localhost:3000
                     Domain: -forward llmproxy.local=localhost:8080
                     Real host: -forward gitlab.corp
-                            (no target = the domain itself; :443 over TLS)
+                            No target = route it to itself, TLS untouched.
+                            Use for upstreams that pin certificates; nothing
+                            is decrypted, so -H does not apply.
                     TLS:    -forward 8085=tls://www.google.com:443
-  -no-mitm          Route the preceding -forward but never terminate its TLS.
-                    For upstreams that pin certificates. Excludes -H.
   -H value          Inject HTTP header into requests for the preceding
   -header value     -forward (domain-flavored). Format "Name: Value".
                     Repeatable. Each -H attaches to the most recent -forward.
@@ -118,6 +118,43 @@ func loadOrCreateCA(path string) (tls.Certificate, error) {
 	return vtunnel.LoadCA(blob)
 }
 
+// certExportPath decides where the certificate half is written, and refuses to
+// name the CA pair itself.
+//
+// The default swaps the extension for .crt, which is right for the conventional
+// ca.pem and catastrophic for a CA already called ca.crt: the export would
+// overwrite the pair with a certificate-only file, destroying the private key.
+// There is no recovering from that — every sandbox trusting the CA needs a new
+// one — so it is refused rather than warned about.
+func certExportPath(caPath, out string) (string, error) {
+	path := out
+	if path == "" {
+		path = strings.TrimSuffix(caPath, filepath.Ext(caPath)) + ".crt"
+	}
+
+	if filepath.Clean(path) == filepath.Clean(caPath) || sameFile(path, caPath) {
+		return "", fmt.Errorf(
+			"refusing to write the certificate over the CA at %s: that would destroy its private key; "+
+				"pass -out with a different path, or name the pair something other than %s",
+			caPath, filepath.Base(caPath))
+	}
+	return path, nil
+}
+
+// sameFile reports whether two paths resolve to the same file on disk, which
+// plain string comparison misses across symlinks and hard links.
+func sameFile(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
 // runCA generates the MITM CA if it does not exist yet and writes its two
 // halves as separate files: the cert+key PEM to keep here, and the certificate
 // on its own to install in a sandbox. Running it again re-exports the
@@ -151,9 +188,9 @@ func runCA(args []string) {
 		return
 	}
 
-	certPath := *out
-	if certPath == "" {
-		certPath = strings.TrimSuffix(path, filepath.Ext(path)) + ".crt"
+	certPath, err := certExportPath(path, *out)
+	if err != nil {
+		log.Fatalf("[vtunnel] %v", err)
 	}
 	// 0644: this half is meant to be copied around and read by anything.
 	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {

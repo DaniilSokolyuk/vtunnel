@@ -1,6 +1,7 @@
 package vtunnel
 
 import (
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
@@ -70,14 +71,31 @@ func TestLoadCARejectsNonCA(t *testing.T) {
 	if err != nil {
 		t.Fatalf("signHost: %v", err)
 	}
-	if _, err := LoadCA(pemOf(t, leaf.Certificate[0])); err == nil {
+
+	// The leaf *and its key*. Handing over the certificate alone made LoadCA
+	// fail in tls.X509KeyPair for want of a key, so the test passed without ever
+	// reaching the IsCA check it exists to cover — deleting that check left it
+	// green.
+	blob := append(pemOf(t, leaf.Certificate[0]), keyPEMOf(t, leaf.PrivateKey)...)
+	if _, err := LoadCA(blob); err == nil {
 		t.Fatal("LoadCA accepted a leaf certificate as a CA")
+	} else if !strings.Contains(err.Error(), "CA") {
+		t.Fatalf("LoadCA failed for the wrong reason: %v", err)
 	}
 }
 
 func pemOf(t *testing.T, der []byte) []byte {
 	t.Helper()
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func keyPEMOf(t *testing.T, key crypto.PrivateKey) []byte {
+	t.Helper()
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshal key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 }
 
 // The leaf's signature algorithm is derived from the CA key rather than pinned,
@@ -263,4 +281,29 @@ func rsaTestCA(t *testing.T) tls.Certificate {
 		t.Fatalf("create RSA CA: %v", err)
 	}
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+// The leaf key is ECDSA, where there is no key transport for KeyEncipherment to
+// authorise. Harmless in practice, but strict validators object.
+func TestLeafKeyUsageSuitsAnECDSAKey(t *testing.T) {
+	ca := testCA(t, "leaf usage CA")
+	cache, err := newCertCache(ca)
+	if err != nil {
+		t.Fatalf("newCertCache: %v", err)
+	}
+	cert, _, err := cache.signHost("usage.test", time.Now())
+	if err != nil {
+		t.Fatalf("signHost: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse leaf: %v", err)
+	}
+
+	if leaf.KeyUsage&x509.KeyUsageDigitalSignature == 0 {
+		t.Error("leaf cannot sign; it is unusable for a TLS handshake")
+	}
+	if leaf.KeyUsage&x509.KeyUsageKeyEncipherment != 0 {
+		t.Error("KeyEncipherment is set on an ECDSA leaf, where nothing enciphers a key")
+	}
 }

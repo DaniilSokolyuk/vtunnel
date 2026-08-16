@@ -62,8 +62,10 @@
 //	routes.ForwardTo("api.corp", "localhost:8081",
 //	    vtunnel.WithHeader("Authorization", "Bearer "+token))
 //
-//	// Passthrough to the real host: a :443 target is dialed over TLS.
-//	routes.ForwardTo("gitlab.corp", "gitlab.corp:443")
+//	// Route it to itself with its TLS untouched — the only shape that works
+//	// against an upstream that pins certificates, and the one that cannot
+//	// carry an injected header.
+//	routes.Forward("gitlab.corp")
 //
 // [MITMProxy.ForwardTo], [MITMProxy.Handle], [MITMProxy.Forward] and
 // [MITMProxy.Remove] may be called at any time while connected; each call

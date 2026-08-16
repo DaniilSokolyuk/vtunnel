@@ -123,9 +123,16 @@ func dualStream(target net.Conn, clientReader io.Reader, clientWriter io.Writer)
 	go func() {
 		defer wg.Done()
 		flushingCopy(clientWriter, target)
+
+		// The error matters, not just whether the method exists. bufferedConn
+		// implements CloseWrite unconditionally and can only forward it when
+		// what it wraps is half-closable — over an HTTP/2 stream it used to
+		// report success having done nothing, and the fallback below, the only
+		// thing that would deliver EOF, was skipped.
 		if cw, ok := clientWriter.(closeWriter); ok {
-			cw.CloseWrite()
-			return
+			if err := cw.CloseWrite(); err == nil {
+				return
+			}
 		}
 		// An HTTP/2 CONNECT tunnel has no half-close: the response stream ends
 		// only when the handler returns, and the handler is still blocked on
@@ -201,18 +208,37 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	removeHopByHop(w.Header(), false)
+
+	// Announced after the hop-by-hop sweep, not before: Trailer is itself
+	// hop-by-hop, so an announcement written earlier is deleted by the sweep and
+	// never reaches the client. Announcing lets a client read the names from
+	// Trailer up front, the way the HTTP/2 mapping of gRPC expects.
+	announced := make(map[string]bool, len(resp.Trailer))
+	for k := range resp.Trailer {
+		w.Header().Add("Trailer", k)
+		announced[http.CanonicalHeaderKey(k)] = true
+	}
+
 	w.WriteHeader(resp.StatusCode)
 	flushingCopy(w, resp.Body)
-	forwardTrailers(w, resp)
+	forwardTrailers(w, resp, announced)
 }
 
-// forwardTrailers re-emits upstream response trailers (e.g. grpc-status)
-// after the body has been copied. Trailer names are unknown until the body
-// is drained, so they are sent unannounced via http.TrailerPrefix.
-func forwardTrailers(w http.ResponseWriter, resp *http.Response) {
+// forwardTrailers re-emits upstream response trailers (grpc-status and the
+// like) once the body has been copied, since their values are unknown until it
+// is drained.
+//
+// A name that was announced is set plainly; one that only appeared while the
+// body streamed was never declared, and the sole way to send it is unannounced
+// via http.TrailerPrefix.
+func forwardTrailers(w http.ResponseWriter, resp *http.Response, announced map[string]bool) {
 	for k, vv := range resp.Trailer {
+		name := k
+		if !announced[http.CanonicalHeaderKey(k)] {
+			name = http.TrailerPrefix + k
+		}
 		for _, v := range vv {
-			w.Header().Set(http.TrailerPrefix+k, v)
+			w.Header().Set(name, v)
 		}
 	}
 }
@@ -282,11 +308,17 @@ func (c *bufferedConn) Read(p []byte) (int, error) {
 // CloseWrite forwards TCP half-close to the wrapped conn, so dualStream's
 // closeWriter assertion still fires through the buffered wrapper (the embedded
 // net.Conn interface would otherwise hide the underlying *net.TCPConn's method).
+//
+// It reports an error rather than nil when the wrapped connection cannot
+// half-close — an HTTP/2 stream, for one. Claiming success there told
+// dualStream the shutdown had been delivered when nothing had happened, and the
+// peer waited for an EOF that was never coming.
 func (c *bufferedConn) CloseWrite() error {
-	if cw, ok := c.Conn.(closeWriter); ok {
-		return cw.CloseWrite()
+	cw, ok := c.Conn.(closeWriter)
+	if !ok {
+		return fmt.Errorf("half-close unsupported by %T", c.Conn)
 	}
-	return nil
+	return cw.CloseWrite()
 }
 
 var hopByHopHeaders = []string{

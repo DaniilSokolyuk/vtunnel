@@ -207,8 +207,11 @@ func (c *certCache) signHost(hostname string, now time.Time) (*tls.Certificate, 
 		Subject:      pkix.Name{CommonName: hostname},
 		NotBefore:    now.Add(-leafBackdate),
 		NotAfter:     notAfter,
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		// DigitalSignature only: the leaf key is ECDSA, and there is no key
+		// transport in ECDHE for KeyEncipherment to authorise. Setting it is
+		// harmless in practice but strict validators object.
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}
 
 	if ip := net.ParseIP(hostname); ip != nil {

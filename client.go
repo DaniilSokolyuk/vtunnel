@@ -54,6 +54,10 @@ type Client struct {
 	proxy      *MITMProxy
 	proxyStart sync.Once
 	proxyErr   error
+	// proxyOwned records that this client started the proxy, and may therefore
+	// stop it. One handed in through [WithProxy] and already serving belongs to
+	// the caller.
+	proxyOwned bool
 	routerPort int
 }
 
@@ -195,6 +199,21 @@ func NewClient(wsURL string, opts ...Option) *Client {
 	if c.proxy == nil {
 		c.proxy = NewMITMProxy()
 	}
+	// Refuse anything unrouted, unless the caller said otherwise.
+	//
+	// The tunnel port on the sandbox is pointed at this proxy as a whole, not at
+	// one forward target, and a process inside the sandbox that dials that port
+	// directly never passes through the Router or its allowlist. A proxy that
+	// dials whatever it is asked for would then hand the sandbox the
+	// controlplane's entire network — the cloud metadata endpoint included.
+	// Dialling on demand is the right default for a sandbox-side proxy and the
+	// wrong one here.
+	if c.proxy.unmappedHandler() == nil {
+		c.proxy.HandleUnmapped(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			log.Printf("[vtunnel-client] refused %s %s: not a forwarded domain", r.Method, r.Host)
+			http.Error(w, "vtunnel: not a forwarded domain", http.StatusForbidden)
+		}))
+	}
 	// Routes are declared on the proxy; the client's job is to keep the sandbox
 	// in step with them. Subscribing here means a route added at any time — before
 	// Connect, or long after — reaches the sandbox without a second call.
@@ -274,7 +293,9 @@ func (c *Client) startProxy() error {
 		}
 		if err := c.proxy.Start("127.0.0.1:0"); err != nil {
 			c.proxyErr = fmt.Errorf("start controlplane proxy: %w", err)
+			return
 		}
+		c.proxyOwned = true
 	})
 	return c.proxyErr
 }
@@ -316,6 +337,16 @@ func (c *Client) Close() error {
 	if sshConn != nil {
 		sshConn.Close()
 		c.setSSH(nil)
+	}
+
+	// The proxy holds every configured credential and listens on loopback, so
+	// leaving it up outlives the client it belonged to: the documented
+	// `defer client.Close()` would leak a listener per client, and anything
+	// local could still have headers injected on its behalf. Only the proxy
+	// this client started is stopped — one handed in through [WithProxy] and
+	// already serving belongs to the caller.
+	if c.proxyOwned {
+		c.proxy.Close()
 	}
 	return nil
 }
@@ -467,6 +498,16 @@ func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
 	if len(domains) == 0 && port == 0 {
 		return nil // nothing forwarded yet, and no route to clear
 	}
+
+	// The tunnel port is pointed at this address, so there is nothing to ask for
+	// without one. Reached whenever startProxy failed earlier — a taken port, a
+	// refused bind, a CA that would not load — and replayForwards came through
+	// here anyway on the next reconnect. Dereferencing the nil took down the
+	// whole controlplane: the reconnect goroutine has no recover.
+	proxyAddr := c.proxy.Addr()
+	if proxyAddr == nil {
+		return fmt.Errorf("controlplane proxy is not listening, so the sandbox has nowhere to chain to")
+	}
 	sort.Strings(domains) // stable payload, easier to diff in logs
 
 	payload := marshalJSON(listenRequest{Port: port, Domains: domains})
@@ -475,6 +516,15 @@ func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
 		return fmt.Errorf("forward request: %w", err)
 	}
 	if !ok {
+		// Drop the cached port. It is an ephemeral one the sandbox allocated
+		// last time, and a rejection usually means it is gone or taken by
+		// something else — asking for it again on every reconnect would keep
+		// failing forever, silently sending every forwarded domain straight out
+		// of the sandbox instead of through the tunnel.
+		c.mu.Lock()
+		delete(c.forwards, c.routerPort)
+		c.routerPort = 0
+		c.mu.Unlock()
 		return fmt.Errorf("forward rejected: %s", string(resp))
 	}
 
@@ -483,7 +533,7 @@ func (c *Client) sendRouterListen(sshConn ssh.Conn) error {
 		c.mu.Lock()
 		c.routerPort = reply.Port
 		// Tunnel channels for this port are piped into the local proxy.
-		c.forwards[reply.Port] = c.proxy.Addr().String()
+		c.forwards[reply.Port] = proxyAddr.String()
 		c.mu.Unlock()
 	}
 
@@ -557,14 +607,15 @@ func (c *Client) replayForwards() {
 	for port, addr := range c.forwards {
 		fwds[port] = addr
 	}
+	// Read under the same lock as the snapshot: it is written from
+	// sendRouterListen on another goroutine.
+	routerPort := c.routerPort
 	c.mu.RUnlock()
 
 	sshConn := c.getSSH()
 	if sshConn == nil {
 		return
 	}
-
-	routerPort := c.routerPort
 	for port, addr := range fwds {
 		if port == routerPort {
 			continue // replayed as one router listen below

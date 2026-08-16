@@ -35,6 +35,14 @@ const peekTimeout = 30 * time.Second
 // dialTimeout bounds every upstream dial the proxy makes.
 const dialTimeout = 10 * time.Second
 
+// mitmHandshakeTimeout bounds the client's TLS handshake once the peek deadline
+// has been cleared. Without it a client that sends a record header and then
+// stops holds a goroutine and a file descriptor for the life of the process:
+// peekTimeout only ever covered the wait for the first byte.
+//
+// A variable rather than a constant so tests need not wait it out.
+var mitmHandshakeTimeout = 30 * time.Second
+
 // noMITMTTL is how long a domain stays out of interception after refusing it.
 // Long enough not to retry a doomed handshake on every request, short enough
 // that fixing the cause — installing the CA in the client, giving the proxy a
@@ -74,6 +82,14 @@ type route struct {
 	handler http.Handler
 	target  string
 	headers http.Header
+	// tlsHost is the server name to present when opening TLS to target, empty
+	// when the target is reached in the clear.
+	//
+	// It lives on the route rather than in a map keyed by address because two
+	// routes may share an address and disagree about it — one tls://, one not —
+	// and a map could then hand the wrong answer to whichever asked second, or
+	// keep a stale mark alive after the route that set it was replaced.
+	tlsHost string
 }
 
 // terminates reports whether serving this route means decrypting the client's
@@ -112,15 +128,15 @@ type MITMProxy struct {
 	transport http.Transport
 	h2cProbed sync.Map // target → bool
 
-	// tlsUpstream tracks targets that need proxy-side TLS.
-	// Key: target address, Value: original hostname (for SNI).
-	tlsUpstream   map[string]string
-	tlsUpstreamMu sync.RWMutex
-
-	listener net.Listener
-	srv      *http.Server
-	done     chan struct{}
-	once     sync.Once
+	// lifecycleMu guards everything Start initialises. Addr, Close, Shutdown
+	// and closed all read these from other goroutines, so writing them bare was
+	// a race the detector catches — and reassigning the once overwrote the
+	// mutex inside it, possibly while stopAccepting held it.
+	lifecycleMu sync.Mutex
+	listener    net.Listener
+	srv         *http.Server
+	done        chan struct{}
+	once        sync.Once
 
 	// detached holds the connections the outer http.Server no longer manages:
 	// an HTTP/1.1 CONNECT is hijacked, and net/http stops tracking a connection
@@ -170,8 +186,10 @@ func WithMitmCA(cert tls.Certificate) MITMProxyOption {
 // NewMITMProxy creates a proxy with no routes.
 func NewMITMProxy(opts ...MITMProxyOption) *MITMProxy {
 	p := &MITMProxy{
-		routes:      make(map[string]route),
-		tlsUpstream: make(map[string]string),
+		routes: make(map[string]route),
+		// Built here rather than in Start: it is guarded by its own mutex, and
+		// initialising it there raced with a concurrent Close reading it.
+		detached: make(map[io.Closer]struct{}),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -197,25 +215,35 @@ func (p *MITMProxy) Start(addr string) error {
 		return fmt.Errorf("proxy listen on %s: %w", addr, err)
 	}
 
+	srv := &http.Server{Handler: h2cHandler}
+
+	p.lifecycleMu.Lock()
 	p.listener = ln
-	p.srv = &http.Server{Handler: h2cHandler}
+	p.srv = srv
 	p.done = make(chan struct{})
-	p.once = sync.Once{}
-	p.detached = make(map[io.Closer]struct{})
+	p.lifecycleMu.Unlock()
 
 	log.Printf("[vtunnel-proxy] Listening on %s", addr)
 
-	go p.srv.Serve(ln)
+	go srv.Serve(ln)
 
 	return nil
 }
 
+// lifecycle returns the state Start installed, as one consistent snapshot.
+func (p *MITMProxy) lifecycle() (net.Listener, *http.Server, chan struct{}) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	return p.listener, p.srv, p.done
+}
+
 // Addr returns the address the proxy listens on, or nil before Start.
 func (p *MITMProxy) Addr() net.Addr {
-	if p.listener == nil {
+	ln, _, _ := p.lifecycle()
+	if ln == nil {
 		return nil
 	}
-	return p.listener.Addr()
+	return ln.Addr()
 }
 
 // Close stops serving immediately: the listener goes down and every connection
@@ -226,10 +254,11 @@ func (p *MITMProxy) Addr() net.Addr {
 // Use [MITMProxy.Shutdown] to let in-flight requests finish first.
 func (p *MITMProxy) Close() {
 	p.stopAccepting()
-	if p.srv != nil {
-		p.srv.Close()
-	} else if p.listener != nil {
-		p.listener.Close()
+	ln, srv, _ := p.lifecycle()
+	if srv != nil {
+		srv.Close()
+	} else if ln != nil {
+		ln.Close()
 	}
 	p.closeDetached()
 	p.transport.CloseIdleConnections()
@@ -256,11 +285,12 @@ func (p *MITMProxy) Shutdown(ctx context.Context) error {
 		p.shutdownNested(ctx)
 	}()
 
+	ln, srv, _ := p.lifecycle()
 	var err error
-	if p.srv != nil {
-		err = p.srv.Shutdown(ctx)
-	} else if p.listener != nil {
-		p.listener.Close()
+	if srv != nil {
+		err = srv.Shutdown(ctx)
+	} else if ln != nil {
+		ln.Close()
 	}
 	<-nestedDone
 
@@ -329,8 +359,8 @@ func (p *MITMProxy) shutdownNested(ctx context.Context) {
 // closed() report true. Calling it before Start is a no-op.
 func (p *MITMProxy) stopAccepting() {
 	p.once.Do(func() {
-		if p.done != nil {
-			close(p.done)
+		if _, _, done := p.lifecycle(); done != nil {
+			close(done)
 		}
 	})
 }
@@ -339,8 +369,9 @@ func (p *MITMProxy) stopAccepting() {
 // proxy was never started — blocks forever in the select, so it reads as open,
 // which is what a standalone-but-unstarted proxy should look like.
 func (p *MITMProxy) closed() bool {
+	_, _, done := p.lifecycle()
 	select {
-	case <-p.done:
+	case <-done:
 		return true
 	default:
 		return false
@@ -436,10 +467,10 @@ func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) erro
 	if cfg.sni != "" {
 		tlsHost, upstreamIsTLS = cfg.sni, true
 	}
-	if upstreamIsTLS {
-		p.setTLSUpstream(addr, tlsHost)
+	if !upstreamIsTLS {
+		tlsHost = ""
 	}
-	p.setRoute(domain, route{target: addr, headers: cfg.headers}, addr)
+	p.setRoute(domain, route{target: addr, headers: cfg.headers, tlsHost: tlsHost}, addr)
 	return nil
 }
 
@@ -527,6 +558,9 @@ func (p *MITMProxy) setRoute(domain string, rt route, describe string) {
 	}
 	changed := p.onChange
 	p.domainMu.Unlock()
+
+	// Replacing a route can orphan a TLS mark too: the same domain pointed at a
+	// tls:// target a moment ago and at a cleartext one now.
 
 	log.Printf("[vtunnel-proxy] Route: %s -> %s", domain, describe)
 	if changed != nil {
@@ -668,24 +702,6 @@ func mitmRefused(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "remote error: tls:") &&
 		(strings.Contains(msg, "certificate") || strings.Contains(msg, "unknown ca"))
-}
-
-// setTLSUpstream records that target needs proxy-side TLS, using host as the
-// SNI name. This lets the proxy control ALPN on the upstream connection
-// instead of relying on TLS being terminated further down the path.
-func (p *MITMProxy) setTLSUpstream(target, host string) {
-	p.tlsUpstreamMu.Lock()
-	p.tlsUpstream[target] = host
-	p.tlsUpstreamMu.Unlock()
-}
-
-// tlsUpstreamHost returns the original hostname for a target that needs
-// proxy-side TLS (e.g. "google.com" for target "127.0.0.1:54321").
-func (p *MITMProxy) tlsUpstreamHost(target string) (string, bool) {
-	p.tlsUpstreamMu.RLock()
-	host, ok := p.tlsUpstream[target]
-	p.tlsUpstreamMu.RUnlock()
-	return host, ok
 }
 
 func (p *MITMProxy) resolveDomain(host string) (route, bool) {
@@ -884,7 +900,7 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 	log.Printf("[vtunnel-proxy] CONNECT MITM %s", connectAuthority)
 	connectHost := hostFromAuthority(connectAuthority)
 	target := rt.target
-	sniHost, upstreamIsTLS := p.tlsUpstreamHost(target)
+	sniHost, upstreamIsTLS := rt.tlsHost, rt.tlsHost != ""
 
 	base := &tls.Config{
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -893,6 +909,11 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 		// Both clones below inherit this, so the client half of every
 		// intercepted session is covered by one assignment.
 		KeyLogWriter: tlsKeyLogWriter(),
+		// The floor the mirroring below starts from. An upstream that negotiates
+		// no ALPN at all leaves nothing to mirror, and without this the proxy
+		// would answer ServerHello with no ALPN extension — which a client that
+		// requires one, gRPC among them, cannot use.
+		NextProtos: []string{"h2", "http/1.1"},
 	}
 
 	var up *upstreamTLSConn
@@ -919,7 +940,13 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 				if len(hello.SupportedProtos) > 0 && !slices.Contains(hello.SupportedProtos, proto) {
 					log.Printf("[vtunnel-proxy] MITM %s: client ALPN %v excludes upstream %q, translating",
 						connectAuthority, hello.SupportedProtos, proto)
-					mirrored.NextProtos = httpALPN(hello.SupportedProtos)
+					// Only when something survives the narrowing. A client
+					// offering nothing this proxy can carry would otherwise be
+					// answered with no ALPN at all, which is worse than being
+					// offered a protocol it did not ask for and refusing it.
+					if narrowed := httpALPN(hello.SupportedProtos); len(narrowed) > 0 {
+						mirrored.NextProtos = narrowed
+					}
 				}
 			}
 			return mirrored, nil
@@ -927,6 +954,12 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 	} else {
 		cfg.NextProtos = []string{"h2", "http/1.1"}
 	}
+
+	// The peek deadline was cleared once the tunnel kind was decided, so the
+	// handshake needs its own: it reads the rest of the ClientHello, and a peer
+	// that stops mid-record would otherwise block here indefinitely. Cleared
+	// again below so it cannot cut short the traffic that follows.
+	clientConn.SetDeadline(time.Now().Add(mitmHandshakeTimeout))
 
 	tlsConn := tls.Server(clientConn, cfg)
 	if err := tlsConn.Handshake(); err != nil {
@@ -941,6 +974,8 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 		clientConn.Close()
 		return
 	}
+	clientConn.SetDeadline(time.Time{}) // the traffic that follows sets its own pace
+
 	defer tlsConn.Close()
 	// Releases the pre-established upstream only if no request ever claimed it.
 	defer func() {
@@ -1074,6 +1109,15 @@ func (p *MITMProxy) dialTLSUpstream(ctx context.Context, target, sniHost string,
 		}
 		return nil, err
 	}
+
+	// Pin what this handshake settled on before the config is reused for a
+	// redial. The transport is chosen once, from the first connection's
+	// protocol; leaving the full offer in place lets a later connection
+	// negotiate something else — http/1.1 under an http2.Transport that is
+	// waiting for h2 — and the session breaks on reconnect rather than at setup.
+	if proto := conn.ConnectionState().NegotiatedProtocol; proto != "" {
+		cfg.NextProtos = []string{proto}
+	}
 	return &upstreamTLSConn{addr: target, cfg: cfg, conn: conn}, nil
 }
 
@@ -1181,7 +1225,7 @@ func (p *MITMProxy) upgradeHandler(authority string, rt route, up *upstreamTLSCo
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[vtunnel-proxy] %s %s -> %s (%s upgrade)", r.Method, authority, rt.target, r.Header.Get("Upgrade"))
 
-		upstream, err := p.dialUpstreamConn(r.Context(), rt.target, up)
+		upstream, err := p.dialUpstreamConn(r.Context(), rt, up)
 		if err != nil {
 			p.noteMITMFailure(authority, rt, err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -1197,7 +1241,8 @@ func (p *MITMProxy) upgradeHandler(authority string, rt route, up *upstreamTLSCo
 // dialUpstreamConn opens a raw connection to target, making the same choices
 // upstreamTransport does but handing back the connection itself: an upgrade is
 // spliced, not round-tripped, so there is nothing for a RoundTripper to do.
-func (p *MITMProxy) dialUpstreamConn(ctx context.Context, target string, up *upstreamTLSConn) (net.Conn, error) {
+func (p *MITMProxy) dialUpstreamConn(ctx context.Context, rt route, up *upstreamTLSConn) (net.Conn, error) {
+	target := rt.target
 	// A pre-established upstream is reusable only if it settled on HTTP/1.1.
 	// An upgrade cannot be expressed over h2, so an h2 connection is no use here
 	// and a fresh one is dialled instead.
@@ -1205,7 +1250,7 @@ func (p *MITMProxy) dialUpstreamConn(ctx context.Context, target string, up *ups
 		return up.dial(ctx)
 	}
 
-	tlsHost, upstreamIsTLS := p.tlsUpstreamHost(target)
+	tlsHost, upstreamIsTLS := rt.tlsHost, rt.tlsHost != ""
 
 	dialer := &net.Dialer{Timeout: dialTimeout}
 	raw, err := dialer.DialContext(ctx, "tcp", target)
@@ -1239,7 +1284,7 @@ func (p *MITMProxy) dialUpstreamConn(ctx context.Context, target string, up *ups
 // forwardingHandler re-issues a decrypted request to the route's target.
 func (p *MITMProxy) forwardingHandler(authority string, rt route, up *upstreamTLSConn, preferH2 bool) http.Handler {
 	target := rt.target
-	transport, scheme := p.upstreamTransport(target, up, preferH2)
+	transport, scheme := p.upstreamTransport(rt, up, preferH2)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.URL.Scheme = scheme
@@ -1258,24 +1303,23 @@ func (p *MITMProxy) forwardingHandler(authority string, rt route, up *upstreamTL
 		}
 		defer resp.Body.Close()
 
-		// Trailer names have to be announced before the body when the client
-		// speaks HTTP/2.
-		for k := range resp.Trailer {
-			w.Header().Add("Trailer", k)
-		}
+		// Trailers, announced and unannounced alike, are copyResponse's job:
+		// announcing here would put the names in the header map just before the
+		// hop-by-hop sweep inside it deleted them again.
 		copyResponse(w, resp)
 	})
 }
 
 // upstreamTransport picks how to reach target and which scheme that implies.
-func (p *MITMProxy) upstreamTransport(target string, up *upstreamTLSConn, preferH2 bool) (http.RoundTripper, string) {
+func (p *MITMProxy) upstreamTransport(rt route, up *upstreamTLSConn, preferH2 bool) (http.RoundTripper, string) {
+	target := rt.target
 	if up != nil {
 		// Upstream TLS is already up and negotiated; reuse it instead of
 		// handshaking a second time.
 		return p.upstreamRoundTripper(up), "https"
 	}
 
-	if tlsHost, ok := p.tlsUpstreamHost(target); ok {
+	if tlsHost := rt.tlsHost; tlsHost != "" {
 		// Proxy-side TLS: dial the target, then handshake using the real
 		// server's hostname for SNI.
 		dialer := &net.Dialer{Timeout: dialTimeout}

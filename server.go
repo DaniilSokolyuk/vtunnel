@@ -237,9 +237,15 @@ func (s *Server) handleListen(_ ssh.Conn, r *ssh.Request) {
 		if _, exists := s.listeners[port]; exists {
 			s.listenersMu.Unlock()
 			log.Printf("[vtunnel-server] Reusing listener on port %d", port)
-			// Routes are refreshed even on reuse: the client is authoritative
-			// and may have added or dropped domains since it last connected.
-			s.router.SetRoutes(port, req.Domains)
+			// Routes are refreshed on reuse — the client is authoritative and
+			// may have added or dropped domains since it last connected — but
+			// only when the request carries any. A plain port forward sends no
+			// domains, and if its ephemeral port ever collided with the router's
+			// this would clear the whole allowlist and send every forwarded
+			// domain straight out of the sandbox, quietly.
+			if len(req.Domains) > 0 {
+				s.router.SetRoutes(port, req.Domains)
+			}
 			r.Reply(true, marshalJSON(listenRequest{Port: port}))
 			return
 		}

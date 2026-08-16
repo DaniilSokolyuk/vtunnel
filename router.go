@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"sync"
+	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
@@ -30,13 +31,47 @@ type Router struct {
 	mu     sync.RWMutex
 
 	transport http.Transport
+	// chained holds one transport per tunnel port. Cloning per request looked
+	// harmless but leaked: the clone inherits a zero IdleConnTimeout, goes out
+	// of scope right after RoundTrip with nobody to call CloseIdleConnections,
+	// and its idle connection plus read and write goroutines then live until
+	// the process exits. Keep-alive never worked either — every request opened
+	// a fresh connection.
+	chained   map[int]*http.Transport
+	chainedMu sync.Mutex
 
-	listener net.Listener
-	once     sync.Once
+	// lifecycleMu guards what Start installs; Addr and Close read it from other
+	// goroutines. The once is created with the Router and never reassigned.
+	lifecycleMu sync.Mutex
+	listener    net.Listener
+	once        sync.Once
 }
 
+// connectReplyTimeout bounds the wait for a chained proxy to answer a CONNECT.
+// A variable rather than a constant so tests need not wait it out.
+var connectReplyTimeout = dialTimeout
+
 func newRouter() *Router {
-	return &Router{routes: make(map[string]int)}
+	return &Router{
+		routes:  make(map[string]int),
+		chained: make(map[int]*http.Transport),
+	}
+}
+
+// chainedTransport returns the transport that proxies through a tunnel port,
+// building it once per port.
+func (r *Router) chainedTransport(chainPort int) *http.Transport {
+	r.chainedMu.Lock()
+	defer r.chainedMu.Unlock()
+
+	if t, ok := r.chained[chainPort]; ok {
+		return t
+	}
+	proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(chainPort))}
+	t := r.transport.Clone()
+	t.Proxy = http.ProxyURL(proxyURL)
+	r.chained[chainPort] = t
+	return t
 }
 
 // Start begins serving on addr.
@@ -45,8 +80,9 @@ func (r *Router) Start(addr string) error {
 	if err != nil {
 		return fmt.Errorf("router listen on %s: %w", addr, err)
 	}
+	r.lifecycleMu.Lock()
 	r.listener = ln
-	r.once = sync.Once{}
+	r.lifecycleMu.Unlock()
 
 	log.Printf("[vtunnel-router] Listening on %s", addr)
 	go http.Serve(ln, h2c.NewHandler(r, &http2.Server{}))
@@ -55,19 +91,32 @@ func (r *Router) Start(addr string) error {
 
 // Addr returns the address the router listens on, or nil before Start.
 func (r *Router) Addr() net.Addr {
-	if r.listener == nil {
+	r.lifecycleMu.Lock()
+	ln := r.listener
+	r.lifecycleMu.Unlock()
+	if ln == nil {
 		return nil
 	}
-	return r.listener.Addr()
+	return ln.Addr()
 }
 
 // Close stops serving. It is safe to call more than once.
 func (r *Router) Close() {
 	r.once.Do(func() {
-		if r.listener != nil {
-			r.listener.Close()
+		r.lifecycleMu.Lock()
+		ln := r.listener
+		r.lifecycleMu.Unlock()
+		if ln != nil {
+			ln.Close()
 		}
 	})
+
+	r.transport.CloseIdleConnections()
+	r.chainedMu.Lock()
+	for _, t := range r.chained {
+		t.CloseIdleConnections()
+	}
+	r.chainedMu.Unlock()
 }
 
 // SetRoutes makes domains reachable through chainPort, replacing any routes
@@ -158,6 +207,13 @@ func (r *Router) chainConnect(w http.ResponseWriter, req *http.Request, hostPort
 	defer upstream.Close()
 	setTCPOptions(upstream)
 
+	// dialTimeout covers only the dial. Without a deadline here a controlplane
+	// that accepts TCP and then goes quiet — mid-reconnect, swapped out, a
+	// wedged hop — would block this read forever, and the promise in the
+	// comment below could never be kept. Cleared once the answer is in, so the
+	// tunnel itself is not on a clock.
+	upstream.SetDeadline(time.Now().Add(connectReplyTimeout))
+
 	if _, err := fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostPort, hostPort); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -176,6 +232,7 @@ func (r *Router) chainConnect(w http.ResponseWriter, req *http.Request, hostPort
 		http.Error(w, fmt.Sprintf("upstream proxy: %s", resp.Status), http.StatusBadGateway)
 		return
 	}
+	upstream.SetDeadline(time.Time{})
 
 	// br may already hold bytes the chained proxy sent after its 200.
 	upstreamConn := newBufferedConn(upstream, br)
@@ -253,10 +310,7 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		// Cleartext HTTP chains the same way, as an ordinary proxied request
 		// in absolute-URI form.
 		log.Printf("[vtunnel-router] %s %s -> tunnel port %d", req.Method, hostPort, chainPort)
-		proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(chainPort))}
-		chained := r.transport.Clone()
-		chained.Proxy = http.ProxyURL(proxyURL)
-		transport = chained
+		transport = r.chainedTransport(chainPort)
 	}
 
 	if req.URL.Scheme == "" {

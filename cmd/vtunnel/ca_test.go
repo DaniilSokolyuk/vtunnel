@@ -119,3 +119,60 @@ func statMode(t *testing.T, path string) os.FileMode {
 	}
 	return info.Mode().Perm()
 }
+
+// Review 2. `vtunnel ca -mitm-ca ca.crt` used to compute the export path by
+// swapping the extension for .crt — which, for a CA already named .crt, is the
+// same file. The certificate half then overwrote the pair, destroying the
+// private key with no warning and no way back: every sandbox trusting that CA
+// needs a new one.
+func TestCertExportPathNeverOverwritesTheCA(t *testing.T) {
+	dir := t.TempDir()
+
+	for _, tc := range []struct {
+		name    string
+		caPath  string
+		out     string
+		want    string
+		wantErr bool
+	}{
+		{
+			name:   "conventional pair name",
+			caPath: filepath.Join(dir, "ca.pem"),
+			want:   filepath.Join(dir, "ca.crt"),
+		},
+		{
+			name:   "explicit destination",
+			caPath: filepath.Join(dir, "ca.pem"),
+			out:    filepath.Join(dir, "elsewhere.crt"),
+			want:   filepath.Join(dir, "elsewhere.crt"),
+		},
+		{
+			name:    "CA already named .crt",
+			caPath:  filepath.Join(dir, "ca.crt"),
+			wantErr: true,
+		},
+		{
+			name:    "explicit destination is the CA itself",
+			caPath:  filepath.Join(dir, "ca.pem"),
+			out:     filepath.Join(dir, "ca.pem"),
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := certExportPath(tc.caPath, tc.out)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("certExportPath(%q, %q) = %q, want a refusal: it would destroy the key",
+						tc.caPath, tc.out, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("certExportPath(%q, %q): %v", tc.caPath, tc.out, err)
+			}
+			if got != tc.want {
+				t.Fatalf("certExportPath(%q, %q) = %q, want %q", tc.caPath, tc.out, got, tc.want)
+			}
+		})
+	}
+}
