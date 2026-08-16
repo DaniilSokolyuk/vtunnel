@@ -228,15 +228,5 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	removeHopByHop(w.Header(), false)
-	w.WriteHeader(resp.StatusCode)
-	// flushingCopy keeps SSE and other streaming responses arriving
-	// event-by-event instead of being batched at end-of-body.
-	flushingCopy(w, resp.Body)
-	forwardTrailers(w, resp)
+	copyResponse(w, resp)
 }

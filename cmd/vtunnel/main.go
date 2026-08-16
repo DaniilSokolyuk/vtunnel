@@ -48,7 +48,11 @@ Client flags:
   -forward value    Forward mapping (repeatable)
                     Port:   -forward 8080=localhost:3000
                     Domain: -forward llmproxy.local=localhost:8080
+                    Real host: -forward gitlab.corp
+                            (no target = the domain itself; :443 over TLS)
                     TLS:    -forward 8085=tls://www.google.com:443
+  -no-mitm          Route the preceding -forward but never terminate its TLS.
+                    For upstreams that pin certificates. Excludes -H.
   -H value          Inject HTTP header into requests for the preceding
   -header value     -forward (domain-flavored). Format "Name: Value".
                     Repeatable. Each -H attaches to the most recent -forward.
@@ -250,11 +254,18 @@ func runClient(args []string) {
 
 	for _, f := range forwards {
 		if f.domain != "" {
-			var opts []vtunnel.ForwardOption
-			for _, h := range f.headers {
-				opts = append(opts, vtunnel.WithHeader(h.name, h.value))
+			var err error
+			if f.localAddr == "" {
+				// No target: route the domain to itself, TLS untouched.
+				err = client.Forward(f.domain)
+			} else {
+				var opts []vtunnel.ForwardOption
+				for _, h := range f.headers {
+					opts = append(opts, vtunnel.WithHeader(h.name, h.value))
+				}
+				err = client.ForwardTo(f.domain, f.localAddr, opts...)
 			}
-			if err := client.Forward(f.domain, f.localAddr, opts...); err != nil {
+			if err != nil {
 				log.Fatalf("[vtunnel] Forward error for %s: %v", f.domain, err)
 			}
 		} else {
@@ -275,7 +286,7 @@ func runClient(args []string) {
 type forward struct {
 	remotePort int    // port-based forward (mutually exclusive with domain)
 	domain     string // domain-based forward (mutually exclusive with remotePort)
-	localAddr  string
+	localAddr  string // empty for a domain = route it to itself, TLS untouched
 	headers    []forwardHeader
 }
 
@@ -301,11 +312,19 @@ type forwardList []forward
 func (f *forwardList) String() string { return fmt.Sprintf("%v", *f) }
 
 func (f *forwardList) Set(val string) error {
-	parts := strings.SplitN(val, "=", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid forward format %q, expected port=localAddr or domain=localAddr", val)
+	left, right, hasTarget := strings.Cut(val, "=")
+	if !hasTarget {
+		// "-forward gitlab.corp": the domain stands for itself. A port form
+		// has nowhere to send its connections, so it still needs a target.
+		if _, err := strconv.Atoi(left); err == nil {
+			return fmt.Errorf("invalid forward %q: a port forward needs a target, e.g. %s=localhost:3000", val, left)
+		}
+		if strings.Contains(left, "*") {
+			return fmt.Errorf("invalid forward %q: a wildcard has no host to stand for, give it a target", val)
+		}
+		*f = append(*f, forward{domain: left})
+		return nil
 	}
-	left, right := parts[0], parts[1]
 	if port, err := strconv.Atoi(left); err == nil {
 		*f = append(*f, forward{remotePort: port, localAddr: right})
 	} else {
@@ -340,6 +359,10 @@ func (h *headerList) Set(val string) error {
 	value = strings.TrimSpace(value)
 	if name == "" {
 		return fmt.Errorf("-H/-header %q: empty header name", val)
+	}
+	if last.localAddr == "" {
+		return fmt.Errorf("-H %q: %s has no target, so its TLS is never terminated and there is nothing to inject into; give it one, e.g. -forward %s=%s:443",
+			val, last.domain, last.domain, last.domain)
 	}
 	last.headers = append(last.headers, forwardHeader{name: name, value: value})
 	return nil

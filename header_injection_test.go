@@ -222,7 +222,7 @@ func TestClientForwardWithHeader(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.Forward("api.test:443", b.srv.Listener.Addr().String(),
+	if err := client.ForwardTo("api.test:443", b.srv.Listener.Addr().String(),
 		vtunnel.WithHeader("Authorization", "Bearer e2e"),
 		vtunnel.WithHeader("X-Env", "preview"),
 	); err != nil {

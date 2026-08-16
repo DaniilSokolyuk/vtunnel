@@ -50,7 +50,7 @@ func TestProxyGrpcurlMITMTunnel(t *testing.T) {
 	defer client.Close()
 
 	target := grpcTestHost + ":443"
-	if err := client.Forward(target, target); err != nil {
+	if err := client.ForwardTo(target, target); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)

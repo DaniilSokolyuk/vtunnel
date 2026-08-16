@@ -62,6 +62,9 @@ type Client struct {
 // domainForward is the client-side record for a domain-based forward: where the
 // domain really points and which headers to inject. Neither ever leaves this
 // process — only the domain name is sent to the sandbox.
+//
+// An empty localAddr is the Forward case: route the domain to itself and never
+// terminate its TLS.
 type domainForward struct {
 	localAddr string
 	headers   http.Header
@@ -230,24 +233,52 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 // domain and chains it through the tunnel to this client's proxy, which
 // resolves it to localAddr.
 //
-// localAddr may be a plain address ("localhost:8080"), a TLS endpoint
-// ("gitlab.corp:443", or an explicit "tls://host:port"), in which case the
-// proxy speaks TLS to it and mirrors the negotiated protocol back down.
+// The domain is routed to itself: the proxy dials the host the application
+// asked for and pipes bytes through, without terminating TLS. Nothing is
+// decrypted, so no CA is involved and upstreams that pin certificates work.
+//
+//	client.Forward("gitlab.corp") // reach the real gitlab.corp from here
+//
+// Use [Client.ForwardTo] to send a domain somewhere else, which is what makes
+// header injection possible. A wildcard has no single host to stand for, so it
+// only works with ForwardTo.
+func (c *Client) Forward(domain string) error {
+	if strings.Contains(domain, "*") {
+		return fmt.Errorf("forward %s: a wildcard has no host to stand for, use ForwardTo", domain)
+	}
+	return c.forward(domain, "", nil)
+}
+
+// ForwardTo registers a domain-based forward that resolves to a different
+// address: the proxy terminates the application's TLS, re-issues the request to
+// target, and mirrors back the protocol target agreed to.
+//
+// target may be a plain address ("localhost:8080") or a TLS endpoint — either
+// ":443" or an explicit "tls://host:port" for TLS on another port. Pointing a
+// domain at its own real address is how you intercept it:
+//
+//	client.ForwardTo("api.corp", "api.corp:443", vtunnel.WithHeader("Authorization", token))
 //
 // Optional ForwardOptions declare headers (WithHeader) injected into requests
 // for this domain. Targets and headers are applied locally and never sent over
 // the tunnel — the sandbox only learns the domain name.
-func (c *Client) Forward(domain, localAddr string, opts ...ForwardOption) error {
+func (c *Client) ForwardTo(domain, target string, opts ...ForwardOption) error {
+	if target == "" {
+		return fmt.Errorf("forward %s: empty target; use Forward to route a domain to itself", domain)
+	}
 	cfg := forwardConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
+	return c.forward(domain, target, cfg.headers)
+}
 
+func (c *Client) forward(domain, localAddr string, headers http.Header) error {
 	c.mu.Lock()
-	c.domainForwards[domain] = &domainForward{localAddr: localAddr, headers: cfg.headers}
+	c.domainForwards[domain] = &domainForward{localAddr: localAddr, headers: headers}
 	c.mu.Unlock()
 
-	c.applyForwardToProxy(domain, localAddr, cfg.headers)
+	c.applyForwardToProxy(domain, localAddr, headers)
 
 	log.Printf("[vtunnel-client] Requesting forward: %s -> %s", domain, localAddr)
 
@@ -311,7 +342,10 @@ func (c *Client) startProxy() error {
 
 // applyForwardToProxy configures the local proxy for one forward.
 func (c *Client) applyForwardToProxy(domain, localAddr string, headers http.Header) {
+	// An empty target is the mapping: the proxy dials the requested host and
+	// never terminates its TLS.
 	target, tlsHost, upstreamIsTLS := parseForwardTarget(localAddr)
+
 	for _, key := range domainKeys(domain) {
 		c.proxy.SetDomainMapping(key, target)
 		if headers != nil {

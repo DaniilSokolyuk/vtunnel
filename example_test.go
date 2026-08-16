@@ -56,7 +56,7 @@ func Example_controlplane() {
 	defer client.Close()
 
 	// A private service, reached with a credential the sandbox never receives.
-	if err := client.Forward("api.corp", "localhost:8081",
+	if err := client.ForwardTo("api.corp", "localhost:8081",
 		vtunnel.WithHeader("Authorization", "Bearer "+os.Getenv("API_TOKEN")),
 	); err != nil {
 		log.Fatal(err)
@@ -64,12 +64,12 @@ func Example_controlplane() {
 
 	// Passthrough: a :443 target is dialed over TLS, with the protocol the
 	// upstream really supports mirrored back to the application.
-	if err := client.Forward("gitlab.corp", "gitlab.corp:443"); err != nil {
+	if err := client.ForwardTo("gitlab.corp", "gitlab.corp:443"); err != nil {
 		log.Fatal(err)
 	}
 
 	// Every subdomain to one service.
-	if err := client.Forward("*.preview.corp", "localhost:8082"); err != nil {
+	if err := client.ForwardTo("*.preview.corp", "localhost:8082"); err != nil {
 		log.Fatal(err)
 	}
 
@@ -85,7 +85,7 @@ func ExampleClient_Unforward() {
 	}
 	defer client.Close()
 
-	if err := client.Forward("api.corp", "localhost:8081"); err != nil {
+	if err := client.ForwardTo("api.corp", "localhost:8081"); err != nil {
 		log.Fatal(err)
 	}
 

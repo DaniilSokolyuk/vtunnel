@@ -74,7 +74,7 @@ func TestProxyHTTP_SSEStreamsEventByEvent(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.Forward("sse.test", backend.Listener.Addr().String()); err != nil {
+	if err := client.ForwardTo("sse.test", backend.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(200 * time.Millisecond)

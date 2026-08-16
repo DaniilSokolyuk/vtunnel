@@ -42,6 +42,18 @@ const dialTimeout = 10 * time.Second
 //
 // The type owns all of its routing state and depends on neither Server nor
 // Client, so it can run on either side of a tunnel.
+// domainRoute is what a mapped domain resolves to.
+//
+// An empty target means the domain is routed to itself: the proxy dials the
+// host the client asked for and pipes bytes, without terminating TLS. That is
+// the only way to serve upstreams that pin certificates, and it needs no CA.
+// A non-empty target means the request is decrypted and re-issued, which is
+// what makes header injection possible.
+type domainRoute struct {
+	target  string
+	headers http.Header
+}
+
 type MITMProxy struct {
 	domainMap     map[string]string
 	domainHeaders map[string]http.Header // same keys as domainMap
@@ -169,6 +181,13 @@ func (p *MITMProxy) SetDomainHeaders(domain string, headers http.Header) {
 	log.Printf("[vtunnel-proxy] Domain headers set: %s (%d)", domain, len(headers))
 }
 
+// SetTransportTLSConfig sets the TLS settings used for upstream connections —
+// extra root CAs for privately signed upstreams, or a client certificate for
+// mutual TLS. Call it before Start.
+func (p *MITMProxy) SetTransportTLSConfig(cfg *tls.Config) {
+	p.transport.TLSClientConfig = cfg
+}
+
 // SetTLSUpstream records that target needs proxy-side TLS, using host as the
 // SNI name. This lets the proxy control ALPN on the upstream connection
 // instead of relying on TLS being terminated further down the path.
@@ -187,15 +206,18 @@ func (p *MITMProxy) tlsUpstreamHost(target string) (string, bool) {
 	return host, ok
 }
 
-func (p *MITMProxy) resolveDomain(host string) (string, http.Header, bool) {
+func (p *MITMProxy) resolveDomain(host string) (domainRoute, bool) {
 	p.domainMu.RLock()
 	defer p.domainMu.RUnlock()
 
 	pattern, ok := bestDomainMatch(p.domainMap, host)
 	if !ok {
-		return "", nil, false
+		return domainRoute{}, false
 	}
-	return p.domainMap[pattern], p.domainHeaders[pattern], true
+	return domainRoute{
+		target:  p.domainMap[pattern],
+		headers: p.domainHeaders[pattern],
+	}, true
 }
 
 func (p *MITMProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -213,20 +235,24 @@ func (p *MITMProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check domain mapping
-	mapped, injectHeaders, isMapped := p.resolveDomain(hostPort)
+	route, isMapped := p.resolveDomain(hostPort)
 
-	// A mapped domain may carry cleartext h2c gRPC, not only TLS.
-	if p.certCache != nil && isMapped {
-		p.handleConnectMITM(w, r, hostPort, mapped, injectHeaders)
+	// A mapped domain may carry cleartext h2c gRPC, not only TLS. A mapping
+	// with no target is routed to the host itself and never terminated.
+	if p.certCache != nil && isMapped && route.target != "" {
+		p.handleConnectMITM(w, r, hostPort, route.target, route.headers)
 		return
 	}
 
 	// Tunnel path: dial target and pipe bytes
 	target := hostPort
-	if isMapped {
-		log.Printf("[vtunnel-proxy] CONNECT %s -> %s", hostPort, mapped)
-		target = mapped
-	} else {
+	switch {
+	case isMapped && route.target != "":
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s", hostPort, route.target)
+		target = route.target
+	case isMapped:
+		log.Printf("[vtunnel-proxy] CONNECT %s -> itself (TLS untouched)", hostPort)
+	default:
 		log.Printf("[vtunnel-proxy] CONNECT %s -> direct", hostPort)
 	}
 
@@ -678,11 +704,13 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		hostPort = net.JoinHostPort(hostPort, port)
 	}
 
-	if mapped, injectHeaders, ok := p.resolveDomain(hostPort); ok {
-		log.Printf("[vtunnel-proxy] %s %s %s -> %s", r.URL.Scheme, r.Method, hostPort, mapped)
-		r.URL.Host = mapped
+	if route, ok := p.resolveDomain(hostPort); ok && route.target != "" {
+		log.Printf("[vtunnel-proxy] %s %s %s -> %s", r.URL.Scheme, r.Method, hostPort, route.target)
+		r.URL.Host = route.target
 		r.URL.Scheme = "http"
-		injectConfiguredHeaders(r.Header, injectHeaders)
+		// A targetless mapping is skipped above: with nothing to re-issue to,
+		// there is no request of ours to inject into.
+		injectConfiguredHeaders(r.Header, route.headers)
 	}
 
 	if r.URL.Scheme == "" {
@@ -704,19 +732,7 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	removeHopByHop(w.Header(), false)
-	w.WriteHeader(resp.StatusCode)
-	// flushingCopy preserves event-by-event delivery for streaming responses
-	// (text/event-stream from LLM proxies, gRPC-web, long-poll endpoints).
-	// Plain io.Copy leaves the http.ResponseWriter's bufio buffer un-flushed
-	// between writes, batching SSE events into one chunk at end-of-body.
-	flushingCopy(w, resp.Body)
-	forwardTrailers(w, resp)
+	copyResponse(w, resp)
 }
 
 // acceptConnectTunnel sends the CONNECT success response and returns a net.Conn

@@ -49,7 +49,7 @@ func TestRouterChainsMappedAndBypassesUnmapped(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.Forward("mapped.test", mapped.Listener.Addr().String(),
+	if err := client.ForwardTo("mapped.test", mapped.Listener.Addr().String(),
 		vtunnel.WithHeader("Authorization", "Bearer chained")); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	}
 
 	// First listen request: the authority now chains to a different backend.
-	if err := client.Forward(decoyAuthority, chained.Listener.Addr().String()); err != nil {
+	if err := client.ForwardTo(decoyAuthority, chained.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward decoyAuthority: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
@@ -149,7 +149,7 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	}
 
 	// Second listen request on the same tunnel port: both routes live.
-	if err := client.Forward("bravo.test", bravo.Listener.Addr().String()); err != nil {
+	if err := client.ForwardTo("bravo.test", bravo.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward bravo: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
@@ -199,7 +199,7 @@ func TestRouterWildcardThroughTunnel(t *testing.T) {
 	}
 	defer client.Close()
 
-	if err := client.Forward("*.wild.test", backend.Listener.Addr().String()); err != nil {
+	if err := client.ForwardTo("*.wild.test", backend.Listener.Addr().String()); err != nil {
 		t.Fatalf("Forward: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)

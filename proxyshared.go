@@ -124,6 +124,15 @@ func dualStream(target net.Conn, clientReader io.Reader, clientWriter io.Writer)
 		flushingCopy(clientWriter, target)
 		if cw, ok := clientWriter.(closeWriter); ok {
 			cw.CloseWrite()
+			return
+		}
+		// An HTTP/2 CONNECT tunnel has no half-close: the response stream ends
+		// only when the handler returns, and the handler is still blocked on
+		// the other direction. Closing the request body unblocks it so the
+		// handler can return — which is what finally delivers EOF to the
+		// client. Without this the upstream can close and the client hangs.
+		if rc, ok := clientReader.(io.Closer); ok {
+			rc.Close()
 		}
 	}()
 	go func() {
@@ -174,6 +183,26 @@ func flushingCopy(dst io.Writer, src io.Reader) {
 			return
 		}
 	}
+}
+
+// copyResponse writes an upstream response back to the client: headers, status,
+// body and trailers. Both proxies end their plain-HTTP path here so streaming
+// behaviour cannot drift between them.
+//
+// flushingCopy preserves event-by-event delivery for streaming responses
+// (text/event-stream from LLM proxies, gRPC-web, long-poll endpoints). Plain
+// io.Copy leaves the http.ResponseWriter's bufio buffer un-flushed between
+// writes, batching SSE events into one chunk at end-of-body.
+func copyResponse(w http.ResponseWriter, resp *http.Response) {
+	for k, vv := range resp.Header {
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	removeHopByHop(w.Header(), false)
+	w.WriteHeader(resp.StatusCode)
+	flushingCopy(w, resp.Body)
+	forwardTrailers(w, resp)
 }
 
 // forwardTrailers re-emits upstream response trailers (e.g. grpc-status)

@@ -151,11 +151,11 @@ func runProxy(srv *vtunnel.Server, client *vtunnel.Client, sinkLn, sourceLn net.
 	}
 	defer srv.CloseProxy()
 
-	if err := client.Forward("sink.bench", sinkLn.Addr().String()); err != nil {
+	if err := client.ForwardTo("sink.bench", sinkLn.Addr().String()); err != nil {
 		fmt.Printf("forward error: %v\n", err)
 		return
 	}
-	if err := client.Forward("source.bench", sourceLn.Addr().String()); err != nil {
+	if err := client.ForwardTo("source.bench", sourceLn.Addr().String()); err != nil {
 		fmt.Printf("forward error: %v\n", err)
 		return
 	}
