@@ -57,11 +57,45 @@ func serveYamux(conn net.Conn, cfg Config) (Session, error) {
 	return muxSession{s}, nil
 }
 
-// muxSession is yamux with the one method it is missing. Open, Accept and
-// Close are already the shapes this package asks for.
+// muxSession is yamux with the one method it is missing, and streams that can
+// say "I am done writing" without also saying "I am done".
 type muxSession struct{ *yamux.Session }
 
 func (m muxSession) Wait() error {
 	<-m.CloseChan()
 	return io.EOF
 }
+
+func (m muxSession) Open() (net.Conn, error) {
+	stream, err := m.Session.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+	return muxStream{stream}, nil
+}
+
+func (m muxSession) Accept() (net.Conn, error) {
+	stream, err := m.Session.AcceptStream()
+	if err != nil {
+		return nil, err
+	}
+	return muxStream{stream}, nil
+}
+
+// muxStream gives a yamux stream the CloseWrite every other stream in this
+// package has.
+//
+// A forwarded connection is half-closable at both ends — a TCP socket on one
+// side, an SSH channel or this on the other — and the tunnel is the only thing
+// in the middle. Whoever cannot pass a FIN along as a FIN turns "I have
+// finished asking" into "I have finished", which kills the answer while it is
+// still being written. Every request/response protocol that frames its request
+// by end-of-stream depends on this.
+type muxStream struct{ *yamux.Stream }
+
+// CloseWrite sends FIN and nothing else. yamux spells that Close: the stream
+// moves to streamLocalClose, which prohibits further local writes and — this is
+// the part that matters — goes on delivering everything the peer sends
+// (hashicorp/yamux stream.go, Read's streamLocalClose case). Reaching for
+// Stream.Shutdown or a full teardown here would drop the reply.
+func (s muxStream) CloseWrite() error { return s.Stream.Close() }

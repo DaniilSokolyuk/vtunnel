@@ -172,7 +172,7 @@ As a library, when the tunnel is all this process serves:
 
 ```go
 server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
-server.StartProxy(":9090") // the application's HTTPS_PROXY
+server.StartProxy("127.0.0.1:9090") // the application's HTTPS_PROXY
 
 ln, err := vtunnel.Listen("ws://:3001/") // or tcp://:3001
 if err != nil {
@@ -295,8 +295,10 @@ Independent of all domain routing: the server opens a TCP port in the sandbox an
 
 ```go
 client.Listen(9000, "localhost:3000")
-client.Listen(8085, "tls://www.google.com:443")
+client.Listen(8085, "tls://www.google.com:443")   // no port means 443
 ```
+
+The remote port has to be one you picked: something inside the sandbox is going to connect to it, and a port only the sandbox knows is a port nobody can use. `Listen(0, …)` is refused rather than accepted and quietly wired to nothing.
 
 ## Reconnection
 
@@ -492,6 +494,8 @@ Covered by [`mitmproxy_exceptions_test.go`](mitmproxy_exceptions_test.go); see [
 
 Either way the teardown reaches **past the proxy**: closing the client connection cancels the handler's request context, which aborts the upstream round trip and closes its body, so a streaming upstream stops streaming instead of billing for tokens nobody reads ([`mitmproxy_shutdown_test.go`](mitmproxy_shutdown_test.go)).
 
+On the sandbox side, [`Server.Close`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Server.Close) releases everything the server owns: every forwarded port and its accept loop, the routing proxy, and the client session being served. Those ports deliberately outlive any one client connection, so that a reconnecting client finds them still open — which makes `Close` the only thing that ends them.
+
 ## Debugging an intercepted session
 
 Set `SSLKEYLOGFILE` and the proxy appends the session keys of both legs — application↔proxy and proxy↔upstream — to that file, which is what Wireshark needs to show the decrypted stream:
@@ -528,7 +532,7 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-listen` | Where to accept the tunnel: `ws://:3001/` (also serves `/health`) or `tcp://:3001` | `$VTUNNEL_LISTEN`, else `ws://:3001/` |
-| `-proxy` | Routing proxy port (0 = disabled) | `0` |
+| `-proxy` | Where the routing proxy listens: `9090` (loopback), `127.0.0.1:9090`, or `:9090` for every interface. Empty disables it. It authenticates nobody, so keep it on loopback unless something else guards the port | `$VTUNNEL_PROXY`, else empty |
 | `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
 | `-protocol` | Session protocol: `ssh`, `yamux`, `yamux-insecure`. Must match the client | `$VTUNNEL_PROTOCOL`, else `ssh` |
 
@@ -625,6 +629,8 @@ Passed to [`NewServer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewSer
 | [`WithServerProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerProtocol) | How streams are multiplexed and both ends authenticated. A client set to anything else is refused | `ssh` |
 | [`WithServerStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerStreamWindow) | The same thing for the other direction: how much the controlplane may send into one connection before the sandbox acknowledges it | 8 MB |
 | [`WithServerKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerKeepAlive) | Ping interval | 30s |
+
+One client at a time: a second connection takes the tunnel over and the previous session is closed, with a line in the log. Refusing it instead would lock a client out of its own sandbox after a half-open connection, which nothing notices until the keepalive does.
 
 **About the stream window.** It reads like a buffer size and behaves like a speed limit: one tunnelled connection can go no faster than the window divided by the round trip, whatever the bandwidth. 2 MB against a sandbox 50 ms away is 40 MB/s on a gigabit link and 40 MB/s on a ten-gigabit one. Two things to know: each direction has its own, so raising one raises one; and the worst-case cost is memory, because a stalled target can leave that much buffered for every connection open at the time.
 

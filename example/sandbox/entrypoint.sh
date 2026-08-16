@@ -4,6 +4,9 @@ set -e
 # The scheme picks the transport. ws also serves /health, which is what the
 # test script waits on; tcp:// would work just as well and just as safely.
 VTUNNEL_LISTEN=${VTUNNEL_LISTEN:-ws://:3001/}
+# A bare port binds to loopback, which is where the application in this
+# container reaches it. Anything wider would hand the port's open relay — and
+# the controlplane's credentials behind it — to whoever else can reach it.
 PROXY_PORT=${PROXY_PORT:-9090}
 
 # Trust the controlplane's MITM CA certificate if one was mounted. Only the

@@ -48,13 +48,17 @@
 // # Sandbox side
 //
 //	server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
-//	server.StartProxy(":9090") // the application's HTTPS_PROXY
+//	server.StartProxy("127.0.0.1:9090") // the application's HTTPS_PROXY
 //
 //	ln, err := vtunnel.Listen("ws://:3001/") // or tcp://:3001
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
 //	log.Fatal(vtunnel.Serve(ln, server))
+//
+// [Server.Close] releases the lot: forwarded ports, their accept loops, the
+// routing proxy and the session being served. Forwarded ports outlive any one
+// client connection on purpose, so nothing else ends them.
 //
 // To share the port with handlers of your own — a health endpoint, a metrics
 // scrape — upgrade the request yourself and hand the connection over:
@@ -115,7 +119,8 @@
 // [Client.Listen] is independent of all the above: it asks the server to open
 // a TCP port in the sandbox and pipes every connection to a local address, with
 // no HTTP parsing. A "tls://" prefix on the target makes the client wrap the
-// connection in TLS.
+// connection in TLS, on port 443 unless another is given. The remote port must
+// be one you chose — something in the sandbox has to be told where to connect.
 //
 //	client.Listen(9000, "localhost:3000")
 //	client.Listen(8085, "tls://www.google.com:443")

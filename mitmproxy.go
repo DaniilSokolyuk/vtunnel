@@ -72,7 +72,10 @@ const maxNoMITMEntries = 1024
 //   - ReadTimeout and WriteTimeout would cut off a legitimate slow body, a
 //     streaming response, or an upstream that simply took five minutes to
 //     answer. Those are the endpoints' business, not this hop's.
-const serverReadHeaderTimeout = 30 * time.Second
+//
+// A variable rather than a constant so tests need not wait it out, as
+// connectReplyTimeout already is.
+var serverReadHeaderTimeout = 30 * time.Second
 
 // idleConnTimeout is how long an unused upstream connection is kept in the
 // pool. The zero value net/http defaults to means "forever", which on a pooled
@@ -148,7 +151,7 @@ type MITMProxy struct {
 	routes     map[string]route
 	middleware []func(http.Handler) http.Handler
 	unmapped   http.Handler // nil = dial the requested host directly
-	onChange   func()
+	onChange   []func()
 	domainMu   sync.RWMutex
 
 	// mitmCA is the CA used to sign generated leaf certificates
@@ -160,6 +163,11 @@ type MITMProxy struct {
 
 	transport http.Transport
 	h2cProbed sync.Map // target → bool
+
+	// h2cInflight deduplicates probes in progress, so a burst of requests for
+	// an unprobed target costs one probe rather than one each.
+	h2cMu       sync.Mutex
+	h2cInflight map[string]*h2cProbe
 
 	// upstreams holds one transport per distinct upstream. Building one per
 	// request looked harmless and leaked: a clone of a zero-value
@@ -570,13 +578,11 @@ func (p *MITMProxy) Remove(domain string) {
 	for _, key := range domainKeys(domain) {
 		delete(p.routes, key)
 	}
-	changed := p.onChange
+	changed := p.changedLocked()
 	p.domainMu.Unlock()
 
 	log.Printf("[vtunnel-proxy] Route removed: %s", domain)
-	if changed != nil {
-		changed()
-	}
+	notify(changed)
 }
 
 // Routes returns the domains this proxy serves, as "host:port" keys.
@@ -635,10 +641,30 @@ func (p *MITMProxy) HandleUnmapped(h http.Handler) {
 
 // OnChange registers a callback fired after any route change. A [Client] uses
 // it to mirror this proxy's domains into the sandbox as they are declared.
+//
+// Callbacks accumulate. One proxy shared between clients — which [WithProxy]
+// exists for — means one subscriber per client, and a single slot made the
+// second registration cancel the first: that client's sandbox went on holding
+// whatever allowlist it had when it last heard anything, with no error to say so.
 func (p *MITMProxy) OnChange(f func()) {
+	if f == nil {
+		return
+	}
 	p.domainMu.Lock()
-	p.onChange = f
+	p.onChange = append(p.onChange, f)
 	p.domainMu.Unlock()
+}
+
+// changed returns the callbacks to fire, copied so they can be called with no
+// lock held — a subscriber is free to read routes, or add one.
+func (p *MITMProxy) changedLocked() []func() {
+	return append([]func(){}, p.onChange...)
+}
+
+func notify(callbacks []func()) {
+	for _, f := range callbacks {
+		f()
+	}
 }
 
 func (p *MITMProxy) setRoute(domain string, rt route, describe string) {
@@ -646,16 +672,14 @@ func (p *MITMProxy) setRoute(domain string, rt route, describe string) {
 	for _, key := range domainKeys(domain) {
 		p.routes[key] = rt
 	}
-	changed := p.onChange
+	changed := p.changedLocked()
 	p.domainMu.Unlock()
 
 	// Replacing a route can orphan a TLS mark too: the same domain pointed at a
 	// tls:// target a moment ago and at a cleartext one now.
 
 	log.Printf("[vtunnel-proxy] Route: %s -> %s", domain, describe)
-	if changed != nil {
-		changed()
-	}
+	notify(changed)
 }
 
 // forwardHeaders collapses ForwardOptions into the headers they declare.
@@ -1351,10 +1375,55 @@ func (p *MITMProxy) cachedTransport(key upstreamKey, build func() http.RoundTrip
 	return transport
 }
 
+// probeH2C reports whether target speaks cleartext HTTP/2, asking it once.
+//
+// The answer is shared between everyone who wants it at the same time. A probe
+// costs a dial and a wait for the peer's SETTINGS — up to eight seconds, on the
+// request path, across the whole tunnel — and a burst of requests for a target
+// nobody has probed yet used to run one each, every one of them blocking its
+// own request to learn the same fact.
 func (p *MITMProxy) probeH2C(target string) bool {
 	if v, ok := p.h2cProbed.Load(target); ok {
 		return v.(bool)
 	}
+
+	p.h2cMu.Lock()
+	if inflight, ok := p.h2cInflight[target]; ok {
+		p.h2cMu.Unlock()
+		<-inflight.done
+		return inflight.h2c
+	}
+	// Re-read under the lock: the probe this call would have joined may have
+	// finished and published between the Load above and here.
+	if v, ok := p.h2cProbed.Load(target); ok {
+		p.h2cMu.Unlock()
+		return v.(bool)
+	}
+	inflight := &h2cProbe{done: make(chan struct{})}
+	if p.h2cInflight == nil {
+		p.h2cInflight = make(map[string]*h2cProbe)
+	}
+	p.h2cInflight[target] = inflight
+	p.h2cMu.Unlock()
+
+	inflight.h2c = p.dialProbeH2C(target)
+
+	p.h2cMu.Lock()
+	delete(p.h2cInflight, target)
+	p.h2cMu.Unlock()
+	close(inflight.done)
+
+	return inflight.h2c
+}
+
+// h2cProbe is one probe in progress; h2c is written before done is closed, so
+// everyone waiting on it sees the finished value.
+type h2cProbe struct {
+	done chan struct{}
+	h2c  bool
+}
+
+func (p *MITMProxy) dialProbeH2C(target string) bool {
 	// The dial and round-trip travel the whole tunnel (server -> SSH -> client
 	// -> upstream), so a transient failure — tunnel reconnecting, slow hop —
 	// says nothing about whether the target speaks h2c. Cache only a
@@ -1391,9 +1460,11 @@ func (p *MITMProxy) probeH2C(target string) bool {
 // and Shutdown could do nothing but sit out its whole deadline and then cut the
 // session off. The MITM config offers h2 first, so this is the common case.
 func (p *MITMProxy) serveH2(clientConn net.Conn, authority string, rt route, up *upstreamTLSConn) {
-	handler, release := p.routeHandler(authority, rt, up, true)
-	defer release()
-
+	// Registered before the handler is built, not after. Building one can take
+	// real time — the h2c probe of a new target is a dial and a wait, on this
+	// very path — and a Shutdown landing in that window would not know this
+	// session existed, leaving it to be cut off at the deadline instead of
+	// drained.
 	h1srv := &http.Server{ReadHeaderTimeout: serverReadHeaderTimeout}
 	h2srv := &http2.Server{}
 	if err := http2.ConfigureServer(h1srv, h2srv); err != nil {
@@ -1401,6 +1472,20 @@ func (p *MITMProxy) serveH2(clientConn net.Conn, authority string, rt route, up 
 		return
 	}
 	defer p.trackNested(h1srv)()
+
+	handler, release := p.routeHandler(authority, rt, up, true)
+	defer release()
+
+	// Building that handler can take a while — probing an unknown target for
+	// h2c is a dial and a wait — and a Shutdown that ran meanwhile has already
+	// been round every nested server there was. Starting to serve now would
+	// produce a session nothing will ever tell to go away: Shutdown would sit
+	// out its whole deadline and then cut it off. Refusing the connection is
+	// what every other request arriving after Shutdown already gets.
+	if p.closed() {
+		log.Printf("[vtunnel-proxy] MITM %s: shutting down, not serving this session", authority)
+		return
+	}
 
 	h2srv.ServeConn(clientConn, &http2.ServeConnOpts{
 		BaseConfig: h1srv,
@@ -1764,9 +1849,19 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Host == "" {
 		r.URL.Host = r.Host
 	}
-	r.Proto = "HTTP/1.1"
-	r.ProtoMajor = 1
-	r.ProtoMinor = 1
+
+	// A cleartext HTTP/2 request stays one. The listener speaks h2c precisely so
+	// a gRPC client can be pointed straight at this proxy with no CONNECT in
+	// front, and flattening every request to HTTP/1.1 threw that away twice
+	// over: the upstream was re-dialled as HTTP/1.1, and TE: trailers went with
+	// the hop-by-hop sweep — which is the header a gRPC call needs to get its
+	// status back.
+	keepH2 := r.ProtoMajor == 2
+	if !keepH2 {
+		r.Proto = "HTTP/1.1"
+		r.ProtoMajor = 1
+		r.ProtoMinor = 1
+	}
 
 	rt, isRouted := p.resolveDomain(hostPort)
 	switch {
@@ -1789,7 +1884,7 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("[vtunnel-proxy] %s %s %s -> handled in process", r.URL.Scheme, r.Method, hostPort)
 	}
-	handler, release := p.routeHandler(hostPort, rt, nil, false)
+	handler, release := p.routeHandler(hostPort, rt, nil, keepH2)
 	defer release()
 	handler.ServeHTTP(w, r)
 }

@@ -208,10 +208,24 @@ func stopAfter(c io.Closer, d time.Duration) func() {
 // A ping that goes unanswered for three intervals means the peer is gone
 // without having said so — a half-open connection, no RST, no FIN — and the
 // session is closed so the client can start reconnecting.
+// The loop ends with the session rather than at the next tick. Sleeping the
+// interval out first meant a closed client left a goroutine behind for up to
+// one whole interval — thirty seconds, by default — holding a dead session and
+// waking up to ping it.
 func keepAliveLoop(sess session.Session, interval time.Duration) {
+	gone := make(chan struct{})
+	go func() {
+		sess.Wait()
+		close(gone)
+	}()
+
 	timeout := interval * 3
 	for {
-		time.Sleep(interval)
+		select {
+		case <-gone:
+			return
+		case <-time.After(interval):
+		}
 
 		errCh := make(chan error, 1)
 		go func() {

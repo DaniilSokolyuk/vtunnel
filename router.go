@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -44,6 +45,7 @@ type Router struct {
 	// goroutines. The once is created with the Router and never reassigned.
 	lifecycleMu sync.Mutex
 	listener    net.Listener
+	srv         *http.Server
 	once        sync.Once
 }
 
@@ -75,38 +77,67 @@ func (r *Router) chainedTransport(chainPort int) *http.Transport {
 }
 
 // Start begins serving on addr.
+//
+// Keep addr on loopback unless something else is guarding the port. The router
+// has no authentication of any kind: it relays to any host it is asked for, and
+// hands anyone who reaches it the controlplane's injected credentials for every
+// allowlisted domain. Its business is with processes inside this sandbox.
 func (r *Router) Start(addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("router listen on %s: %w", addr, err)
 	}
+
+	// A server rather than http.Serve: it is the only thing that can carry a
+	// timeout, and the only thing Close can reach the live connections through.
+	srv := &http.Server{
+		Handler:           h2c.NewHandler(r, &http2.Server{}),
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+	}
+
 	r.lifecycleMu.Lock()
 	r.listener = ln
+	r.srv = srv
 	r.lifecycleMu.Unlock()
 
-	log.Printf("[vtunnel-router] Listening on %s", addr)
-	go http.Serve(ln, h2c.NewHandler(r, &http2.Server{}))
+	log.Printf("[vtunnel-router] Listening on %s", ln.Addr())
+	go func() {
+		// Serve always ends with an error; the one Close causes is not news.
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Printf("[vtunnel-router] Stopped serving: %v", err)
+		}
+	}()
 	return nil
+}
+
+// lifecycle returns the state Start installed, as one consistent snapshot.
+func (r *Router) lifecycle() (net.Listener, *http.Server) {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	return r.listener, r.srv
 }
 
 // Addr returns the address the router listens on, or nil before Start.
 func (r *Router) Addr() net.Addr {
-	r.lifecycleMu.Lock()
-	ln := r.listener
-	r.lifecycleMu.Unlock()
+	ln, _ := r.lifecycle()
 	if ln == nil {
 		return nil
 	}
 	return ln.Addr()
 }
 
-// Close stops serving. It is safe to call more than once.
+// Close stops serving, including connections already established. It is safe to
+// call more than once.
+//
+// Closing only the listener left every live connection running — a keep-alive
+// pool from the application, a CONNECT tunnel mid-transfer — with nothing the
+// caller could reach them through.
 func (r *Router) Close() {
 	r.once.Do(func() {
-		r.lifecycleMu.Lock()
-		ln := r.listener
-		r.lifecycleMu.Unlock()
-		if ln != nil {
+		ln, srv := r.lifecycle()
+		if srv != nil {
+			srv.Close() // closes the listener too
+		} else if ln != nil {
 			ln.Close()
 		}
 	})
@@ -319,11 +350,18 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	if req.URL.Host == "" {
 		req.URL.Host = req.Host
 	}
+
+	// The request goes out as HTTP/1.1 whatever it arrived as: chaining rides
+	// net/http's proxy support, which speaks nothing else. TE: trailers survives
+	// that downgrade, though, and has to — it is what tells the far end trailers
+	// are wanted, and a gRPC call that arrived here as h2c reports its status in
+	// one. HTTP/1.1 carries trailers with chunked encoding, so asking is valid.
+	keepTE := req.ProtoMajor == 2
 	req.Proto = "HTTP/1.1"
 	req.ProtoMajor = 1
 	req.ProtoMinor = 1
 	req.RequestURI = ""
-	removeHopByHop(req.Header, false)
+	removeHopByHop(req.Header, keepTE)
 
 	resp, err := transport.RoundTrip(req)
 	if err != nil {

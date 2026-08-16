@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -167,17 +168,38 @@ func (c *certCache) getCert(hello *tls.ClientHelloInfo, fallbackHost string) (*t
 	return cert, err
 }
 
-// sweepLocked drops entries that are due for renewal. If that frees nothing —
-// every entry is still fresh — the whole map is dropped rather than letting it
-// grow without bound; the cost is regenerating certs that are still in use.
+// sweepLocked makes room in a full cache. Entries due for renewal go first,
+// since they are worthless anyway. If that frees nothing — every entry is still
+// fresh — the oldest quarter is evicted by expiry, which is insertion order for
+// leaves that all live equally long.
+//
+// Dropping the whole map instead, which is what this did, made a client walking
+// distinct SNI names cost every other client on the proxy a fresh key on its
+// next handshake: one cache overflow, and every live domain has to be signed
+// again. Partial eviction keeps that a local cost.
 func (c *certCache) sweepLocked(now time.Time) {
 	for host, cached := range c.certs {
 		if !now.Before(cached.renewAt) {
 			delete(c.certs, host)
 		}
 	}
-	if len(c.certs) >= maxCachedCerts {
-		clear(c.certs)
+	if len(c.certs) < maxCachedCerts {
+		return
+	}
+
+	evict := len(c.certs) / 4
+	if evict == 0 {
+		evict = 1
+	}
+	hosts := make([]string, 0, len(c.certs))
+	for host := range c.certs {
+		hosts = append(hosts, host)
+	}
+	sort.Slice(hosts, func(i, j int) bool {
+		return c.certs[hosts[i]].renewAt.Before(c.certs[hosts[j]].renewAt)
+	})
+	for _, host := range hosts[:evict] {
+		delete(c.certs, host)
 	}
 }
 

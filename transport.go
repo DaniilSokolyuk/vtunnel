@@ -128,28 +128,41 @@ func NewUpgrader() websocket.Upgrader { return ws.Upgrader(defaultHandshakeTimeo
 // [Server.HandleConn].
 func NewWSConn(conn *websocket.Conn) net.Conn { return ws.Conn(conn) }
 
-// pipe copies bidirectionally between a and b using io.Copy.
-// When either direction finishes (EOF or error), both sides are closed.
-// Blocks until both directions complete.
+// pipe copies bidirectionally between a and b, and closes both when both
+// directions are done. Blocks until then.
+//
+// Each direction ends on its own. A clean end of one is forwarded as a
+// half-close — "nothing more is coming from this side" — and the other
+// direction goes on. Closing both on the first EOF instead, which is the
+// obvious way to write this, silently truncates every request/response
+// exchange where the caller shuts down its write side before reading the
+// answer: curl --http1.0, git over a plain forward, and the sandbox router
+// itself, whose dualStream half-closes the tunnel socket the moment the
+// application has finished its request.
+//
+// An error is not a half-close: the pipe is already broken, so that side is
+// closed outright rather than left waiting for a peer that will never answer.
+// A stream that cannot half-close at all is closed for the same reason — an
+// abrupt end beats a hang.
 func pipe(a, b io.ReadWriteCloser) {
 	var wg sync.WaitGroup
-	var once sync.Once
-	closeBoth := func() {
-		a.Close()
-		b.Close()
+	half := func(dst, src io.ReadWriteCloser) {
+		defer wg.Done()
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			if cw, ok := dst.(closeWriter); ok && cw.CloseWrite() == nil {
+				return
+			}
+		}
+		dst.Close()
 	}
 	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(a, b)
-		once.Do(closeBoth)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(b, a)
-		once.Do(closeBoth)
-	}()
+	go half(a, b)
+	go half(b, a)
 	wg.Wait()
+
+	a.Close()
+	b.Close()
 }
 
 // setTCPOptions enables keepalive and disables Nagle on TCP connections.

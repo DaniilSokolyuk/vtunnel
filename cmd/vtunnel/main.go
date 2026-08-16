@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,7 +36,14 @@ Server flags:
                          tcp://:3001    a raw socket, and cheaper
                        Neither is more secure — the session authenticates the
                        peer either way. [$VTUNNEL_LISTEN]
-  -proxy int           HTTP CONNECT proxy port (0 = disabled, default 0)
+  -proxy string        Where the routing proxy listens (empty = disabled):
+                         9090             loopback only  (do this)
+                         127.0.0.1:9090   the same thing, spelled out
+                         :9090            every interface — see below
+                       It authenticates nobody, so a port reachable from
+                       outside the sandbox hands whoever finds it an open
+                       relay and the controlplane's injected credentials.
+                       [$VTUNNEL_PROXY]
   -secret string       Shared tunnel secret, the same value the client is
                        given. Any hard-to-guess string; @/path reads it from
                        a file. [$VTUNNEL_SECRET]
@@ -231,7 +239,8 @@ func runCA(args []string) {
 func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	listen := fs.String("listen", envOr("VTUNNEL_LISTEN", "ws://:3001/"), "Tunnel listen URL: ws://:3001/ or tcp://:3001")
-	proxyPort := fs.Int("proxy", 0, "HTTP CONNECT proxy port (0 = disabled)")
+	proxyAddr := fs.String("proxy", os.Getenv("VTUNNEL_PROXY"),
+		"Routing proxy address: 9090 (loopback), 127.0.0.1:9090, or :9090 for every interface (empty = disabled)")
 	secret := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
 	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the client")
 	fs.Parse(args)
@@ -248,12 +257,22 @@ func runServer(args []string) {
 	}
 	srv = vtunnel.NewServer(opts...)
 
-	if *proxyPort > 0 {
-		proxyAddr := fmt.Sprintf(":%d", *proxyPort)
-		if err := srv.StartProxy(proxyAddr); err != nil {
+	addr, public, err := proxyListenAddr(*proxyAddr)
+	if err != nil {
+		log.Fatalf("[vtunnel] bad -proxy %q: %v", *proxyAddr, err)
+	}
+	if addr != "" {
+		if err := srv.StartProxy(addr); err != nil {
 			log.Fatalf("[vtunnel] Failed to start proxy: %v", err)
 		}
-		log.Printf("[vtunnel] Routing proxy on %s (no TLS interception here)", proxyAddr)
+		log.Printf("[vtunnel] Routing proxy on %s (no TLS interception here)", addr)
+		if public {
+			log.Printf("[vtunnel] WARNING: the routing proxy on %s is reachable from outside "+
+				"this sandbox. It authenticates nobody: whoever reaches it gets an open relay, "+
+				"and for every forwarded domain the controlplane's injected credentials with it. "+
+				"Use -proxy 9090 to keep it on loopback unless something else guards the port.",
+				addr)
+		}
 	}
 
 	log.Printf("[vtunnel] Starting server on %s", *listen)
@@ -489,4 +508,43 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
+}
+
+// proxyListenAddr resolves the -proxy flag into an address to listen on, and
+// reports whether that address faces anything beyond the sandbox. An empty
+// value means the routing proxy is off.
+//
+// A bare port is loopback, which is both the common case and the safe one: the
+// router has no authentication, so the port is worth exactly as much as the
+// credentials the controlplane injects behind it. Anything wider has to be
+// written out in full.
+func proxyListenAddr(v string) (addr string, public bool, err error) {
+	if v == "" {
+		return "", false, nil
+	}
+
+	host, port := "", v
+	if h, p, splitErr := net.SplitHostPort(v); splitErr == nil {
+		host, port = h, p
+	} else if strings.ContainsAny(v, ":.") {
+		// Looked like an address and was not one; a bare port contains neither.
+		return "", false, fmt.Errorf("want a port (9090) or an address (127.0.0.1:9090)")
+	}
+
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", false, fmt.Errorf("%q is not a port in 1..65535", port)
+	}
+
+	if host == "" && v == port {
+		// A bare port: keep it where only this sandbox can reach it.
+		return net.JoinHostPort("127.0.0.1", port), false, nil
+	}
+	if host == "localhost" {
+		return v, false, nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return v, false, nil
+	}
+	return v, true, nil
 }

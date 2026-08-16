@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -160,5 +161,182 @@ func TestNoMITMEntriesStayBounded(t *testing.T) {
 	p.noMITMMu.RUnlock()
 	if size > maxNoMITMEntries {
 		t.Fatalf("noMITM holds %d entries, want at most %d", size, maxNoMITMEntries)
+	}
+}
+
+// The half of intercepted-h2 shutdown the drain test does not reach: a session
+// with a request actually in flight.
+//
+// An idle session only has to be told to go away. One mid-request has to be
+// waited for — the whole point of Shutdown over Close — and the nested h2
+// server is the thing that has to notice, since the connection it serves is a
+// TLS conn the outer http.Server has already handed over and stopped tracking.
+func TestShutdownWaitsForInflightInterceptedHTTP2(t *testing.T) {
+	serving := make(chan struct{})
+	release := make(chan struct{})
+
+	// Only the request under test waits. The h2c probe reaches this handler
+	// too — net/http parses the cleartext preface as a PRI request — and
+	// holding that one would stall the proxy before the session even starts,
+	// which is a different bug and not this one.
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/slow" {
+			fmt.Fprint(w, "ok")
+			return
+		}
+		once.Do(func() { close(serving) })
+		<-release
+		fmt.Fprint(w, "finished")
+	}))
+	defer upstream.Close()
+
+	ca := generateProxyTestCA(t)
+	p := NewMITMProxy(WithMitmCA(ca))
+	if err := p.ForwardTo("api.corp", upstream.Listener.Addr().String()); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	if err := p.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close()
+
+	client := proxyHTTPClient(p.Addr().String(), ca, true)
+	type result struct {
+		body  string
+		proto string
+		err   error
+	}
+	requested := make(chan result, 1)
+	go func() {
+		resp, err := client.Get("https://api.corp/slow")
+		if err != nil {
+			requested <- result{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		requested <- result{body: string(body), proto: resp.Proto, err: err}
+	}()
+
+	select {
+	case <-serving:
+	case r := <-requested:
+		t.Fatalf("the request finished before it was served: %+v", r)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the upstream")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	shutdown := make(chan error, 1)
+	shutdownStart := time.Now()
+	go func() { shutdown <- p.Shutdown(ctx) }()
+
+	// Nothing to drain to yet: the handler is still holding the request.
+	select {
+	case err := <-shutdown:
+		t.Fatalf("Shutdown returned while a request was in flight (err=%v); the reply is "+
+			"cut off mid-stream, which is what Close is for and Shutdown is not", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(release)
+
+	got := <-requested
+	if got.err != nil {
+		t.Fatalf("the in-flight request failed across shutdown: %v", got.err)
+	}
+	if got.body != "finished" {
+		t.Fatalf("body = %q, want the whole answer", got.body)
+	}
+	if got.proto != "HTTP/2.0" {
+		t.Skipf("client negotiated %s, not HTTP/2", got.proto)
+	}
+
+	select {
+	case err := <-shutdown:
+		if err != nil {
+			t.Fatalf("Shutdown: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("Shutdown did not return once the request it was waiting for had finished (waited %v)", time.Since(shutdownStart))
+	}
+}
+
+// A Shutdown that lands while the handler for a session is still being built.
+//
+// Building one probes an unknown target for h2c, which is a dial and a wait for
+// SETTINGS — across the whole tunnel, when there is one. Shutdown has been round
+// every nested server by the time this one appears, so nothing would ever tell
+// it to go away: it used to sit out the entire deadline and then cut the session
+// off. Such a session is refused instead, which is what every request arriving
+// after Shutdown already gets.
+func TestShutdownFindsASessionWhoseHandlerIsStillBeingBuilt(t *testing.T) {
+	probing := make(chan struct{})
+	releaseProbe := make(chan struct{})
+
+	var once sync.Once
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PRI" || r.ProtoMajor == 2 && r.URL.Path == "*" {
+			// The h2c probe. Holding it holds routeHandler, which is the
+			// window this test is about.
+			once.Do(func() { close(probing) })
+			<-releaseProbe
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	ca := generateProxyTestCA(t)
+	p := NewMITMProxy(WithMitmCA(ca))
+	if err := p.ForwardTo("api.corp", upstream.Listener.Addr().String()); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	if err := p.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close()
+
+	client := proxyHTTPClient(p.Addr().String(), ca, true)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := client.Get("https://api.corp/")
+		if err != nil {
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	select {
+	case <-probing:
+	case <-time.After(5 * time.Second):
+		t.Skip("the target was not probed; nothing to race with")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	shutdown := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		p.Shutdown(ctx)
+		shutdown <- time.Since(start)
+	}()
+
+	time.Sleep(100 * time.Millisecond) // let Shutdown reach the nested servers
+	close(releaseProbe)
+	<-done // the request itself is not expected to survive; the shutdown is
+
+	select {
+	case took := <-shutdown:
+		if took >= 4*time.Second {
+			t.Fatalf("Shutdown took %v of its 5s deadline: it never saw the session, so it "+
+				"waited the whole way out and then cut it off", took)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown never returned")
 	}
 }

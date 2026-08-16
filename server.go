@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -36,8 +37,19 @@ type Server struct {
 	connReady    chan struct{} // closed when activeConn becomes non-nil
 
 	// Persistent listeners (survive reconnections)
-	listeners   map[int]net.Listener
+	listeners map[int]net.Listener
+	// routerPorts records which of those ports were opened to carry domains, so
+	// an empty domain list can be told apart from a plain port forward that
+	// never had any. Without it the two are indistinguishable and one of them
+	// has to be guessed wrong: either a port forward clears the whole allowlist,
+	// or withdrawing the last forward is impossible.
+	routerPorts map[int]bool
 	listenersMu sync.Mutex
+
+	// closed is set once, by Close. It is atomic rather than guarded because
+	// every stage of accepting a client consults it — the handshake that is
+	// still running when Close lands must not end up publishing its session.
+	closed atomic.Bool
 
 	// router is the sandbox-side forward proxy. Its allowlist survives
 	// reconnections; the client replays it on every connect.
@@ -103,9 +115,10 @@ func WithServerSecret(secret string) ServerOption {
 // NewServer creates a new vtunnel server.
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
-		keepAlive: defaultKeepAlive,
-		connReady: make(chan struct{}),
-		listeners: make(map[int]net.Listener),
+		keepAlive:   defaultKeepAlive,
+		connReady:   make(chan struct{}),
+		listeners:   make(map[int]net.Listener),
+		routerPorts: make(map[int]bool),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -163,7 +176,10 @@ func (s *Server) HandleConn(conn net.Conn) {
 	log.Println("[vtunnel-server] Client connected")
 
 	// Publish this session so acceptLoops (and new ones) can use it
-	s.setSession(sess)
+	if !s.setSession(sess) {
+		log.Println("[vtunnel-server] Refusing a client: the server is closed")
+		return
+	}
 	defer func() {
 		s.clearSession(sess)
 		log.Println("[vtunnel-server] Client disconnected")
@@ -178,13 +194,42 @@ func (s *Server) HandleConn(conn net.Conn) {
 }
 
 // setSession publishes a new session and unblocks anyone waiting in getSession.
-func (s *Server) setSession(sess session.Session) {
+// It reports whether the session was taken; a closed server takes none.
+//
+// The check comes after publishing as well as before. Close cannot see a
+// session that is still being handshaked, so without the second look a client
+// arriving at exactly the wrong moment would be served by a server that had
+// already shut down — with an accept loop feeding it ports that no longer
+// exist.
+func (s *Server) setSession(sess session.Session) bool {
+	if s.closed.Load() {
+		return false
+	}
+
 	s.activeConnMu.Lock()
+	displaced := s.activeConn
 	s.activeConn = sess
 	ch := s.connReady
 	s.connReady = make(chan struct{}) // prepare for next wait cycle
 	s.activeConnMu.Unlock()
 	close(ch) // unblock all goroutines waiting in getSession
+
+	// One client at a time, and the newcomer wins. Refusing instead would lock
+	// a client out of its own sandbox after a half-open connection — nothing
+	// notices those until the keepalive does, and until then the ghost would
+	// hold the tunnel. What must not happen is both being served: the old
+	// session used to stay up, with its streams answered by a server that had
+	// moved on, and its accept loops feeding a client nobody was reading.
+	if displaced != nil {
+		log.Println("[vtunnel-server] A second client took the tunnel over; closing the previous session")
+		displaced.Close()
+	}
+
+	if s.closed.Load() {
+		s.clearSession(sess)
+		return false
+	}
+	return true
 }
 
 // clearSession marks the session as dead and creates a new wait channel.
@@ -252,20 +297,29 @@ func (s *Server) handleStream(stream net.Conn, h streamHeader) {
 func (s *Server) handleListen(stream net.Conn, h streamHeader) {
 	port := h.Port
 
+	if s.closed.Load() {
+		writeFrame(stream, streamReply{Error: "server is closed"})
+		return
+	}
+
 	s.listenersMu.Lock()
 	// Reuse existing listener on reconnect (client replays its forwards).
 	if port != 0 {
 		if _, exists := s.listeners[port]; exists {
-			s.listenersMu.Unlock()
 			log.Printf("[vtunnel-server] Reusing listener on port %d", port)
 			// Routes are refreshed on reuse — the client is authoritative and
-			// may have added or dropped domains since it last connected — but
-			// only when the request carries any. A plain port forward sends no
-			// domains, and if its ephemeral port ever collided with the router's
-			// this would clear the whole allowlist and send every forwarded
-			// domain straight out of the sandbox, quietly.
-			if len(h.Domains) > 0 {
+			// may have added or dropped domains since it last connected —
+			// including down to none, which is how the last forward is
+			// withdrawn. A plain port forward sends no domains and never had
+			// any, and clearing on its behalf would send every forwarded domain
+			// straight out of the sandbox, quietly; routerPorts is what tells
+			// the two apart.
+			if len(h.Domains) > 0 || s.routerPorts[port] {
+				s.routerPorts[port] = true
+				s.listenersMu.Unlock()
 				s.router.SetRoutes(port, h.Domains)
+			} else {
+				s.listenersMu.Unlock()
 			}
 			writeFrame(stream, streamReply{OK: true, Port: port})
 			return
@@ -287,19 +341,69 @@ func (s *Server) handleListen(stream net.Conn, h streamHeader) {
 	}
 
 	s.listeners[port] = ln
+	if len(h.Domains) > 0 {
+		s.routerPorts[port] = true
+	}
 	s.listenersMu.Unlock()
 
 	log.Printf("[vtunnel-server] Listening on %s", ln.Addr())
 
+	// Routes first, answer second. The answer is what starts the client, and
+	// between the two an application in the sandbox could ask for a domain
+	// whose route was promised but not yet installed — which the router does
+	// not treat as an error, it treats it as direct egress, past the tunnel and
+	// past the credential.
+	s.router.SetRoutes(port, h.Domains)
+
 	// Reply with the allocated port (no LocalAddr rewrite — client dials plain TCP).
 	writeFrame(stream, streamReply{OK: true, Port: port})
-
-	// Point the router at this tunnel port for the client's domains.
-	s.router.SetRoutes(port, h.Domains)
 
 	// Start persistent accept loop — runs forever, uses getSession() to
 	// wait for reconnects.
 	go s.acceptLoop(ln, port)
+}
+
+// Close releases everything the server owns: every forwarded port and its
+// accept loop, the routing proxy, and the client session currently being
+// served. It is safe to call more than once, and safe to call while
+// [Server.HandleConn] is still running — that call returns as its session ends.
+//
+// Forwarded ports deliberately outlive any one client connection, so that a
+// reconnecting client finds them still open. That makes this the only way to
+// get rid of them: without it an embedding process leaks a listener, a
+// goroutine and a descriptor per forward, still answering on behalf of a tunnel
+// nobody is watching.
+//
+// A closed server stays closed; further listen requests are refused.
+func (s *Server) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+
+	s.listenersMu.Lock()
+	listeners := make([]net.Listener, 0, len(s.listeners))
+	for port, ln := range s.listeners {
+		listeners = append(listeners, ln)
+		delete(s.listeners, port)
+	}
+	clear(s.routerPorts)
+	s.listenersMu.Unlock()
+
+	// Each close ends one acceptLoop, which is what removes the goroutine.
+	for _, ln := range listeners {
+		ln.Close()
+	}
+
+	s.router.Close()
+
+	s.activeConnMu.Lock()
+	sess := s.activeConn
+	s.activeConn = nil
+	s.activeConnMu.Unlock()
+	if sess != nil {
+		sess.Close()
+	}
+	return nil
 }
 
 // Router returns the sandbox-side forward proxy. Its allowlist survives client

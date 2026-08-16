@@ -35,6 +35,9 @@ ENV UV_SYSTEM_CERTS=true
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-EXPOSE 3001 9090
+# Only the tunnel port is published. The routing proxy listens on loopback and
+# is for processes inside this container: it authenticates nobody, and behind it
+# are the controlplane's injected credentials.
+EXPOSE 3001
 
 ENTRYPOINT ["/entrypoint.sh"]

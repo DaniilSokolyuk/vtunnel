@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -61,7 +62,11 @@ type Client struct {
 	// proxyOwned records that this client started the proxy, and may therefore
 	// stop it. One handed in through [WithProxy] and already serving belongs to
 	// the caller.
-	proxyOwned bool
+	//
+	// Atomic because the two ends of it are on different goroutines: it is set
+	// by startProxy, which runs on whoever declared a route, and read by Close,
+	// on the owner's.
+	proxyOwned atomic.Bool
 	routerPort int
 }
 
@@ -326,7 +331,18 @@ func (c *Client) Connect() error {
 }
 
 // Listen requests the server to listen on a remote port and forward to local.
+//
+// remotePort must be a real port. Zero — "let the sandbox pick" — is refused:
+// the port exists for something inside the sandbox to connect to, so a port
+// only the sandbox knows is a port nobody can use. It was accepted once, and
+// quietly did nothing: the sandbox allocated an ephemeral port and reported it,
+// the answer was dropped, and every tunnel stream for the forward arrived
+// tagged with a port this client had never heard of.
 func (c *Client) Listen(remotePort int, localAddr string) error {
+	if remotePort <= 0 || remotePort > 65535 {
+		return fmt.Errorf("vtunnel: Listen needs a fixed remote port in 1..65535, got %d", remotePort)
+	}
+
 	c.mu.Lock()
 	c.forwards[remotePort] = localAddr
 	c.mu.Unlock()
@@ -345,7 +361,16 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 // on connect and again whenever the proxy's routes change, which is how routes
 // declared on the proxy reach the sandbox without a second API to call.
 func (c *Client) syncRoutes() {
-	if len(c.proxy.Routes()) == 0 {
+	c.mu.RLock()
+	routerPort := c.routerPort
+	c.mu.RUnlock()
+
+	// No routes and none ever announced: nothing for the sandbox to hear about.
+	// With a router port already open the empty list is the message — it is how
+	// the last forward is withdrawn. Returning here instead left the sandbox
+	// chaining a domain into a controlplane that had forgotten it, answering 403
+	// for as long as the tunnel lived.
+	if len(c.proxy.Routes()) == 0 && routerPort == 0 {
 		return
 	}
 	if err := c.startProxy(); err != nil {
@@ -385,7 +410,7 @@ func (c *Client) startProxy() error {
 			c.proxyErr = fmt.Errorf("start controlplane proxy: %w", err)
 			return
 		}
-		c.proxyOwned = true
+		c.proxyOwned.Store(true)
 	})
 	return c.proxyErr
 }
@@ -397,7 +422,11 @@ func parseForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS bool
 	if after, ok := strings.CutPrefix(addr, "tls://"); ok {
 		host, _, err := net.SplitHostPort(after)
 		if err != nil {
-			return after, "", false
+			// No port: TLS means 443. Reading the missing port as "not TLS
+			// after all" dropped the one thing the prefix was there to say,
+			// and the request went out on port 80 in the clear — with the
+			// configured credential attached to it.
+			return net.JoinHostPort(after, "443"), after, true
 		}
 		return after, host, true
 	}
@@ -423,10 +452,15 @@ func (c *Client) Close() error {
 		close(c.done)
 	})
 
-	sess := c.getSession()
+	// Taken and cleared in one step, rather than through setSession: done is
+	// closed by now, so setSession would refuse to write and leave the field
+	// pointing at a session this call has just closed.
+	c.connMu.Lock()
+	sess := c.sess
+	c.sess = nil
+	c.connMu.Unlock()
 	if sess != nil {
 		sess.Close()
-		c.setSession(nil)
 	}
 
 	// The proxy holds every configured credential and listens on loopback, so
@@ -435,7 +469,7 @@ func (c *Client) Close() error {
 	// local could still have headers injected on its behalf. Only the proxy
 	// this client started is stopped — one handed in through [WithProxy] and
 	// already serving belongs to the caller.
-	if c.proxyOwned {
+	if c.proxyOwned.Load() {
 		c.proxy.Close()
 	}
 	return nil
@@ -516,13 +550,12 @@ func (c *Client) handleStream(stream net.Conn, h streamHeader) {
 // dialTarget dials the target address; if it has a "tls://" prefix,
 // a TLS connection is established with the appropriate ServerName.
 func (c *Client) dialTarget(addr string) (net.Conn, error) {
-	if after, ok := strings.CutPrefix(addr, "tls://"); ok {
-		host, _, err := net.SplitHostPort(after)
-		if err != nil {
-			return nil, err
-		}
+	if strings.HasPrefix(addr, "tls://") {
+		// Same rule as parseForwardTarget: the prefix is the instruction, and a
+		// missing port is 443 rather than a reason to ignore it.
+		target, host, _ := parseForwardTarget(addr)
 		dialer := &net.Dialer{Timeout: defaultDialTimeout}
-		conn, err := tls.DialWithDialer(dialer, "tcp", after, &tls.Config{ServerName: host})
+		conn, err := tls.DialWithDialer(dialer, "tcp", target, &tls.Config{ServerName: host})
 		if err != nil {
 			return nil, err
 		}
@@ -603,8 +636,25 @@ func (c *Client) sendRouterListen(sess session.Session) error {
 	return nil
 }
 
+// setSession publishes a session, unless the client has been closed in the
+// meantime — in which case the session is closed instead of published.
+//
+// A reconnect already under way when Close is called finishes afterwards, and
+// used to hand its session to a client nobody holds any more: a live tunnel
+// with a stream loop and a keepalive behind it, and a reconnect loop ready to
+// build another one as soon as it died. The owner had every reason to believe
+// all of it was gone.
 func (c *Client) setSession(sess session.Session) {
 	c.connMu.Lock()
+	select {
+	case <-c.done:
+		c.connMu.Unlock()
+		if sess != nil {
+			sess.Close()
+		}
+		return
+	default:
+	}
 	c.sess = sess
 	c.connMu.Unlock()
 }
@@ -641,26 +691,49 @@ func (c *Client) connectionLoop() {
 			return
 		}
 
+		started := time.Now()
 		err := c.connectOnce()
-		if err != nil {
-			delay := bo.NextBackOff()
-			log.Printf("[vtunnel-client] Reconnect failed: %v (retrying in %v)", err, delay)
-			select {
-			case <-c.done:
-				return
-			case <-time.After(delay):
+		if err == nil {
+			log.Printf("[vtunnel-client] Reconnected to %s", c.url)
+
+			// Block until this connection dies
+			if conn := c.getSession(); conn != nil {
+				conn.Wait()
 			}
-			continue
+
+			// A session that lasted is what the backoff is reset for, and the
+			// next attempt goes out immediately. Resetting on the mere fact of
+			// having built one turned an endpoint that accepts and hangs up
+			// straight away — a half-started sandbox, something answering for
+			// one that has gone — into a spin: connect, die, connect, die,
+			// with no delay anywhere and a core to itself.
+			if time.Since(started) >= c.stableSession() {
+				bo.Reset()
+				continue
+			}
+			log.Printf("[vtunnel-client] Connection to %s ended after %v", c.url, time.Since(started).Round(time.Millisecond))
+		} else {
+			log.Printf("[vtunnel-client] Reconnect failed: %v", err)
 		}
 
-		bo.Reset()
-		log.Printf("[vtunnel-client] Reconnected to %s", c.url)
-
-		// Block until this connection dies
-		if conn := c.getSession(); conn != nil {
-			conn.Wait()
+		delay := bo.NextBackOff()
+		log.Printf("[vtunnel-client] Retrying in %v", delay)
+		select {
+		case <-c.done:
+			return
+		case <-time.After(delay):
 		}
 	}
+}
+
+// stableSession is how long a session has to last to count as one that worked.
+// The longest backoff is the natural mark: anything shorter than the delay the
+// retries would have grown to says nothing was achieved by connecting.
+func (c *Client) stableSession() time.Duration {
+	if c.reconnectMax > 0 {
+		return c.reconnectMax
+	}
+	return defaultReconnectMax
 }
 
 func (c *Client) replayForwards() {
@@ -687,7 +760,10 @@ func (c *Client) replayForwards() {
 		}
 	}
 
-	if len(c.proxy.Routes()) > 0 {
+	// An empty list is replayed too, once a router port exists: a fresh sandbox
+	// process, or one whose routes were cleared while the tunnel was down, must
+	// end up with the same allowlist this client has, which may be none.
+	if len(c.proxy.Routes()) > 0 || routerPort != 0 {
 		if err := c.sendRouterListen(sess); err != nil {
 			log.Printf("[vtunnel-client] Re-forward failed: %v", err)
 		}
@@ -713,5 +789,11 @@ func (c *Client) newBackoff() *backoff.ExponentialBackOff {
 	bo.Multiplier = 2
 	bo.RandomizationFactor = 0
 	bo.MaxElapsedTime = 0
+	// NewExponentialBackOff resets itself before returning, which fixes the
+	// current interval at the package default of 500ms; the fields set above
+	// are not read again until the next Reset. connectionLoop only resets after
+	// a session that lasted, so without this the first series of retries — the
+	// one that matters — ignored WithReconnectBackoff entirely.
+	bo.Reset()
 	return bo
 }
