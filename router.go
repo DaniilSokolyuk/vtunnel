@@ -188,6 +188,48 @@ func (r *Router) chainConnect(w http.ResponseWriter, req *http.Request, hostPort
 	}
 }
 
+// serveUpgrade forwards a cleartext protocol upgrade, chaining it to the
+// controlplane for a routed domain and dialling the host directly otherwise.
+//
+// The router still parses nothing beyond the request line and headers: the
+// handshake is passed on as it arrived, and once the far side answers 101 the
+// connection is a byte pipe. Interception, if any, happens on the controlplane
+// exactly as it does for CONNECT.
+func (r *Router) serveUpgrade(w http.ResponseWriter, req *http.Request, hostPort string) {
+	// A client may address the router in either form: absolute-URI when it knows
+	// it is talking to a proxy, origin-form when something else pointed it here.
+	// Chaining writes the absolute form, so the URL has to carry a scheme and
+	// host either way.
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "http"
+	}
+	if req.URL.Host == "" {
+		req.URL.Host = req.Host
+	}
+
+	target, proxyForm := hostPort, false
+	if chainPort, ok := r.route(hostPort); ok {
+		target = net.JoinHostPort("127.0.0.1", strconv.Itoa(chainPort))
+		// The far side is the controlplane proxy, which expects the absolute
+		// form a proxied request carries.
+		proxyForm = true
+		log.Printf("[vtunnel-router] %s %s -> tunnel %s (%s upgrade)", req.Method, hostPort, target, req.Header.Get("Upgrade"))
+	} else {
+		log.Printf("[vtunnel-router] %s %s -> direct (%s upgrade)", req.Method, hostPort, req.Header.Get("Upgrade"))
+	}
+
+	upstream, err := net.DialTimeout("tcp", target, dialTimeout)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer upstream.Close()
+	setTCPOptions(upstream)
+
+	removeHopByHopForUpgrade(req.Header)
+	serveUpgrade(w, req, upstream, proxyForm, nil)
+}
+
 func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	hostPort := req.Host
 	if _, _, err := net.SplitHostPort(hostPort); err != nil {
@@ -196,6 +238,14 @@ func (r *Router) handleHTTP(w http.ResponseWriter, req *http.Request) {
 			port = "443"
 		}
 		hostPort = net.JoinHostPort(hostPort, port)
+	}
+
+	// An upgrade cannot go through http.Transport at all: it has no way to hand
+	// back a 101 and the connection under it. Cleartext ws:// therefore needs its
+	// own path here, or it dies in the sandbox without ever reaching the tunnel.
+	if isUpgradeRequest(req) {
+		r.serveUpgrade(w, req, hostPort)
+		return
 	}
 
 	transport := &r.transport

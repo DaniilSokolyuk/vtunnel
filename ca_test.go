@@ -9,6 +9,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -124,6 +125,120 @@ func TestCertCacheSignsWithEitherCAKeyType(t *testing.T) {
 				t.Fatalf("CA key algorithm = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// A client opening several connections to the same host at once is the normal
+// case, not the exceptional one — browsers and `git` both do it. Each of those
+// handshakes calls getCert, and before the misses were deduplicated they all
+// generated their own key and leaf, with every result but the last thrown away.
+func TestCertCacheDeduplicatesConcurrentMisses(t *testing.T) {
+	blob, err := GenerateCA("dedup CA")
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	ca, err := LoadCA(blob)
+	if err != nil {
+		t.Fatalf("LoadCA: %v", err)
+	}
+	cache, err := newCertCache(ca)
+	if err != nil {
+		t.Fatalf("newCertCache: %v", err)
+	}
+
+	const callers = 50
+	var wg sync.WaitGroup
+	certs := make([]*tls.Certificate, callers)
+	errs := make([]error, callers)
+	start := make(chan struct{})
+
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // release them together, so they really do collide
+			certs[i], errs[i] = cache.getCert(&tls.ClientHelloInfo{ServerName: "busy.test"}, "")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: getCert: %v", i, err)
+		}
+	}
+	// One generated certificate means one key: identity of the pointer is the
+	// assertion, since every signHost call would produce a distinct one.
+	for i, cert := range certs {
+		if cert != certs[0] {
+			t.Fatalf("caller %d got a different certificate — the miss was not deduplicated", i)
+		}
+	}
+
+	cache.mu.Lock()
+	inflight := len(cache.inflight)
+	cache.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("inflight has %d leftover entries, want 0", inflight)
+	}
+}
+
+// A failure must reach every waiter and leave nothing behind: if the in-progress
+// entry survived, the host would be pinned to that error and no later handshake
+// could ever recover.
+func TestCertCacheFailureReachesAllWaitersAndClears(t *testing.T) {
+	blob, err := GenerateCA("failing CA")
+	if err != nil {
+		t.Fatalf("GenerateCA: %v", err)
+	}
+	ca, err := LoadCA(blob)
+	if err != nil {
+		t.Fatalf("LoadCA: %v", err)
+	}
+	cache, err := newCertCache(ca)
+	if err != nil {
+		t.Fatalf("newCertCache: %v", err)
+	}
+	// Signing needs the CA private key; without it x509.CreateCertificate fails.
+	cache.ca.PrivateKey = nil
+
+	const callers = 10
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	start := make(chan struct{})
+
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errs[i] = cache.getCert(&tls.ClientHelloInfo{ServerName: "broken.test"}, "")
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err == nil {
+			t.Fatalf("caller %d got no error, want the signing failure", i)
+		}
+	}
+
+	cache.mu.Lock()
+	inflight, cached := len(cache.inflight), len(cache.certs)
+	cache.mu.Unlock()
+	if inflight != 0 {
+		t.Fatalf("inflight has %d leftover entries after a failure, want 0", inflight)
+	}
+	if cached != 0 {
+		t.Fatalf("cache holds %d entries after a failure, want 0", cached)
+	}
+
+	// With the key back, the host must be signable again rather than stuck.
+	cache.ca.PrivateKey = ca.PrivateKey
+	if _, err := cache.getCert(&tls.ClientHelloInfo{ServerName: "broken.test"}, ""); err != nil {
+		t.Fatalf("host stayed poisoned after the failure cleared: %v", err)
 	}
 }
 

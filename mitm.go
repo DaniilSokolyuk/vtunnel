@@ -7,8 +7,11 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"io"
+	"log"
 	"math/big"
 	"net"
+	"os"
 	"sync"
 	"time"
 )
@@ -31,13 +34,46 @@ const (
 	maxCachedCerts = 1024
 )
 
+// keyLogOnce guards the one-time resolution of tlsKeyLogWriter. Tests reset it
+// to observe both outcomes.
+var (
+	keyLogOnce sync.Once
+	keyLogDest io.Writer
+)
+
+// tlsKeyLogWriter returns where TLS session keys should be written, or nil when
+// $SSLKEYLOGFILE is unset — which is what tls.Config expects for "off".
+//
+// Handing the keys over makes an intercepted session readable in Wireshark,
+// which is the only practical way to see what actually went over a MITM'd
+// connection. It also makes every session it covers readable by anyone who can
+// read the file, so the mode belongs on a developer's machine and nowhere else.
+// The file is opened 0600 rather than the 0666 the convention often uses.
+func tlsKeyLogWriter() io.Writer {
+	keyLogOnce.Do(func() {
+		path := os.Getenv("SSLKEYLOGFILE")
+		if path == "" {
+			return
+		}
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			log.Printf("[vtunnel-proxy] SSLKEYLOGFILE=%s could not be opened, TLS key logging is off: %v", path, err)
+			return
+		}
+		log.Printf("[vtunnel-proxy] WARNING: writing TLS session keys to %s — anyone who can read it can decrypt this traffic", path)
+		keyLogDest = f
+	})
+	return keyLogDest
+}
+
 // certCache generates and caches TLS certificates signed by a MITM CA.
 type certCache struct {
 	ca     tls.Certificate
 	caX509 *x509.Certificate
 
-	mu    sync.Mutex
-	certs map[string]*cachedCert
+	mu       sync.Mutex
+	certs    map[string]*cachedCert
+	inflight map[string]*certRequest
 }
 
 type cachedCert struct {
@@ -47,15 +83,26 @@ type cachedCert struct {
 	renewAt time.Time
 }
 
+// certRequest is a signHost call in progress. Everyone who wants the same host
+// while it runs waits on done instead of generating a second key; the fields are
+// written before done is closed, so a waiter reading them after the receive sees
+// the finished values.
+type certRequest struct {
+	done chan struct{}
+	cert *tls.Certificate
+	err  error
+}
+
 func newCertCache(ca tls.Certificate) (*certCache, error) {
 	caX509, err := x509.ParseCertificate(ca.Certificate[0])
 	if err != nil {
 		return nil, err
 	}
 	return &certCache{
-		ca:     ca,
-		caX509: caX509,
-		certs:  make(map[string]*cachedCert),
+		ca:       ca,
+		caX509:   caX509,
+		certs:    make(map[string]*cachedCert),
+		inflight: make(map[string]*certRequest),
 	}, nil
 }
 
@@ -67,6 +114,11 @@ func newCertCache(ca tls.Certificate) (*certCache, error) {
 // clock: the CA is fixed for the lifetime of a certCache, so a hit can only
 // ever fail verification by being expired, and a signature check on every
 // handshake would be pure cost on the hot path.
+//
+// Misses for the same host are deduplicated. A client opening several connections
+// at once — which is the normal way a browser or `git` starts — would otherwise
+// land as many simultaneous misses, each generating a key and all but one of
+// those thrown away.
 func (c *certCache) getCert(hello *tls.ClientHelloInfo, fallbackHost string) (*tls.Certificate, error) {
 	host := hello.ServerName
 	if host == "" {
@@ -86,21 +138,33 @@ func (c *certCache) getCert(hello *tls.ClientHelloInfo, fallbackHost string) (*t
 		}
 		delete(c.certs, host)
 	}
+	if req, ok := c.inflight[host]; ok {
+		c.mu.Unlock()
+		<-req.done
+		return req.cert, req.err
+	}
+	req := &certRequest{done: make(chan struct{})}
+	c.inflight[host] = req
 	c.mu.Unlock()
 
 	cert, notAfter, err := c.signHost(host, now)
-	if err != nil {
-		return nil, err
-	}
 
 	c.mu.Lock()
-	if len(c.certs) >= maxCachedCerts {
-		c.sweepLocked(now)
+	// Cleared in both outcomes: a failure must not pin the host to that error,
+	// the next handshake should try again.
+	delete(c.inflight, host)
+	if err == nil {
+		if len(c.certs) >= maxCachedCerts {
+			c.sweepLocked(now)
+		}
+		c.certs[host] = &cachedCert{cert: cert, renewAt: notAfter.Add(-leafRenewBefore)}
 	}
-	c.certs[host] = &cachedCert{cert: cert, renewAt: notAfter.Add(-leafRenewBefore)}
 	c.mu.Unlock()
 
-	return cert, nil
+	req.cert, req.err = cert, err
+	close(req.done)
+
+	return cert, err
 }
 
 // sweepLocked drops entries that are due for renewal. If that frees nothing —

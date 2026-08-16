@@ -243,6 +243,16 @@ Interception is on exactly when `-mitm-ca` is given (the file is created if it d
 
 The proxy establishes the upstream connection before finishing the client handshake, so the protocol it offers the application is one the upstream actually supports, rather than a blind `h2`/`http/1.1` guess.
 
+### Debugging an intercepted session
+
+Set `SSLKEYLOGFILE` on the client and the proxy appends the session keys of both legs — application↔proxy and proxy↔upstream — to that file, which is what Wireshark needs to show the decrypted stream:
+
+```bash
+SSLKEYLOGFILE=/tmp/vtunnel-keys.log vtunnel client -server ws://... -mitm-ca ca.pem -forward ...
+```
+
+The file is created `0600`, but it still makes every session it covers readable to anyone who obtains it. Use it while debugging on your own machine and leave it unset everywhere else.
+
 ### Wiring the sandbox
 
 `update-ca-certificates` only populates the **system** trust store, and plenty
@@ -274,8 +284,29 @@ extra hop.
 
 Two things this still cannot fix: a runtime with its own keystore that ignores
 these variables (Java wants `keytool -importcert` into the JDK cacerts), and
-certificate pinning, which rejects any CA by design. Leave pinned domains
-unmapped, or forward them without `-H` so their TLS passes through untouched.
+certificate pinning, which rejects any CA by design.
+
+### When interception cannot work
+
+A pinned client refuses the generated certificate every time, and an upstream
+that demands a client certificate refuses the proxy every time. Rather than
+failing identically on every request, the proxy notices and stops trying: the
+domain is piped through untouched for the next 10 minutes, with a `WARNING` in
+the log naming it. Interception resumes after that, so installing the CA in the
+client takes effect without a restart.
+
+Two cases deliberately keep failing instead:
+
+- a forward carrying `-H`, because a request that quietly kept working without
+  its credential would hide the problem rather than report it;
+- a domain served in-process, which has no upstream to fall back to.
+
+Domains known to pin can be declared up front, so not even the first request is
+spent discovering it:
+
+```go
+proxy.MITMExceptions("pinned.example.com")
+```
 
 ## How It Works
 

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -307,6 +308,135 @@ func injectConfiguredHeaders(dst, inject http.Header) {
 	for name, values := range inject {
 		dst[http.CanonicalHeaderKey(name)] = append([]string(nil), values...)
 	}
+}
+
+// isUpgradeRequest reports whether r asks to switch protocols — a WebSocket
+// handshake, or anything else carried by the same mechanism. Both halves matter:
+// Upgrade names the protocol, and the Connection token is what makes it a
+// request rather than an advertisement.
+func isUpgradeRequest(r *http.Request) bool {
+	if r.Header.Get("Upgrade") == "" {
+		return false
+	}
+	return headerHasToken(r.Header, "Connection", "upgrade")
+}
+
+// headerHasToken reports whether a comma-separated header contains a token,
+// case-insensitively and across repeated header lines.
+func headerHasToken(h http.Header, name, token string) bool {
+	for _, value := range h.Values(name) {
+		for _, candidate := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(candidate), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// removeHopByHopForUpgrade strips what a proxy must not forward while keeping
+// what carries the upgrade itself.
+//
+// Connection and Upgrade are hop-by-hop, and removeHopByHop deletes them — which
+// is right for an ordinary request and fatal for this one. A proxy performing an
+// upgrade is the hop those headers address, so dropping them turns a WebSocket
+// handshake into a plain GET that the upstream answers 200 to, and the client
+// waits for a 101 that is never coming.
+//
+// Everything named in Connection other than the upgrade token still goes, since
+// those really are for this hop alone.
+func removeHopByHopForUpgrade(h http.Header) {
+	for _, value := range h.Values("Connection") {
+		for _, token := range strings.Split(value, ",") {
+			token = strings.TrimSpace(token)
+			if token == "" || strings.EqualFold(token, "upgrade") {
+				continue
+			}
+			h.Del(token)
+		}
+	}
+	for _, key := range hopByHopHeaders {
+		if key == "Connection" || key == "Upgrade" {
+			continue
+		}
+		h.Del(key)
+	}
+	h.Del("Te")
+
+	// Rewritten rather than passed along: the original may have listed tokens
+	// that have just been removed.
+	h.Set("Connection", "Upgrade")
+}
+
+// serveUpgrade completes a protocol upgrade over an already-dialled upstream.
+//
+// The handshake is re-issued as an ordinary request, so headers configured for
+// the route land inside it — which is the whole reason this is not simply a byte
+// pipe from the start. Once the upstream answers 101 the two connections are
+// spliced and nothing further is parsed, so subprotocols, extensions and frame
+// boundaries survive exactly as the endpoints negotiated them. Terminating the
+// WebSocket instead, the way go-mitmproxy does with gorilla, would silently drop
+// permessage-deflate and reassemble fragmented messages.
+//
+// The upstream answer is read before the client connection is touched: while w
+// is still an ordinary ResponseWriter a failure can be reported as a status, and
+// after the hijack it cannot. track may be nil; when set it registers the
+// connections a shutdown has to be able to reach.
+func serveUpgrade(w http.ResponseWriter, r *http.Request, upstream net.Conn, proxyForm bool, track func(io.Closer) func()) {
+	upstream.SetDeadline(time.Now().Add(dialTimeout))
+
+	write := r.Write
+	if proxyForm {
+		// The next hop is itself a proxy, so it needs the absolute form it
+		// would have received from the client directly.
+		write = r.WriteProxy
+	}
+	if err := write(upstream); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	br := bufio.NewReader(upstream)
+	resp, err := http.ReadResponse(br, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	upstream.SetDeadline(time.Time{})
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		// The upstream declined to upgrade. That is an ordinary response and the
+		// client is still expecting one, so nothing is hijacked.
+		defer resp.Body.Close()
+		copyResponse(w, resp)
+		return
+	}
+
+	client, brw, err := hijack(w)
+	if err != nil {
+		log.Printf("[vtunnel-proxy] upgrade %s: hijack failed: %v", r.Host, err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer client.Close()
+	if track != nil {
+		defer track(client)()
+	}
+
+	if err := resp.Write(brw); err != nil {
+		log.Printf("[vtunnel-proxy] upgrade %s: write 101 failed: %v", r.Host, err)
+		return
+	}
+	if err := brw.Flush(); err != nil {
+		log.Printf("[vtunnel-proxy] upgrade %s: flush 101 failed: %v", r.Host, err)
+		return
+	}
+
+	// Both sides may already hold buffered bytes: the upstream's reader can have
+	// frames that arrived with the 101, and net/http may have read ahead on the
+	// client. Splicing the raw sockets would drop them.
+	clientConn := newBufferedConn(client, brw.Reader)
+	dualStream(newBufferedConn(upstream, br), clientConn, clientConn)
 }
 
 func removeHopByHop(h http.Header, preserveTeTrailers bool) {
