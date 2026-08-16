@@ -1,10 +1,12 @@
 /**
  * vtunnel controlplane example
  *
- * The sandbox has vtunnel server with a routing proxy. When code inside does
+ * The sandbox runs vtunnel server with a routing proxy that never decrypts:
+ * it reads the domain from the cleartext CONNECT line and chains matching
+ * requests through the tunnel. When code inside does
  * `https://api.anthropic.com/...` or `git clone https://github.com/...`,
- * the MITM proxy intercepts TLS, decrypts, and routes through the tunnel
- * to this controlplane as plain HTTP.
+ * the request arrives here, where the MITM proxy terminates TLS, injects the
+ * credential and forwards it on.
  *
  * This example returns mock responses to demonstrate credential injection
  * without requiring real API keys. In production, you'd inject real
@@ -12,11 +14,11 @@
  *
  *   Sandbox Container                        Controlplane (this process)
  *   ┌──────────────────────┐                ┌─────────────────────────────┐
- *   │                      │                │                             │
- *   │ HTTPS_PROXY=:9090    │     TUNNEL     │ vtunnel client              │
- *   │ vtunnel server :3001 │◀══════════════▶│   ├─ api.anthropic.com     │
- *   │   + proxy :9090      │                │   └─ github.com            │
- *   │   + mitm ca.pem      │                │                             │
+ *   │                      │                │ vtunnel client              │
+ *   │ HTTPS_PROXY=:9090    │     TUNNEL     │   + MITM proxy + CA key     │
+ *   │ vtunnel server :3001 │◀══════════════▶│   ├─ api.anthropic.com      │
+ *   │   + router :9090     │                │   └─ github.com             │
+ *   │   + ca.crt only      │                │                             │
  *   └──────────────────────┘                └─────────────────────────────┘
  */
 

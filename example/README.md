@@ -8,10 +8,10 @@ The controlplane returns mock responses ("Hello from mock!") so you can test the
 
 ```
 example/
-├── sandbox/          # Container: vtunnel server + MITM proxy
+├── sandbox/          # Container: vtunnel server + routing proxy, no CA key
 │   ├── Dockerfile
 │   └── entrypoint.sh
-├── controlplane/     # Your machine: vtunnel client + mock proxies
+├── controlplane/     # Your machine: vtunnel client + MITM proxy + mock upstreams
 │   └── src/index.ts
 └── test.sh           # Builds, starts, tests, cleans up
 ```
@@ -20,19 +20,22 @@ example/
  SANDBOX CONTAINER                  CONTROLPLANE (your machine)
 
 ┌────────────────────────┐        ┌──────────────────────────────────────────┐
-│                        │        │                                          │
-│ HTTPS_PROXY=:9090      │ TUNNEL │ vtunnel client                           │
+│                        │        │ vtunnel client                           │
+│ HTTPS_PROXY=:9090      │ TUNNEL │   + MITM proxy, CA private key           │
 │      │                 │◀══════▶│      │                                   │
 │ vtunnel server :3001   │        │      ├─ api.anthropic.com                │
-│   + proxy :9090        │        │      │   inject API key ───▶ anthropic   │
-│   + mitm ca.pem        │        │      │                                   │
+│   + router :9090       │        │      │   inject API key ───▶ anthropic   │
+│   + ca.crt (cert only) │        │      │                                   │
 │                        │        │      ├─ github.com                       │
-│                        │        │      │   inject PAT ───────▶ github      │
-│                        │        │      │                                   │
+│ routes by domain,      │        │      │   inject PAT ───────▶ github      │
+│ never decrypts         │        │      │                                   │
 │                        │        │      └─ * unmapped ────────▶ direct      │
-│                        │        │                                          │
 └────────────────────────┘        └──────────────────────────────────────────┘
 ```
+
+The container holds only the CA **certificate**, so it can trust the interception
+without being able to perform it. The private key and every credential stay on
+the controlplane.
 
 ### Run
 

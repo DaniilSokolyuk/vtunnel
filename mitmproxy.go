@@ -50,6 +50,17 @@ const maxNoMITMEntries = 1024
 // replacing it, so the original cause stays readable in logs.
 var errClientCertRequested = errors.New("upstream requested a client certificate")
 
+// errNoMitmCA is returned when a route is declared that could only be served by
+// decrypting, on a proxy that holds no CA.
+//
+// Refusing at declaration rather than at request time is the whole point.
+// Injection happens after TLS is terminated, so on a proxy that cannot
+// terminate it, a route configured with headers answers requests perfectly
+// normally and simply never adds the credential — a failure with no error and
+// no missing response to notice. The CLI has always rejected `-H` without
+// `-mitm-ca`; this is the same rule for callers of the library.
+var errNoMitmCA = errors.New("no MITM CA is configured: pass WithMitmCA, or WithMitm on a Client")
+
 // route is how one domain is served. Exactly one of three shapes:
 //
 //   - handler set — served in this process, no upstream connection at all
@@ -381,11 +392,18 @@ func (p *MITMProxy) closeDetached() {
 // at all — which is how a service that needs custom authentication, rewriting
 // or mocking is implemented without standing up a second proxy for it to reach.
 //
-// A handler route needs a CA: there is no way to hand a decrypted request to a
-// handler without decrypting it first.
-func (p *MITMProxy) Handle(domain string, h http.Handler, opts ...ForwardOption) {
+// A handler route needs a CA and is refused without one: there is no way to
+// hand a decrypted request to a handler without decrypting it first, and a
+// route that could only ever answer HTTPS with an error is better reported when
+// it is declared than on every request that reaches it.
+func (p *MITMProxy) Handle(domain string, h http.Handler, opts ...ForwardOption) error {
+	if p.mitmCA == nil {
+		return fmt.Errorf("handle %s: serving a domain in process means decrypting it, %w",
+			domain, errNoMitmCA)
+	}
 	p.setRoute(domain, route{handler: h, headers: forwardHeaders(opts)},
 		"handled in process")
+	return nil
 }
 
 // Forward routes a domain through this proxy to the host the client asked for,
@@ -407,6 +425,11 @@ func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) erro
 	cfg := forwardConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+
+	if len(cfg.headers) > 0 && p.mitmCA == nil {
+		return fmt.Errorf("forward %s: %d configured header(s) need a MITM CA, %w",
+			domain, len(cfg.headers), errNoMitmCA)
 	}
 
 	addr, tlsHost, upstreamIsTLS := parseForwardTarget(target)

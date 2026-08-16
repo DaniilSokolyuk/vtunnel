@@ -23,6 +23,11 @@
 // Only domain names cross the tunnel. Targets, headers and the CA private key
 // never do.
 //
+// [MITMProxy] depends on neither [Server] nor [Client]. Given a CA and a listen
+// address it is a complete intercepting forward proxy on its own, with no
+// tunnel anywhere in sight — useful for local development and tests, where the
+// "sandbox" is another process on the same host.
+//
 // # Sandbox side
 //
 //	server := vtunnel.NewServer(vtunnel.WithClientKey(publicKey))
@@ -49,17 +54,22 @@
 //	client.Connect()
 //	defer client.Close()
 //
+//	// Routes are declared on the proxy the client owns; the client mirrors
+//	// their domain names into the sandbox as they appear.
+//	routes := client.Proxy()
+//
 //	// Reach a private service, injecting a credential the sandbox never sees.
-//	client.Forward("api.corp", "localhost:8081",
+//	routes.ForwardTo("api.corp", "localhost:8081",
 //	    vtunnel.WithHeader("Authorization", "Bearer "+token))
 //
 //	// Passthrough to the real host: a :443 target is dialed over TLS.
-//	client.Forward("gitlab.corp", "gitlab.corp:443")
+//	routes.ForwardTo("gitlab.corp", "gitlab.corp:443")
 //
-// [Client.Forward] and [Client.Unforward] may be called at any time while
-// connected; each call re-sends the full domain list, which the router applies
-// wholesale. Connections already established keep their old route until they
-// are re-established.
+// [MITMProxy.ForwardTo], [MITMProxy.Handle], [MITMProxy.Forward] and
+// [MITMProxy.Remove] may be called at any time while connected; each call
+// re-sends the full domain list, which the router applies wholesale.
+// Connections already established keep their old route until they are
+// re-established.
 //
 // Interception happens exactly when [WithMitm] is given. Without it the client
 // still forwards domains, but their TLS is piped through untouched and
@@ -87,8 +97,9 @@
 //   - Server: WithProxyMitmCA is gone, and so is the -proxy-mitm-ca flag. The
 //     server cannot intercept TLS at all now. Server.SetDomainMapping and
 //     Server.SetDomainHeaders are gone too; routes arrive over the tunnel.
-//   - Client: configure interception with [WithMitm]. [Client.Forward] keeps
-//     its signature, but now configures the local proxy instead of shipping
+//   - Client: configure interception with [WithMitm]. Client.Forward and
+//     Client.Unforward are gone; routes are declared on the proxy the client
+//     owns, via [Client.Proxy], and configure that proxy instead of shipping
 //     the target and headers into the sandbox.
 //   - The listen request on the wire lost its LocalAddr and Headers fields.
 //     A 0.7 client cannot drive a 0.6 server, or the reverse.

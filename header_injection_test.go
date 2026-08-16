@@ -156,7 +156,10 @@ func TestProxyPlainHTTPHeaderInjection(t *testing.T) {
 	b := captureBackend(t)
 	defer b.srv.Close()
 
-	proxy := vtunnel.NewMITMProxy()
+	// A CA even though nothing on this path is decrypted: injection is refused
+	// without one, since the same route would silently drop the header the
+	// moment the domain were reached over HTTPS.
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(generateTestCA(t)))
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)
 	if err := proxy.Start(proxyAddr); err != nil {
@@ -164,8 +167,10 @@ func TestProxyPlainHTTPHeaderInjection(t *testing.T) {
 	}
 	defer proxy.Close()
 
-	proxy.ForwardTo("plain.test:80", b.srv.Listener.Addr().String(),
-		vtunnel.WithHeader("Authorization", "Bearer plain"))
+	if err := proxy.ForwardTo("plain.test:80", b.srv.Listener.Addr().String(),
+		vtunnel.WithHeader("Authorization", "Bearer plain")); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
 
 	proxyURL, _ := url.Parse("http://" + proxyAddr)
 	client := &http.Client{

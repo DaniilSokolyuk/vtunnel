@@ -264,7 +264,9 @@ func runClient(args []string) {
 			for _, h := range f.headers {
 				opts = append(opts, vtunnel.WithHeader(h.name, h.value))
 			}
-			client.Proxy().ForwardTo(f.domain, f.localAddr, opts...)
+			if err := client.Proxy().ForwardTo(f.domain, f.localAddr, opts...); err != nil {
+				log.Fatalf("[vtunnel] %v", err)
+			}
 		} else {
 			if err := client.Listen(f.remotePort, f.localAddr); err != nil {
 				log.Fatalf("[vtunnel] Listen error for port %d: %v", f.remotePort, err)
