@@ -426,7 +426,12 @@ func parseForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS bool
 			// after all" dropped the one thing the prefix was there to say,
 			// and the request went out on port 80 in the clear — with the
 			// configured credential attached to it.
-			return net.JoinHostPort(after, "443"), after, true
+			//
+			// The brackets of an IPv6 literal come off first: JoinHostPort puts
+			// them back, and leaving them on produced "[[::1]]:443", which is
+			// not an address anything can dial.
+			bare := strings.TrimSuffix(strings.TrimPrefix(after, "["), "]")
+			return net.JoinHostPort(bare, "443"), bare, true
 		}
 		return after, host, true
 	}
@@ -587,7 +592,10 @@ func (c *Client) sendListen(sess session.Session, port int, localAddr string) er
 	if !reply.OK {
 		return fmt.Errorf("listen rejected: %s", reply.Error)
 	}
-	log.Printf("[vtunnel-client] Listen OK: port=%d", port)
+	// The local address stays on this side: the sandbox opens a port and pipes
+	// it, and where the far end of that pipe goes is nobody's business but this
+	// process's. It is logged so the two halves of a forward read as a pair.
+	log.Printf("[vtunnel-client] Listen OK: sandbox port=%d -> %s", port, localAddr)
 	return nil
 }
 

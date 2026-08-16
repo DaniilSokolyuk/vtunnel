@@ -22,9 +22,9 @@ import (
 // A peer that connects and then says nothing must not cost a goroutine and a
 // descriptor for the life of the process.
 func TestRouterBoundsTheRequestHeader(t *testing.T) {
-	prev := serverReadHeaderTimeout
-	serverReadHeaderTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { serverReadHeaderTimeout = prev })
+	prev := serverReadHeaderTimeout.Get()
+	serverReadHeaderTimeout.Set(200 * time.Millisecond)
+	t.Cleanup(func() { serverReadHeaderTimeout.Set(prev) })
 
 	router := newRouter()
 	if err := router.Start("127.0.0.1:0"); err != nil {

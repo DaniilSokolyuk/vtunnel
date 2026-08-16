@@ -1,13 +1,17 @@
 package vtunnel_test
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -150,4 +154,76 @@ func readAll(t *testing.T, c *http.Client, rawURL string) string {
 		t.Fatalf("read %s: %v", rawURL, err)
 	}
 	return string(body)
+}
+
+// A proxy may be handed an absolute-form request instead of a CONNECT —
+// `GET https://host/path HTTP/1.1` straight at the proxy port. It is unusual,
+// because a client that wants TLS normally tunnels, but it is legal and some
+// tools do it.
+//
+// The scheme in that URL is the client saying which protocol it wants spoken to
+// the origin. Reading only the route and not the scheme sent the request to
+// port 443 in the clear — carrying whatever credential the client had attached
+// to it, in a request it believed it had asked to encrypt.
+func TestAbsoluteFormHTTPSReachesTheOriginOverTLS(t *testing.T) {
+	var mu sync.Mutex
+	var firstByte byte
+	var sawCleartext bool
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				head := make([]byte, 512)
+				conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				n, _ := conn.Read(head)
+				mu.Lock()
+				if n > 0 && firstByte == 0 {
+					firstByte = head[0]
+					sawCleartext = strings.Contains(string(head[:n]), "client-token")
+				}
+				mu.Unlock()
+			}()
+		}
+	}()
+
+	p := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(generateTestCA(t)))
+	if err := p.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	conn, err := net.DialTimeout("tcp", p.Addr().String(), 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	fmt.Fprintf(conn, "GET https://%s/secret HTTP/1.1\r\nHost: %s\r\n"+
+		"Authorization: Bearer client-token\r\n\r\n", ln.Addr(), ln.Addr())
+	if resp, err := http.ReadResponse(bufio.NewReader(conn), nil); err == nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if sawCleartext {
+		t.Fatal("the client's credential went to the origin in cleartext, on a request " +
+			"whose URL asked for https")
+	}
+	if firstByte != 0x16 {
+		t.Fatalf("first byte on the wire = %#x, want a TLS handshake record (0x16)", firstByte)
+	}
 }

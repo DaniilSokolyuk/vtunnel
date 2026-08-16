@@ -620,6 +620,54 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
+// claimedOriginHeaders are the headers a downstream hop uses to tell an origin
+// where a request came from. They are claims, and internal services routinely
+// believe them — for rate limiting, address allowlists and audit trails.
+//
+// This proxy is not a hop such a claim travelled through: it is the first one,
+// and what sits in front of it is the sandbox. Forwarding the sandbox's claim
+// on to an upstream, in a request this proxy has just attached a credential to,
+// would let it say both "this is authorised" and "it came from somewhere else".
+var claimedOriginHeaders = map[string]bool{
+	"Forwarded":                        true,
+	"X-Forwarded-For":                  true,
+	"X-Forwarded-Host":                 true,
+	"X-Forwarded-Port":                 true,
+	"X-Forwarded-Proto":                true,
+	"X-Forwarded-Scheme":               true,
+	"X-Forwarded-Server":               true,
+	"X-Forwarded-Uri":                  true,
+	"X-Forwarded-Method":               true,
+	"X-Forwarded-Prefix":               true,
+	"X-Forwarded-Tls-Client-Cert":      true,
+	"X-Forwarded-Tls-Client-Cert-Info": true,
+	"X-Scheme":                         true,
+	"X-Real-Ip":                        true,
+	"X-Client-Ip":                      true,
+	"X-Originating-Ip":                 true,
+	"Proxy-Client-Ip":                  true,
+	"True-Client-Ip":                   true,
+	"Cf-Connecting-Ip":                 true,
+}
+
+// removeClaimedOrigin drops what the request says about where it came from.
+// Anything the route configures is applied afterwards, so an operator who does
+// want one of these can still set it — that value is the controlplane speaking,
+// not the sandbox.
+//
+// Underscores are folded into dashes before the name is looked up. Go keeps a
+// header name as it arrived, and plenty of things behind a proxy do not: nginx
+// and PHP among others read X_Forwarded_For as X-Forwarded-For, so a list of
+// exact names is a list with a spelling-shaped hole in it. Traefik folds them
+// for the same reason.
+func removeClaimedOrigin(h http.Header) {
+	for name := range h {
+		if claimedOriginHeaders[http.CanonicalHeaderKey(strings.ReplaceAll(name, "_", "-"))] {
+			delete(h, name)
+		}
+	}
+}
+
 // injectConfiguredHeaders overwrites headers on the forwarded request using
 // values configured on the corresponding domain forward. Set-not-Add: the
 // controlplane is authoritative, so any value the sandbox application sent

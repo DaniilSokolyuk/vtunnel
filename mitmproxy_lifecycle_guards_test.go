@@ -340,3 +340,28 @@ func TestShutdownFindsASessionWhoseHandlerIsStillBeingBuilt(t *testing.T) {
 		t.Fatal("Shutdown never returned")
 	}
 }
+
+// Shutdown waits on a WaitGroup that connections add themselves to. A CONNECT
+// that passed the closed check just before Shutdown began adds to a counter
+// that has already reached zero and is being waited on, which is not slow or
+// wrong but a panic: "WaitGroup misuse".
+func TestTrackingRefusesAfterShutdownHasBegun(t *testing.T) {
+	p := NewMITMProxy()
+	if err := p.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	p.Close()
+
+	// The shape of the race, made deterministic: Close has run, and something
+	// that was already in flight now tries to register.
+	conn, server := tcpPair(t)
+	defer conn.Close()
+	defer server.Close()
+
+	release, ok := p.trackIfOpen(conn)
+	if ok {
+		release()
+		t.Fatal("a connection registered itself after Close; whether that panics " +
+			"depends on how far Shutdown's Wait had got")
+	}
+}

@@ -44,6 +44,13 @@ var fuzzDoors = sync.OnceValues(func() (doors, error) {
 	}
 
 	p := NewMITMProxy(WithMitmCA(ca))
+	// Refuse what is not routed, the way a Client-managed controlplane does.
+	// Without it an unrouted authority is dialled directly, and a fuzzer
+	// inventing names finds real ones: the target would leave the machine, and
+	// its timing would depend on somebody else's DNS.
+	p.HandleUnmapped(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "vtunnel: domain not allowed", http.StatusForbidden)
+	}))
 	if err := p.ForwardTo("api.corp", echo); err != nil {
 		return doors{}, err
 	}
@@ -111,6 +118,13 @@ func pour(conn net.Conn, script []byte, pieces int) {
 	}
 }
 
+// fuzzPatience is deliberately far larger than any bound the proxy is running
+// under here (those are shortened to 200ms). It is not measuring latency: with
+// a dozen fuzz workers competing for ports and CPU an exchange can take a while
+// to get going, while a genuine hang has no bound at all and fails whatever the
+// number is.
+const fuzzPatience = 20 * time.Second
+
 // resolves reports whether the exchange ended — answered, or hung up on.
 func resolves(conn net.Conn, within time.Duration) bool {
 	conn.SetReadDeadline(time.Now().Add(within))
@@ -131,7 +145,7 @@ func stillServing(t *testing.T, proxyAddr string) {
 		return // out of ports, not out of order
 	}
 	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	conn.SetDeadline(time.Now().Add(fuzzPatience))
 
 	fmt.Fprint(conn, "CONNECT api.corp:443 HTTP/1.1\r\nHost: api.corp:443\r\n\r\n")
 	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -146,10 +160,20 @@ func stillServing(t *testing.T, proxyAddr string) {
 
 func fuzzTimeouts(t *testing.T) {
 	t.Helper()
-	header, peek := serverReadHeaderTimeout, peekTimeout
+	// Every bound a half-finished message can run into, shortened together, so
+	// the target measures "inside its configured bound" rather than waiting one
+	// out. A client that sends the first bytes of a TLS record and stops is
+	// held by the handshake timeout, not by the peek.
+	header, peek, handshake := serverReadHeaderTimeout.Get(), peekTimeout.Get(), mitmHandshakeTimeout.Get()
 	silence := 200 * time.Millisecond
-	t.Cleanup(func() { serverReadHeaderTimeout, peekTimeout = header, peek })
-	serverReadHeaderTimeout, peekTimeout = silence, silence
+	t.Cleanup(func() {
+		serverReadHeaderTimeout.Set(header)
+		peekTimeout.Set(peek)
+		mitmHandshakeTimeout.Set(handshake)
+	})
+	serverReadHeaderTimeout.Set(silence)
+	peekTimeout.Set(silence)
+	mitmHandshakeTimeout.Set(silence)
 }
 
 // The proxy's own port: anything a client can write before the proxy knows what
@@ -187,15 +211,15 @@ func fuzzOverASocket(f *testing.F, pick func(doors) string) {
 			t.Skipf("could not stand up the doors: %v", err)
 		}
 
-		conn, err := net.DialTimeout("tcp", pick(d), 2*time.Second)
+		conn, err := net.DialTimeout("tcp", pick(d), fuzzPatience)
 		if err != nil {
 			t.Skipf("dial: %v", err)
 		}
 		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		conn.SetDeadline(time.Now().Add(2 * fuzzPatience))
 
 		pour(conn, script, pieces)
-		if !resolves(conn, 5*time.Second) {
+		if !resolves(conn, fuzzPatience) {
 			t.Fatalf("neither answered nor closed")
 		}
 		conn.Close()
@@ -224,12 +248,12 @@ func FuzzTunnelInteriorSurvivesAnything(f *testing.F) {
 			t.Skipf("could not stand up the doors: %v", err)
 		}
 
-		conn, err := net.DialTimeout("tcp", d.proxy, 2*time.Second)
+		conn, err := net.DialTimeout("tcp", d.proxy, fuzzPatience)
 		if err != nil {
 			t.Skipf("dial: %v", err)
 		}
 		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(10 * time.Second))
+		conn.SetDeadline(time.Now().Add(2 * fuzzPatience))
 
 		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, authority)
 		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
@@ -242,7 +266,7 @@ func FuzzTunnelInteriorSurvivesAnything(f *testing.F) {
 		}
 
 		pour(conn, script, pieces)
-		if !resolves(conn, 5*time.Second) {
+		if !resolves(conn, fuzzPatience) {
 			// A silent client on a route that may be piped is a legitimate open
 			// tunnel — that is how SMTP works — so only a client that said
 			// something is owed an ending.

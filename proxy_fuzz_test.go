@@ -58,6 +58,11 @@ func FuzzTunnelClassificationIgnoresSegmentation(f *testing.F) {
 	f.Add([]byte("GET mykey\r\n"), 3)
 	f.Add([]byte{0x00, 0x00, 0x00, 0x08, 0x04, 0xd2, 0x16, 0x2f}, 2)
 	f.Add([]byte("\r\n\r\nGET / HTTP/1.1\r\n\r\n"), 2)
+	// The two the fuzzer found, kept because they are the bug rather than an
+	// example of it: a one-letter method, and a byte outside printable ASCII
+	// inside the line. Each was read one way whole and another way split.
+	f.Add([]byte("A HTTP/1.\n"), 8)
+	f.Add([]byte("A HTTP/1.0\xc6\n"), 11)
 
 	f.Fuzz(func(t *testing.T, input []byte, at int) {
 		if len(input) > maxRequestLinePeek {

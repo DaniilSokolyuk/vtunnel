@@ -231,7 +231,7 @@ func (r *Router) Start(addr string) error {
 	// timeout, and the only thing Close can reach the live connections through.
 	srv := &http.Server{
 		Handler:           h2c.NewHandler(r, &http2.Server{}),
-		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadHeaderTimeout: serverReadHeaderTimeout.Get(),
 		// `OPTIONS *` is forwarded like any other request; net/http would
 		// otherwise answer it here, on behalf of a server it is not.
 		DisableGeneralOptionsHandler: true,
@@ -252,7 +252,7 @@ func (r *Router) Start(addr string) error {
 	// ALL_PROXY for what does not, and pointing both at one address is the
 	// difference between one firewall rule and two. The two protocols are told
 	// apart by their first byte.
-	mixed := proxy.NewMixed(ln, peekTimeout, r.handleSocks5)
+	mixed := proxy.NewMixed(ln, peekTimeout.Get(), r.handleSocks5)
 
 	r.lifecycleMu.Lock()
 	r.listener = mixed
@@ -309,7 +309,7 @@ func (r *Router) handleSocks5(conn net.Conn) {
 	// other way to reach it.
 	defer r.track(conn)()
 
-	req, err := socks5.Accept(conn, peekTimeout)
+	req, err := socks5.Accept(conn, peekTimeout.Get())
 	if err != nil {
 		log.Printf("[vtunnel-router] SOCKS5: %v", err)
 		return

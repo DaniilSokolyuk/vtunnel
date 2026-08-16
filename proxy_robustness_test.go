@@ -107,10 +107,10 @@ func TestBothFrontDoorsSurviveOddInput(t *testing.T) {
 	// byte.
 	// Restored with Cleanup, not defer: the subtests below run in parallel,
 	// which means after this function body returns.
-	header, peek := serverReadHeaderTimeout, peekTimeout
-	t.Cleanup(func() { serverReadHeaderTimeout, peekTimeout = header, peek })
-	serverReadHeaderTimeout = 2 * time.Second
-	peekTimeout = 2 * time.Second
+	header, peek := serverReadHeaderTimeout.Get(), peekTimeout.Get()
+	t.Cleanup(func() { serverReadHeaderTimeout.Set(header); peekTimeout.Set(peek) })
+	serverReadHeaderTimeout.Set(2 * time.Second)
+	peekTimeout.Set(2 * time.Second)
 	const limit = 20 * time.Second
 
 	proxyAddr, routerAddr := robustnessDoors(t)

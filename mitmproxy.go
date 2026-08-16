@@ -32,17 +32,41 @@ const tlsHandshakeRecordType = 0x16
 // content type + the two-byte legacy record version.
 const tlsRecordHeaderLen = 3
 
-// tunnelSilenceGrace bounds the wait for the first byte of a tunnel that may be
-// piped. Silence there means the server speaks first, which a pipe serves
-// correctly, so there is no reason to sit out the whole peekTimeout to find out.
-const tunnelSilenceGrace = 3 * time.Second
+// clientFirstByteGrace is how long a tunnel waits for the client to say
+// something before it starts asking the upstream instead. Every client that
+// speaks first does so within a round trip of the CONNECT it just read, so this
+// only has to be longer than that; past it, silence is worth investigating
+// rather than waiting out.
+const clientFirstByteGrace = 250 * time.Millisecond
+
+// tunnelSegmentGrace bounds the wait for the rest of something the client has
+// already started saying. That is a different wait from the one above: the
+// message is half-delivered and the remainder is a round trip away at most, so
+// waiting out the whole peekTimeout for it would park a connection on a request
+// line that is never going to be finished.
+const tunnelSegmentGrace = time.Second
 
 // peekTimeout bounds the wait for the client's first tunnel byte, so an idle
 // CONNECT can't park a goroutine and fd indefinitely. It bounds the sandbox
 // router's SOCKS5 handshake too — a greeting that stops halfway is the same
 // shape of idle client. A variable rather than a constant so a test can prove
 // the bound is applied instead of waiting one out.
-var peekTimeout = 30 * time.Second
+var peekTimeout = newDurationVar(30 * time.Second)
+
+// durationVar is a duration a test may change while the proxy is running.
+// Reading it through an atomic is not about which of the two values a given
+// connection sees — either is fine — but about the alternative, which is a data
+// race with every connection being served at that moment.
+type durationVar struct{ nanos atomic.Int64 }
+
+func newDurationVar(d time.Duration) *durationVar {
+	v := &durationVar{}
+	v.Set(d)
+	return v
+}
+
+func (v *durationVar) Get() time.Duration  { return time.Duration(v.nanos.Load()) }
+func (v *durationVar) Set(d time.Duration) { v.nanos.Store(int64(d)) }
 
 // dialTimeout bounds every upstream dial the proxy makes.
 const dialTimeout = 10 * time.Second
@@ -53,7 +77,7 @@ const dialTimeout = 10 * time.Second
 // peekTimeout only ever covered the wait for the first byte.
 //
 // A variable rather than a constant so tests need not wait it out.
-var mitmHandshakeTimeout = 30 * time.Second
+var mitmHandshakeTimeout = newDurationVar(30 * time.Second)
 
 // noMITMTTL is how long a domain stays out of interception after refusing it.
 // Long enough not to retry a doomed handshake on every request, short enough
@@ -87,7 +111,7 @@ const maxNoMITMEntries = 1024
 //
 // A variable rather than a constant so tests need not wait it out, as
 // connectReplyTimeout already is.
-var serverReadHeaderTimeout = 30 * time.Second
+var serverReadHeaderTimeout = newDurationVar(30 * time.Second)
 
 // idleConnTimeout is how long an unused upstream connection is kept in the
 // pool. The zero value net/http defaults to means "forever", which on a pooled
@@ -247,6 +271,9 @@ type MITMProxy struct {
 	detached   map[io.Closer]struct{}
 	detachedMu sync.Mutex
 	detachedWg sync.WaitGroup
+	// stopping is set once the wait on detachedWg has begun, under detachedMu,
+	// so registering and closing cannot race that wait.
+	stopping bool
 
 	// nested holds the http.Servers running on detached connections. They are
 	// the only place the proxy knows where a request ends, so they are what lets
@@ -346,7 +373,7 @@ func (p *MITMProxy) Start(addr string) error {
 	h2s := &http2.Server{}
 	srv := &http.Server{
 		Handler:           h2c.NewHandler(p, h2s),
-		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadHeaderTimeout: serverReadHeaderTimeout.Get(),
 		// net/http answers `OPTIONS *` itself unless told not to. That request
 		// asks about the server the client is talking to, and inside an
 		// intercepted connection that server is the origin, not this proxy — so
@@ -389,6 +416,7 @@ func (p *MITMProxy) Addr() net.Addr {
 // Use [MITMProxy.Shutdown] to let in-flight requests finish first.
 func (p *MITMProxy) Close() {
 	p.stopAccepting()
+	p.stopTracking()
 	ln, srv := p.lifecycle()
 	if srv != nil {
 		srv.Close()
@@ -397,6 +425,15 @@ func (p *MITMProxy) Close() {
 	}
 	p.closeDetached()
 	p.closeIdleUpstreams()
+}
+
+// stopTracking closes the registry to new arrivals. After this a connection
+// that was in flight registers nothing and is told so, which is what keeps it
+// from adding to a WaitGroup somebody is already waiting on.
+func (p *MITMProxy) stopTracking() {
+	p.detachedMu.Lock()
+	p.stopping = true
+	p.detachedMu.Unlock()
 }
 
 // Shutdown stops accepting new connections and lets the requests already in
@@ -432,6 +469,13 @@ func (p *MITMProxy) Shutdown(ctx context.Context) error {
 	// http.Server.Shutdown knows nothing about hijacked connections — the whole
 	// point of hijacking is that the server hands ownership over — so the
 	// detached ones are waited on separately.
+	//
+	// Closed to new arrivals first: from here on nothing may join the group. A
+	// connection that registered after the wait began would be adding to a
+	// counter that had already reached zero, which a WaitGroup answers with a
+	// panic rather than by waiting a little longer.
+	p.stopTracking()
+
 	drained := make(chan struct{})
 	go func() {
 		p.detachedWg.Wait()
@@ -536,9 +580,25 @@ func (p *MITMProxy) closed() bool {
 // track registers a connection so Close can reach it and Shutdown can wait for
 // it, returning the function that undoes both. The caller must defer it.
 func (p *MITMProxy) track(c io.Closer) func() {
-	p.detachedWg.Add(1)
+	release, _ := p.trackIfOpen(c)
+	return release
+}
 
+// trackIfOpen registers a connection unless the proxy is already shutting down,
+// reporting whether it did.
+//
+// The check and the Add are one step on purpose. Shutdown waits on this counter,
+// and a connection that passed a closed() check a moment earlier would add to a
+// counter that had already reached zero and was being waited on — which is not
+// a slow shutdown but a panic, because a WaitGroup may not be reused before its
+// Wait returns.
+func (p *MITMProxy) trackIfOpen(c io.Closer) (release func(), ok bool) {
 	p.detachedMu.Lock()
+	if p.stopping {
+		p.detachedMu.Unlock()
+		return func() {}, false
+	}
+	p.detachedWg.Add(1)
 	if p.detached == nil {
 		p.detached = make(map[io.Closer]struct{})
 	}
@@ -553,7 +613,7 @@ func (p *MITMProxy) track(c io.Closer) func() {
 			p.detachedMu.Unlock()
 			p.detachedWg.Done()
 		})
-	}
+	}, true
 }
 
 // closeDetached drops every tracked connection. The map is emptied first so a
@@ -1118,28 +1178,54 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 
 	// Bound the wait for the opening bytes so an idle CONNECT can't park a
 	// goroutine and fd; cleared once the tunnel kind is decided.
-	//
-	// How long that wait may be depends on what silence would mean here. A
-	// route that may be piped reads silence as "the server speaks first" —
-	// SMTP, IMAP, POP3, MySQL and postgres all open that way, and a pipe serves
-	// every one of them correctly — so it need not wait long to find out. A
-	// route that may not be piped has nothing to guess early for, so it waits
-	// out the full timeout before giving up.
-	grace := peekTimeout
-	if rt.canFallBack(connectAuthority) {
-		grace = tunnelSilenceGrace
-	}
-	rawConn.SetReadDeadline(time.Now().Add(grace))
+	deadline := time.Now().Add(peekTimeout.Get())
+	rawConn.SetReadDeadline(time.Now().Add(clientFirstByteGrace))
 	br := bufio.NewReaderSize(rawConn, maxRequestLinePeek)
 
 	// Read once before deciding anything, so the padding check has something to
 	// look at without waiting for more than the client sent.
-	if _, err := br.Peek(1); err != nil && !isTimeout(err) {
+	_, err := br.Peek(1)
+	if err != nil && !isTimeout(err) {
 		rawConn.SetReadDeadline(time.Time{})
 		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
 		rawConn.Close()
 		return
 	}
+
+	// The client has said nothing. That is not evidence of anything on its own —
+	// a protocol whose server greets first has nothing to say yet, and so has a
+	// TLS client that is merely slow — so rather than guess, ask the upstream.
+	// Silence proves nothing; a greeting proves the protocol is server-first.
+	// This is mitmproxy's connection_strategy=eager, and its default.
+	var eager *bufferedConn
+	if err != nil && rt.target != "" && rt.canFallBack(connectAuthority) {
+		var greeted bool
+		eager, greeted = p.raceForFirstBytes(rawConn, br, rt.target, deadline)
+		defer func() {
+			// Closed unless the pipe below took it over.
+			if eager != nil {
+				eager.Close()
+			}
+		}()
+		if greeted {
+			log.Printf("[vtunnel-proxy] CONNECT %s -> %s: the upstream greeted first, piping",
+				connectAuthority, rt.target)
+			rawConn.SetReadDeadline(time.Time{})
+			piped := eager
+			eager = nil
+			defer piped.Close()
+			defer p.track(piped)()
+			dualStream(piped, newBufferedConn(rawConn, br), rawConn)
+			return
+		}
+	}
+	// A client that has started speaking is held to the shorter bound; one that
+	// has not is still owed the full wait, and for a route that may be piped the
+	// race above is what ends it early.
+	if br.Buffered() > 0 {
+		deadline = time.Now().Add(tunnelSegmentGrace)
+	}
+	rawConn.SetReadDeadline(deadline)
 	discardConnectPadding(br)
 
 	kind := classifyTunnel(br)
@@ -1195,19 +1281,24 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 		defer tunnelConn.Close()
 		log.Printf("[vtunnel-proxy] CONNECT %s: not HTTP, and this route injects %d header(s) a raw pipe cannot add; refused rather than forwarded without them",
 			connectAuthority, len(rt.headers))
+	case eager != nil:
+		// Already dialled while waiting for this client to speak.
+		defer tunnelConn.Close()
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw pipe)", connectAuthority, rt.target)
+		piped := eager
+		eager = nil
+		defer piped.Close()
+		defer p.track(piped)()
+		dualStream(piped, tunnelConn, tunnelConn)
 	default:
 		defer tunnelConn.Close()
 		if br.Buffered() == 0 {
-			// Nothing was ever said, so nothing identified this tunnel: it is
-			// being piped on the assumption that the server speaks first. That
-			// assumption is right for SMTP, IMAP and the database protocols,
-			// and wrong for a TLS client that was simply slow — in which case
-			// this connection is not intercepted and no middleware will see it.
-			// Worth a line either way, because the alternative is finding out
-			// from the absence of something.
-			log.Printf("[vtunnel-proxy] CONNECT %s -> %s: the client said nothing in %v, "+
-				"piping on the assumption that the server speaks first",
-				connectAuthority, rt.target, tunnelSilenceGrace)
+			// Neither side said anything before the deadline: nothing was ever
+			// established about this tunnel, and a pipe is the only thing that
+			// can be done with it. Worth a line, because the alternative is
+			// finding out from the absence of something.
+			log.Printf("[vtunnel-proxy] CONNECT %s -> %s: neither side spoke, piping",
+				connectAuthority, rt.target)
 		} else {
 			log.Printf("[vtunnel-proxy] CONNECT %s -> %s (cleartext, raw pipe)", connectAuthority, rt.target)
 		}
@@ -1320,7 +1411,7 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 	// handshake needs its own: it reads the rest of the ClientHello, and a peer
 	// that stops mid-record would otherwise block here indefinitely. Cleared
 	// again below so it cannot cut short the traffic that follows.
-	clientConn.SetDeadline(time.Now().Add(mitmHandshakeTimeout))
+	clientConn.SetDeadline(time.Now().Add(mitmHandshakeTimeout.Get()))
 
 	tlsConn := tls.Server(clientConn, cfg)
 	if err := tlsConn.Handshake(); err != nil {
@@ -1839,7 +1930,7 @@ func (p *MITMProxy) serveH2(clientConn net.Conn, authority string, rt route, up 
 	// session existed, leaving it to be cut off at the deadline instead of
 	// drained.
 	h1srv := &http.Server{
-		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadHeaderTimeout: serverReadHeaderTimeout.Get(),
 		// See the proxy listener: an intercepting proxy forwards `OPTIONS *`
 		// rather than answering it.
 		DisableGeneralOptionsHandler: true,
@@ -2040,12 +2131,14 @@ func (p *MITMProxy) serveRouted(w http.ResponseWriter, r *http.Request, handlers
 	// the ResponseWriter question: only the HTTP/1.1 path can hijack.
 	if !preferH2 && isUpgradeRequest(r) {
 		removeHopByHopForUpgrade(r.Header)
+		removeClaimedOrigin(r.Header)
 		injectConfiguredHeaders(r, inject)
 		handlers.upgrade.ServeHTTP(w, r)
 		return
 	}
 
 	removeHopByHop(r.Header, true)
+	removeClaimedOrigin(r.Header)
 	injectConfiguredHeaders(r, inject)
 	handlers.serve.ServeHTTP(w, r)
 }
@@ -2331,7 +2424,7 @@ func (p *MITMProxy) serveH1(clientConn net.Conn, authority string, rt route, up 
 	ln := newOneShotListener(clientConn)
 	srv := &http.Server{
 		Handler:           handler,
-		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadHeaderTimeout: serverReadHeaderTimeout.Get(),
 		// See the proxy listener: an intercepting proxy forwards `OPTIONS *`
 		// rather than answering it.
 		DisableGeneralOptionsHandler: true,
@@ -2437,6 +2530,35 @@ func (c *notifyConn) Close() error {
 	return err
 }
 
+// CloseWrite forwards half-close, for the same reason bufferedConn does: an
+// embedded net.Conn answers dualStream's assertion for the interface, not for
+// the *tls.Conn behind it, so without this every half-close inside an
+// intercepted HTTP/1 session became a full close and the peer lost the rest of
+// the response it was still streaming.
+func (c *notifyConn) CloseWrite() error {
+	cw, ok := c.Conn.(closeWriter)
+	if !ok {
+		return fmt.Errorf("half-close unsupported by %T", c.Conn)
+	}
+	return cw.CloseWrite()
+}
+
+// schemeTLSHost reads the protocol the client asked for out of an absolute-form
+// URL, for a request going to the host it named rather than to a configured
+// target.
+//
+// `GET https://host/path` at a proxy port is unusual — a client that wants TLS
+// normally sends CONNECT — but it is legal, and the scheme is the client saying
+// what to speak to the origin. Taking the route's word for it and not the URL's
+// sent such a request to port 443 in the clear, with whatever credential the
+// client had attached to a request it believed it had asked to encrypt.
+func schemeTLSHost(r *http.Request, hostPort string) string {
+	if r.URL == nil || r.URL.Scheme != "https" {
+		return ""
+	}
+	return hostFromAuthority(hostPort)
+}
+
 func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	// A request with no Host names no destination. Synthesising one produced
 	// ":80" — a perfectly dialable address in Go, meaning the local machine —
@@ -2487,11 +2609,12 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Nothing routed and nothing to refuse with: send it where it asked to go.
-		rt = route{target: hostPort}
+		rt = route{target: hostPort, tlsHost: schemeTLSHost(r, hostPort)}
 	case rt.target == "" && rt.handler == nil:
 		// A Forward route is a pipe for TLS; in the clear there is nothing to
 		// pipe, so it behaves as "go to the host you asked for".
 		rt.target = hostPort
+		rt.tlsHost = schemeTLSHost(r, hostPort)
 	}
 
 	if rt.handler == nil {
@@ -2542,6 +2665,64 @@ func acceptConnectTunnel(w http.ResponseWriter, r *http.Request) net.Conn {
 
 // dialAndPipe lets cleartext traffic on a MITM-configured domain still reach
 // its upstream, reusing the no-MITM raw byte pipe.
+// raceForFirstBytes dials the upstream and waits for whichever side speaks
+// first, so a tunnel whose client is silent is decided by evidence rather than
+// by a timeout.
+//
+// It returns the dialled connection either way, greeting and all, so the pipe
+// that follows does not open a second one — and reports whether the upstream is
+// what spoke, which is the only thing here that proves anything.
+//
+// The two waiters each own one side, and the loser is stopped before its side
+// is touched again: a deadline in the past unblocks the peek, and bufio keeps
+// what it buffered and forgets the timeout.
+func (p *MITMProxy) raceForFirstBytes(rawConn net.Conn, br *bufio.Reader, target string, deadline time.Time) (up *bufferedConn, greeted bool) {
+	release, ok := p.acquirePreDial()
+	if !ok {
+		return nil, false
+	}
+	defer release()
+
+	conn, err := net.DialTimeout("tcp", target, dialTimeout)
+	if err != nil {
+		log.Printf("[vtunnel-proxy] dial %s failed: %v", target, err)
+		return nil, false
+	}
+	conn.SetReadDeadline(deadline)
+	upBr := bufio.NewReader(conn)
+
+	spoke := make(chan bool, 2) // true: the upstream, false: the client
+	upstreamDone := make(chan struct{})
+	go func() {
+		defer close(upstreamDone)
+		upBr.Peek(1)
+		spoke <- true
+	}()
+	clientDone := make(chan struct{})
+	go func() {
+		defer close(clientDone)
+		rawConn.SetReadDeadline(deadline)
+		br.Peek(1)
+		spoke <- false
+	}()
+
+	upstreamFirst := <-spoke
+
+	// Stop both waiters before their sides are read again.
+	conn.SetReadDeadline(time.Now())
+	rawConn.SetReadDeadline(time.Now())
+	<-upstreamDone
+	<-clientDone
+	conn.SetReadDeadline(time.Time{})
+
+	if upstreamFirst && upBr.Buffered() == 0 {
+		// The upstream returned without saying anything — it hung up, or the
+		// deadline arrived. Not a greeting.
+		upstreamFirst = false
+	}
+	return newBufferedConn(conn, upBr), upstreamFirst
+}
+
 func (p *MITMProxy) dialAndPipe(target string, clientConn net.Conn) {
 	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {

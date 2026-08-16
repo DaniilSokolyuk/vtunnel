@@ -140,3 +140,71 @@ func TestHostInjectionDoesNotWeakenTheAuthorityCheck(t *testing.T) {
 		t.Fatalf("status = %s, want 421 for a Host that is not the connection authority", status)
 	}
 }
+
+// The sandbox writes the request; the controlplane attaches the credential that
+// makes it trusted. Between them that is enough to tell an internal service
+// both "this is authorised" and "it came from wherever I say" — because
+// X-Forwarded-For and its relatives are claims, and internal services routinely
+// believe them: rate limits, address allowlists, audit trails.
+//
+// This proxy is not a hop those claims travelled through. It is the first hop,
+// and the thing in front of it is untrusted, so whatever it says about origin
+// does not go on to the upstream.
+func TestClaimedOriginHeadersDoNotReachTheUpstream(t *testing.T) {
+	upstream, got := requestRecorder(t)
+	_, send := injectingProxy(t, upstream, vtunnel.WithHeader("Authorization", "Bearer injected"))
+
+	send("GET /x HTTP/1.1\r\nHost: api.corp\r\n" +
+		"X-Forwarded-For: 10.0.0.1\r\n" +
+		"X-Forwarded-Host: admin.corp\r\n" +
+		"X-Forwarded-Proto: https\r\n" +
+		"X-Real-Ip: 10.0.0.1\r\n" +
+		"Forwarded: for=10.0.0.1;host=admin.corp\r\n" +
+		"X-Client-Ip: 10.0.0.1\r\n" +
+		"X-Forwarded-Uri: /admin\r\n" +
+		"X-Forwarded-Tls-Client-Cert: MIIB\r\n" +
+		// Underscores, because Go keeps the name as it arrived and plenty of
+		// things behind a proxy read this one as X-Forwarded-For.
+		"X_Forwarded_For: 10.0.0.2\r\n" +
+		"\r\n")
+
+	select {
+	case head := <-got:
+		for _, claim := range []string{
+			"X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto",
+			"X-Real-Ip", "Forwarded", "X-Client-Ip", "X-Forwarded-Uri",
+			"X-Forwarded-Tls-Client-Cert", "X_Forwarded_For",
+		} {
+			if strings.Contains(head, claim+":") {
+				t.Errorf("%s reached the upstream:\n%s", claim, head)
+			}
+		}
+		if !strings.Contains(head, "Authorization: Bearer injected") {
+			t.Fatalf("the credential did not reach the upstream:\n%s", head)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request never reached the upstream")
+	}
+}
+
+// An operator who wants one of them can still set it, because a configured
+// header is the controlplane speaking rather than the sandbox.
+func TestAConfiguredForwardedHeaderIsStillSent(t *testing.T) {
+	upstream, got := requestRecorder(t)
+	_, send := injectingProxy(t, upstream,
+		vtunnel.WithHeader("X-Forwarded-For", "203.0.113.7"))
+
+	send("GET /x HTTP/1.1\r\nHost: api.corp\r\nX-Forwarded-For: 10.0.0.1\r\n\r\n")
+
+	select {
+	case head := <-got:
+		if !strings.Contains(head, "X-Forwarded-For: 203.0.113.7") {
+			t.Fatalf("the configured value did not reach the upstream:\n%s", head)
+		}
+		if strings.Contains(head, "10.0.0.1") {
+			t.Fatalf("the sandbox's own value survived:\n%s", head)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the request never reached the upstream")
+	}
+}

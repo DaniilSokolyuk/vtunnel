@@ -14,9 +14,9 @@ import (
 // ClientHello with no deadline at all. A client that sends a record header and
 // then stops held a goroutine and a descriptor for as long as the process lived.
 func TestMITMHandshakeHasADeadline(t *testing.T) {
-	prev := mitmHandshakeTimeout
-	mitmHandshakeTimeout = 200 * time.Millisecond
-	t.Cleanup(func() { mitmHandshakeTimeout = prev })
+	prev := mitmHandshakeTimeout.Get()
+	mitmHandshakeTimeout.Set(200 * time.Millisecond)
+	t.Cleanup(func() { mitmHandshakeTimeout.Set(prev) })
 
 	proxy, proxyAddr, _ := startCoverageProxy(t, nil)
 	proxy.ForwardTo("slowhello.test:443", "127.0.0.1:1")
