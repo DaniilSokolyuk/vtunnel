@@ -36,10 +36,14 @@ Server flags:
                          tcp://:3001    a raw socket, and cheaper
                        Neither is more secure — the session authenticates the
                        peer either way. [$VTUNNEL_LISTEN]
-  -proxy string        Where the routing proxy listens (empty = disabled):
-                         9090             loopback only  (do this)
-                         127.0.0.1:9090   the same thing, spelled out
-                         :9090            every interface — see below
+  -proxy string        Where the routing proxy listens (empty = disabled).
+                       It serves HTTP and SOCKS5 on the one port, so the
+                       sandbox can point HTTP_PROXY and ALL_PROXY at it:
+                         9090                      loopback only  (do this)
+                         127.0.0.1:9090            the same, spelled out
+                         :9090                     every interface — see below
+                         socks5://127.0.0.1:1080   one protocol only
+                         http://127.0.0.1:8080
                        It authenticates nobody, so a port reachable from
                        outside the sandbox hands whoever finds it an open
                        relay and the controlplane's injected credentials.
@@ -523,10 +527,30 @@ func proxyListenAddr(v string) (addr string, public bool, err error) {
 		return "", false, nil
 	}
 
-	host, port := "", v
-	if h, p, splitErr := net.SplitHostPort(v); splitErr == nil {
+	// A scheme says which protocols the port serves and belongs to the router;
+	// everything below only decides whether the address is reachable from
+	// outside the sandbox, which is the part worth warning about.
+	scheme, rest, hasScheme := strings.Cut(v, "://")
+	if hasScheme {
+		switch scheme {
+		case "mixed", "http", "socks5":
+		default:
+			return "", false, fmt.Errorf("unsupported scheme %q (want mixed, http or socks5)", scheme)
+		}
+		if _, _, splitErr := net.SplitHostPort(rest); splitErr != nil {
+			return "", false, fmt.Errorf("%q needs a port, as in %s://127.0.0.1:9090", v, scheme)
+		}
+	}
+
+	bare := v
+	if hasScheme {
+		bare = rest
+	}
+
+	host, port := "", bare
+	if h, p, splitErr := net.SplitHostPort(bare); splitErr == nil {
 		host, port = h, p
-	} else if strings.ContainsAny(v, ":.") {
+	} else if strings.ContainsAny(bare, ":.") {
 		// Looked like an address and was not one; a bare port contains neither.
 		return "", false, fmt.Errorf("want a port (9090) or an address (127.0.0.1:9090)")
 	}
@@ -536,7 +560,7 @@ func proxyListenAddr(v string) (addr string, public bool, err error) {
 		return "", false, fmt.Errorf("%q is not a port in 1..65535", port)
 	}
 
-	if host == "" && v == port {
+	if host == "" && bare == port {
 		// A bare port: keep it where only this sandbox can reach it.
 		return net.JoinHostPort("127.0.0.1", port), false, nil
 	}

@@ -300,6 +300,41 @@ client.Listen(8085, "tls://www.google.com:443")   // no port means 443
 
 The remote port has to be one you picked: something inside the sandbox is going to connect to it, and a port only the sandbox knows is a port nobody can use. `Listen(0, …)` is refused rather than accepted and quietly wired to nothing.
 
+## SOCKS5
+
+The routing proxy speaks SOCKS5 on the same port it speaks HTTP, so one address covers everything the sandbox runs:
+
+```bash
+export http_proxy=http://localhost:9090   # lower case matters, see below
+export HTTP_PROXY=http://localhost:9090
+export HTTPS_PROXY=http://localhost:9090
+export ALL_PROXY=socks5h://localhost:9090
+```
+
+curl takes `http_proxy` in lower case only — [deliberately](https://everything.curl.dev/usingcurl/proxies/env.html), so that a CGI script cannot be handed a proxy by an incoming `Proxy:` header — and every other variable in either case. `ALL_PROXY` is the fallback for schemes with no variable of their own, which is what carries the non-HTTP traffic here. `NO_PROXY` still applies, and curl 7.86 and later match CIDR blocks in it.
+
+It exists for the traffic that has no other way in — `psql`, `redis-cli`, `mongosh`, ssh, anything that never reads `HTTPS_PROXY`. Such a client used to leave the sandbox directly, past the allowlist and past the credential the controlplane would have injected, not by decision but because nothing asked it where it was going.
+
+Nothing new crosses the tunnel: SOCKS5 only learns the destination, and the router then chains it as the same `CONNECT` an HTTPS client produces. The controlplane matches that name against its own routes and dials `ForwardTo`'s target, never an address from the wire — which is what keeps a compromised sandbox from using the tunnel as a door into the controlplane's network.
+
+Two things follow from that, and both are deliberate:
+
+**`socks5h`, not `socks5`.** The `h` leaves name resolution to the far side, so the name reaches the proxy and can be matched. A `socks5://` client resolves first and sends an address instead.
+
+**An address nobody forwarded is refused** (`0x02 connection not allowed by ruleset`), rather than dialled. Policy here is written in names, and an address cannot be matched against one, so allowing it would mean a client that resolves its own names slips past the allowlist without a word. Forward the address explicitly if it really is meant to be reachable:
+
+```go
+client.Proxy().ForwardTo("10.0.0.9:5432", "10.0.0.9:5432")
+```
+
+A non-HTTP target needs its port in the route, since a bare domain covers `:80` and `:443` only:
+
+```go
+client.Proxy().ForwardTo("db.corp:5432", "10.0.0.9:5432")
+```
+
+Only `CONNECT` is implemented. `BIND` and `UDP ASSOCIATE` are answered with `0x07 command not supported`, which is what mitmproxy answers too — a UDP association needs a datagram path the tunnel does not have, and refusing it up front lets a client fail immediately instead of waiting for something that is not coming.
+
 ## Reconnection
 
 Automatic, with exponential backoff. Server-side listeners persist across reconnections, and forwards are replayed once the tunnel is back, so a dropped link recovers without intervention. Tunable with [`WithReconnectBackoff`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithReconnectBackoff) and [`WithKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithKeepAlive). Every reconnect redials through the same [`Dialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Dialer), so a transport with its own setup — handshake headers for a corporate proxy, a credential to refresh — gets it applied each time. Covered by [`vtunnel_reconnect_test.go`](vtunnel_reconnect_test.go).
@@ -403,9 +438,10 @@ Leaf certificates are generated per hostname and cached ([`mitm.go`](mitm.go)). 
 `update-ca-certificates` only populates the **system** trust store, and plenty of runtimes ship their own. Rather than chase each one, point them all at the same bundle — the system one, which now contains the MITM CA:
 
 ```dockerfile
+ENV http_proxy=http://localhost:9090
 ENV HTTP_PROXY=http://localhost:9090
 ENV HTTPS_PROXY=http://localhost:9090
-ENV ALL_PROXY=http://localhost:9090
+ENV ALL_PROXY=socks5h://localhost:9090
 # localhost so the daemons in here do not proxy to themselves
 ENV NO_PROXY=localhost,127.0.0.1
 ENV NODE_USE_ENV_PROXY=1
@@ -486,6 +522,8 @@ proxy.MITMExceptions("pinned.example.com")
 
 Covered by [`mitmproxy_exceptions_test.go`](mitmproxy_exceptions_test.go); see [`ExampleMITMProxy_MITMExceptions`](example_test.go).
 
+**HTTP/3 is a different escape.** Interception here is about TCP; QUIC is UDP, and neither this proxy nor the tunnel carries it. An upstream that answers with `Alt-Svc: h3=":443"` is inviting the client to come back over UDP, straight past everything described above — so the header is stripped from every response the proxy passes on, which is what mitmproxy's own `update_alt_svc` addon exists for (it rewrites the header to point at itself; having no h3 port to name, we drop it). That leaves the case of a client told about HTTP/3 by some other means, and the answer to that one is the sandbox's firewall: if outbound UDP/443 is open, traffic can leave that way regardless of what any proxy says.
+
 ## Shutting down
 
 [`Close`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Close) stops immediately: the listener goes down and every connection still open is dropped, including `CONNECT` tunnels and the servers running on top of them.
@@ -532,7 +570,7 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-listen` | Where to accept the tunnel: `ws://:3001/` (also serves `/health`) or `tcp://:3001` | `$VTUNNEL_LISTEN`, else `ws://:3001/` |
-| `-proxy` | Where the routing proxy listens: `9090` (loopback), `127.0.0.1:9090`, or `:9090` for every interface. Empty disables it. It authenticates nobody, so keep it on loopback unless something else guards the port | `$VTUNNEL_PROXY`, else empty |
+| `-proxy` | Where the routing proxy listens, serving HTTP and SOCKS5 on one port: `9090` (loopback), `127.0.0.1:9090`, `:9090` for every interface, or a scheme to serve one protocol only (`socks5://127.0.0.1:1080`, `http://127.0.0.1:8080`). Empty disables it. It authenticates nobody, so keep it on loopback unless something else guards the port | `$VTUNNEL_PROXY`, else empty |
 | `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
 | `-protocol` | Session protocol: `ssh`, `yamux`, `yamux-insecure`. Must match the client | `$VTUNNEL_PROTOCOL`, else `ssh` |
 

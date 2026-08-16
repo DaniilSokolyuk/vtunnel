@@ -9,11 +9,15 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/h2c"
+
+	"github.com/vivid-money/vtunnel/internal/proxy"
+	"github.com/vivid-money/vtunnel/internal/proxy/socks5"
 )
 
 // Router is the sandbox-side forward proxy. It is deliberately dumb: it holds
@@ -76,16 +80,79 @@ func (r *Router) chainedTransport(chainPort int) *http.Transport {
 	return t
 }
 
-// Start begins serving on addr.
+// proxyMode is which front ends a listener serves.
+type proxyMode int
+
+const (
+	// proxyMixed serves HTTP and SOCKS5 on the same port, telling them apart by
+	// their first byte. It is the default because a sandbox points HTTP_PROXY
+	// and ALL_PROXY at one address, and two listeners would mean two of
+	// everything for no gain.
+	proxyMixed proxyMode = iota
+	proxyHTTP
+	proxySocks5
+)
+
+func (m proxyMode) String() string {
+	switch m {
+	case proxyHTTP:
+		return "http"
+	case proxySocks5:
+		return "socks5"
+	default:
+		return "mixed"
+	}
+}
+
+// parseProxyScheme splits an optional scheme off a listen address, the way gost
+// and glider spell it. No scheme means both protocols.
 //
-// Keep addr on loopback unless something else is guarding the port. The router
-// has no authentication of any kind: it relays to any host it is asked for, and
-// hands anyone who reaches it the controlplane's injected credentials for every
-// allowlisted domain. Its business is with processes inside this sandbox.
+// A port is always required. Defaulting one would be a listener on an address
+// nobody asked for, which is the sort of thing that is discovered later, from
+// the wrong end.
+func parseProxyScheme(addr string) (proxyMode, string, error) {
+	mode := proxyMixed
+	if scheme, rest, found := strings.Cut(addr, "://"); found {
+		switch scheme {
+		case "mixed":
+			mode = proxyMixed
+		case "http":
+			mode = proxyHTTP
+		case "socks5":
+			mode = proxySocks5
+		default:
+			return mode, "", fmt.Errorf("unsupported proxy scheme %q in %q (want mixed, http or socks5)", scheme, addr)
+		}
+		addr = rest
+	}
+
+	if _, port, err := net.SplitHostPort(addr); err != nil || port == "" {
+		return mode, "", fmt.Errorf("bad proxy address %q: want host:port, :port or a scheme in front of one", addr)
+	}
+	return mode, addr, nil
+}
+
+// Start begins serving on addr, which may carry a scheme:
+//
+//	127.0.0.1:9090          HTTP and SOCKS5 on one port
+//	mixed://127.0.0.1:9090  the same, spelled out
+//	http://127.0.0.1:8080   HTTP only
+//	socks5://127.0.0.1:1080 SOCKS5 only
+//
+// Keep the address on loopback unless something else is guarding the port. The
+// router has no authentication of any kind: it relays to any host it is asked
+// for, and hands anyone who reaches it the controlplane's injected credentials
+// for every allowlisted domain. Its business is with processes inside this
+// sandbox.
 func (r *Router) Start(addr string) error {
-	ln, err := net.Listen("tcp", addr)
+	mode, hostPort, err := parseProxyScheme(addr)
 	if err != nil {
-		return fmt.Errorf("router listen on %s: %w", addr, err)
+		return fmt.Errorf("router: %w", err)
+	}
+
+	ln, err := net.Listen("tcp", hostPort)
+	if err != nil {
+		return fmt.Errorf("router listen on %s: %w", hostPort, err)
 	}
 
 	// A server rather than http.Serve: it is the only thing that can carry a
@@ -95,19 +162,137 @@ func (r *Router) Start(addr string) error {
 		ReadHeaderTimeout: serverReadHeaderTimeout,
 	}
 
+	if mode == proxyHTTP {
+		r.lifecycleMu.Lock()
+		r.listener = ln
+		r.srv = srv
+		r.lifecycleMu.Unlock()
+
+		log.Printf("[vtunnel-router] Listening on %s (HTTP)", ln.Addr())
+		go r.serveHTTP(srv, ln)
+		return nil
+	}
+
+	// An application in a sandbox has HTTP_PROXY for what speaks HTTP and
+	// ALL_PROXY for what does not, and pointing both at one address is the
+	// difference between one firewall rule and two. The two protocols are told
+	// apart by their first byte.
+	mixed := proxy.NewMixed(ln, peekTimeout, r.handleSocks5)
+
 	r.lifecycleMu.Lock()
-	r.listener = ln
-	r.srv = srv
+	r.listener = mixed
+	if mode == proxyMixed {
+		r.srv = srv
+	}
 	r.lifecycleMu.Unlock()
 
-	log.Printf("[vtunnel-router] Listening on %s", ln.Addr())
-	go func() {
-		// Serve always ends with an error; the one Close causes is not news.
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("[vtunnel-router] Stopped serving: %v", err)
-		}
-	}()
+	log.Printf("[vtunnel-router] Listening on %s (%s)", ln.Addr(), mode)
+	if mode == proxySocks5 {
+		go r.refuseNonSocks5(mixed)
+		return nil
+	}
+	go r.serveHTTP(srv, mixed)
 	return nil
+}
+
+func (r *Router) serveHTTP(srv *http.Server, ln net.Listener) {
+	// Serve always ends with an error; the one Close causes is not news.
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("[vtunnel-router] Stopped serving: %v", err)
+	}
+}
+
+// refuseNonSocks5 drains what a SOCKS5-only listener is not there for. Hanging
+// up says more than an HTTP error would: the operator asked for one protocol on
+// this port, and something is speaking another.
+func (r *Router) refuseNonSocks5(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		log.Printf("[vtunnel-router] %s spoke something other than SOCKS5 to a socks5:// listener", conn.RemoteAddr())
+		conn.Close()
+	}
+}
+
+// handleSocks5 serves one SOCKS5 connection: learn where the client wants to
+// go, then take exactly the same decision the CONNECT path takes.
+//
+// SOCKS5 exists here for the traffic that has no other way in — psql,
+// redis-cli, ssh, anything that never reads HTTPS_PROXY. Such a client used to
+// leave the sandbox directly, past the allowlist and past the credential the
+// controlplane would have injected, not by decision but because nothing asked
+// it where it was going.
+//
+// It contributes no authority of its own: the name it produces is matched
+// against the same routes, and an unrouted one is dialled from the sandbox
+// exactly as an unrouted CONNECT is.
+func (r *Router) handleSocks5(conn net.Conn) {
+	defer conn.Close()
+
+	req, err := socks5.Accept(conn, peekTimeout)
+	if err != nil {
+		log.Printf("[vtunnel-router] SOCKS5: %v", err)
+		return
+	}
+
+	// Policy is written in names, and an address cannot be matched against one.
+	// A client configured as socks5:// resolves before it asks, so its traffic
+	// would leave the sandbox with the allowlist never consulted and the
+	// credential never injected — silently, which is the worst way for a rule
+	// to fail. Refusing makes it an error the first time, and forwarding the
+	// address explicitly is how it is allowed.
+	if isAddressLiteral(req.Target) {
+		if _, routed := r.route(req.Target); !routed {
+			log.Printf("[vtunnel-router] SOCKS5 %s: refused, addresses are not routable — "+
+				"use socks5h:// so the name reaches this proxy unresolved, or forward "+
+				"the address itself if it is meant to be reachable", req.Target)
+			req.Refuse(socks5.RepNotAllowed)
+			return
+		}
+	}
+
+	upstream, err := r.dialFor(req.Target, "SOCKS5")
+	if err != nil {
+		log.Printf("[vtunnel-router] SOCKS5 %s: %v", req.Target, err)
+		req.Refuse(socks5.ReplyCode(err))
+		return
+	}
+	defer upstream.Close()
+
+	if err := req.Grant(); err != nil {
+		return
+	}
+	dualStream(upstream, conn, conn)
+}
+
+// dialFor opens the connection a request for hostPort should get: through the
+// tunnel when the domain is allowlisted, straight out of the sandbox when it is
+// not. how names the front end, for the log.
+func (r *Router) dialFor(hostPort, how string) (net.Conn, error) {
+	if chainPort, ok := r.route(hostPort); ok {
+		log.Printf("[vtunnel-router] %s %s -> tunnel port %d", how, hostPort, chainPort)
+		return r.dialChained(hostPort, chainPort)
+	}
+
+	log.Printf("[vtunnel-router] %s %s -> direct", how, hostPort)
+	conn, err := net.DialTimeout("tcp", hostPort, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	setTCPOptions(conn)
+	return conn, nil
+}
+
+// isAddressLiteral reports whether hostPort names a host by address rather than
+// by name.
+func isAddressLiteral(hostPort string) bool {
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return false
+	}
+	return net.ParseIP(host) != nil
 }
 
 // lifecycle returns the state Start installed, as one consistent snapshot.
@@ -227,46 +412,12 @@ func (r *Router) handleConnect(w http.ResponseWriter, req *http.Request) {
 // touched here — it is terminated on the controlplane, which is the only side
 // holding the MITM CA.
 func (r *Router) chainConnect(w http.ResponseWriter, req *http.Request, hostPort string, chainPort int) {
-	upstreamAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(chainPort))
-	log.Printf("[vtunnel-router] CONNECT %s -> tunnel %s", hostPort, upstreamAddr)
-
-	upstream, err := net.DialTimeout("tcp", upstreamAddr, dialTimeout)
+	upstreamConn, err := r.dialChained(hostPort, chainPort)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
-	defer upstream.Close()
-	setTCPOptions(upstream)
-
-	// dialTimeout covers only the dial. Without a deadline here a controlplane
-	// that accepts TCP and then goes quiet — mid-reconnect, swapped out, a
-	// wedged hop — would block this read forever, and the promise in the
-	// comment below could never be kept. Cleared once the answer is in, so the
-	// tunnel itself is not on a clock.
-	upstream.SetDeadline(time.Now().Add(connectReplyTimeout))
-
-	if _, err := fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostPort, hostPort); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
-	}
-
-	// Read the chained proxy's answer before touching the client's connection,
-	// so a failure can still be reported as a status rather than a dead tunnel.
-	br := bufio.NewReader(upstream)
-	resp, err := http.ReadResponse(br, req)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("upstream proxy: %v", err), http.StatusBadGateway)
-		return
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		http.Error(w, fmt.Sprintf("upstream proxy: %s", resp.Status), http.StatusBadGateway)
-		return
-	}
-	upstream.SetDeadline(time.Time{})
-
-	// br may already hold bytes the chained proxy sent after its 200.
-	upstreamConn := newBufferedConn(upstream, br)
+	defer upstreamConn.Close()
 
 	switch req.ProtoMajor {
 	case 1:
@@ -274,6 +425,53 @@ func (r *Router) chainConnect(w http.ResponseWriter, req *http.Request, hostPort
 	default:
 		serveH2Connect(w, req, upstreamConn)
 	}
+}
+
+// dialChained opens a connection to the controlplane proxy on the far side of
+// chainPort and asks it, by CONNECT, for hostPort.
+//
+// Only the name travels: the controlplane matches it against its own routes and
+// dials whatever those say. That is the whole reason there is no "give me a TCP
+// connection to this address" message anywhere in this protocol — a sandbox
+// that could name an address could name any address on the controlplane's
+// network.
+func (r *Router) dialChained(hostPort string, chainPort int) (net.Conn, error) {
+	upstreamAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(chainPort))
+
+	upstream, err := net.DialTimeout("tcp", upstreamAddr, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	setTCPOptions(upstream)
+
+	// dialTimeout covers only the dial. Without a deadline here a controlplane
+	// that accepts TCP and then goes quiet — mid-reconnect, swapped out, a
+	// wedged hop — would block this read forever. Cleared once the answer is
+	// in, so the tunnel itself is not on a clock.
+	upstream.SetDeadline(time.Now().Add(connectReplyTimeout))
+
+	if _, err := fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", hostPort, hostPort); err != nil {
+		upstream.Close()
+		return nil, err
+	}
+
+	// The answer is read before the client's connection is touched, so a
+	// failure can still be reported as a status rather than a dead tunnel.
+	br := bufio.NewReader(upstream)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		upstream.Close()
+		return nil, fmt.Errorf("upstream proxy: %w", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		upstream.Close()
+		return nil, fmt.Errorf("upstream proxy: %s", resp.Status)
+	}
+	upstream.SetDeadline(time.Time{})
+
+	// br may already hold bytes the chained proxy sent after its 200.
+	return newBufferedConn(upstream, br), nil
 }
 
 // serveUpgrade forwards a cleartext protocol upgrade, chaining it to the

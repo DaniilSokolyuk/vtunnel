@@ -20,9 +20,17 @@ RUN apt-get update && apt-get install -y curl ca-certificates && \
 
 # Route everything through the routing proxy, and point every runtime's TLS
 # stack at the one system bundle that entrypoint.sh adds the controlplane CA to.
+# http_proxy is set in lower case as well as upper: curl accepts only the lower
+# case one for plain HTTP, deliberately, so that a CGI script cannot be handed a
+# proxy by an incoming Proxy: header. Everything else reads either.
+ENV http_proxy=http://localhost:9090
 ENV HTTP_PROXY=http://localhost:9090
 ENV HTTPS_PROXY=http://localhost:9090
-ENV ALL_PROXY=http://localhost:9090
+# socks5h, not socks5: the "h" keeps name resolution on the far side, so the
+# domain reaches the proxy unresolved and can be matched against the allowlist.
+# With socks5:// the client resolves first and sends an address, which matches
+# no route by name and quietly egresses from the sandbox instead.
+ENV ALL_PROXY=socks5h://localhost:9090
 ENV NO_PROXY=localhost,127.0.0.1
 ENV NODE_USE_ENV_PROXY=1
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt

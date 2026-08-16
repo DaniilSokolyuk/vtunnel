@@ -34,6 +34,16 @@ func TestProxyListenAddr(t *testing.T) {
 		{name: "not a port", in: "nine thousand", wantErr: true},
 		{name: "no port at all", in: "10.0.0.7", wantErr: true},
 		{name: "port out of range", in: "70000", wantErr: true},
+
+		// A scheme picks which front ends the port serves, and is passed
+		// through to the router untouched; the address inside it still decides
+		// whether anything outside the sandbox can reach it.
+		{name: "mixed, loopback", in: "mixed://127.0.0.1:9090", wantAddr: "mixed://127.0.0.1:9090"},
+		{name: "mixed, every interface", in: "mixed://:8080", wantAddr: "mixed://:8080", wantPublic: true},
+		{name: "socks5 only", in: "socks5://127.0.0.1:1080", wantAddr: "socks5://127.0.0.1:1080"},
+		{name: "http only, routable", in: "http://10.0.0.7:8080", wantAddr: "http://10.0.0.7:8080", wantPublic: true},
+		{name: "scheme without a port", in: "mixed://127.0.0.1", wantErr: true},
+		{name: "scheme nobody serves", in: "gopher://127.0.0.1:70", wantErr: true},
 	}
 
 	for _, tc := range cases {

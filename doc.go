@@ -48,7 +48,7 @@
 // # Sandbox side
 //
 //	server := vtunnel.NewServer(vtunnel.WithServerSecret(secret))
-//	server.StartProxy("127.0.0.1:9090") // the application's HTTPS_PROXY
+//	server.StartProxy("127.0.0.1:9090") // the application's HTTPS_PROXY and ALL_PROXY
 //
 //	ln, err := vtunnel.Listen("ws://:3001/") // or tcp://:3001
 //	if err != nil {
@@ -113,6 +113,13 @@
 // For the CA itself, [GenerateCA] produces a cert+key blob and [CACertPEM]
 // extracts the certificate half — the only part that belongs in a sandbox
 // trust store.
+//
+// The routing proxy serves HTTP and SOCKS5 on that one port. SOCKS5 is there
+// for what does not read HTTPS_PROXY — psql, redis-cli, ssh — and adds nothing
+// to what crosses the tunnel: it learns a destination and chains the same
+// CONNECT an HTTPS client would. Point ALL_PROXY at it as socks5h, so names
+// reach the proxy unresolved; an address nobody forwarded is refused, because
+// an allowlist written in names cannot match one.
 //
 // # Raw port forwards
 //

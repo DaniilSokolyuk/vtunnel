@@ -100,6 +100,11 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) {
 	brw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
 	brw.Flush()
 
+	// Whatever the client wrote after its request headers is the tunnel's
+	// first bytes — except for the blank lines some of them pad with, which
+	// would arrive at the target in front of everything else.
+	discardConnectPadding(brw.Reader)
+
 	// Flush any buffered data from the client
 	if n := brw.Reader.Buffered(); n > 0 {
 		buf, _ := brw.Peek(n)
@@ -107,6 +112,38 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) {
 	}
 
 	dualStream(targetConn, clientConn, clientConn)
+}
+
+// maxConnectPadding bounds how many stray line endings are skipped after a
+// CONNECT. A handful covers what clients actually send; a limit is what keeps
+// this from reading a payload that happens to start with blank lines.
+const maxConnectPadding = 4
+
+// discardConnectPadding drops the CRLFs some clients write after the CONNECT
+// headers.
+//
+// RFC 9112 §2.2 lets a recipient ignore them, and clients do send them
+// (mitmproxy fixed the same thing from a bug report). Left in place they become
+// the first bytes of the tunnel: on the interception path the ClientHello no
+// longer looks like TLS, so the connection is quietly piped instead of
+// intercepted — no decryption, no injected credential — and on the piping path
+// they arrive at the upstream in front of the ClientHello and break its
+// handshake.
+//
+// Only what is already buffered is examined. Peeking further would wait, and
+// the whole point is that the next thing may be a ClientHello nobody has sent
+// yet.
+func discardConnectPadding(br *bufio.Reader) {
+	for range maxConnectPadding {
+		if br.Buffered() < 2 {
+			return
+		}
+		head, err := br.Peek(2)
+		if err != nil || string(head) != "\r\n" {
+			return
+		}
+		br.Discard(2)
+	}
 }
 
 // hijack takes over the underlying connection from the ResponseWriter.
@@ -230,6 +267,16 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 		}
 	}
 	removeHopByHop(w.Header(), false)
+
+	// Alt-Svc offers the client another way to the same origin, over HTTP/3 —
+	// which is UDP, which this proxy neither terminates nor routes. A client
+	// that takes the offer leaves the tunnel altogether: no interception, no
+	// injected credential, no error to notice. mitmproxy rewrites the header to
+	// point at itself and describes keeping it as something that "may cause
+	// clients to bypass the proxy"; with no h3 listener to point at, dropping it
+	// is the only honest answer. Whether the sandbox may speak UDP at all is a
+	// firewall's business, not a proxy's.
+	w.Header().Del("Alt-Svc")
 
 	// Announced after the hop-by-hop sweep, not before: Trailer is itself
 	// hop-by-hop, so an announcement written earlier is deleted by the sweep and

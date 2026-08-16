@@ -2,6 +2,7 @@ package vtunnel
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -11,6 +12,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/textproto"
 	"slices"
 	"strings"
 	"sync"
@@ -1027,6 +1030,16 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 	// goroutine and fd; cleared once the tunnel kind is decided.
 	rawConn.SetReadDeadline(time.Now().Add(peekTimeout))
 	br := bufio.NewReader(rawConn)
+	// Read once before deciding anything, so the padding check below has
+	// something to look at without waiting for more than the client sent.
+	if _, err := br.Peek(1); err != nil {
+		rawConn.SetReadDeadline(time.Time{})
+		log.Printf("[vtunnel-proxy] CONNECT %s: peek client stream failed: %v", connectAuthority, err)
+		rawConn.Close()
+		return
+	}
+	discardConnectPadding(br)
+
 	first, err := br.Peek(tlsRecordHeaderLen)
 	if err != nil {
 		rawConn.SetReadDeadline(time.Time{})
@@ -1060,6 +1073,25 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 		// No pre-established upstream here: the client came in cleartext, so
 		// there was no client handshake to mirror an upstream ALPN onto.
 		p.serveH2(tunnelConn, connectAuthority, rt, nil)
+	case overHijackedSocket && startsLikeHTTP1Request(br):
+		// Cleartext HTTP/1.1 inside the tunnel. Every SOCKS5 client arrives
+		// this way — it has no CONNECT of its own, so the router makes one, and
+		// `curl http://api.corp/` becomes CONNECT api.corp:80 followed by an
+		// ordinary request.
+		//
+		// It is served rather than piped, which is what makes the answer the
+		// same whichever door the client came through: a handler route is
+		// served (piping would have nowhere to go, and this used to be closed
+		// outright), and a target route gets its configured headers injected —
+		// over a pipe they silently were not, so the same request carried the
+		// credential through HTTP_PROXY and not through ALL_PROXY.
+		//
+		// Restricted to a hijacked socket for the same reason h2c is: a nested
+		// server writing after the outer handler returned would be writing to a
+		// response that no longer exists.
+		defer tunnelConn.Close()
+		log.Printf("[vtunnel-proxy] CONNECT %s: cleartext HTTP, terminating", connectAuthority)
+		p.serveH1(tunnelConn, connectAuthority, rt, nil)
 	case rt.handler != nil:
 		// A handler route has no address to fall back to.
 		defer tunnelConn.Close()
@@ -1525,6 +1557,19 @@ func (p *MITMProxy) routeHandler(authority string, rt route, up *upstreamTLSConn
 	return p.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.RequestURI = ""
 
+		// HTTP/1.0 has no Host header, and net/http hands such a request to the
+		// handler as it stands (it answers 400 itself for HTTP/1.1). An empty
+		// Host is not a different host — it is no claim at all — so the
+		// authority this connection was opened for is filled in. Nothing is
+		// widened by that: it is the very value the comparison below would have
+		// demanded.
+		if r.Host == "" && expectHost != "" {
+			r.Host = authority
+			if r.URL != nil {
+				r.URL.Host = authority
+			}
+		}
+
 		if expectHost != "" && !strings.EqualFold(hostFromAuthority(r.Host), expectHost) {
 			log.Printf("[vtunnel-proxy] %s %s: Host %q does not match the authority this connection was opened for; refused",
 				r.Method, authority, r.Host)
@@ -1620,6 +1665,27 @@ func (p *MITMProxy) forwardingHandler(authority string, rt route, up *upstreamTL
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.URL.Scheme = scheme
 		r.URL.Host = target
+
+		// An informational response is an answer that arrives before the
+		// answer: 103 Early Hints tells a client what to start fetching while
+		// the upstream is still working. RoundTrip does not surface them at
+		// all, so they were dropped here — the same plumbing net/http's own
+		// reverse proxy uses is what gets them out.
+		r = r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
+			Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+				h := w.Header()
+				for k, vv := range header {
+					for _, v := range vv {
+						h.Add(k, v)
+					}
+				}
+				w.WriteHeader(code)
+				// The hint's headers belong to the hint. Left in place they
+				// would be written again as part of the real response.
+				clear(h)
+				return nil
+			},
+		}))
 
 		resp, err := transport.RoundTrip(r)
 		if err != nil {
@@ -1954,12 +2020,52 @@ func startsLikeTLSRecord(d []byte) bool {
 // isH2CPreface reports whether the buffered stream opens with the HTTP/2 client
 // connection preface (RFC 7540 §3.5) — the marker of cleartext h2c, which sends
 // it over CONNECT in place of a TLS ClientHello.
+// startsLikeHTTP1Request reports whether the buffered bytes open with a
+// complete HTTP/1.x request line.
+//
+// The whole line is required, version and all, rather than a method-looking
+// word: "GET key\r\n" is a valid redis inline command, and mistaking one for
+// HTTP would mean parsing a connection that should have been piped. Every real
+// HTTP client writes the request line and its headers in one go, so the strict
+// reading costs nothing.
+//
+// Only what has already arrived is examined. Peeking further would wait, and
+// the protocols this most needs to tell apart are the ones that send a short
+// opening and then expect the other side to speak.
+func startsLikeHTTP1Request(br *bufio.Reader) bool {
+	head, _ := br.Peek(min(br.Buffered(), maxRequestLinePeek))
+	line, _, ok := bytes.Cut(head, []byte("\r\n"))
+	if !ok {
+		return false
+	}
+	version := bytes.LastIndex(line, []byte(" HTTP/1."))
+	return version > 0
+}
+
+// maxRequestLinePeek bounds how much of a first line is examined. A request
+// line longer than this is one net/http would refuse anyway.
+const maxRequestLinePeek = 8 << 10
+
+// isH2CPreface reports whether the connection opens with the HTTP/2 client
+// preface.
+//
+// The prefix is checked against what is already buffered before asking for the
+// whole 24 bytes, because a peek waits for them. Every protocol that opens with
+// a short packet and then expects the server to speak first — postgres sends
+// eight bytes, redis six — used to sit here until the peek timeout expired
+// before a single byte was forwarded. An h2c client, by contrast, sends the
+// whole preface at once, so waiting for the rest only happens when the rest is
+// already on its way.
 func isH2CPreface(br *bufio.Reader) bool {
-	p, err := br.Peek(len(http2.ClientPreface))
+	head, _ := br.Peek(min(br.Buffered(), len(http2.ClientPreface)))
+	if len(head) == 0 || !strings.HasPrefix(http2.ClientPreface, string(head)) {
+		return false
+	}
+	full, err := br.Peek(len(http2.ClientPreface))
 	if err != nil {
 		return false
 	}
-	return string(p) == http2.ClientPreface
+	return string(full) == http2.ClientPreface
 }
 
 func hostFromAuthority(authority string) string {
