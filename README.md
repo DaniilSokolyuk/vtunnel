@@ -250,19 +250,16 @@ What multiplexes the streams and authenticates the two ends. There is no negotia
 | `-protocol` | what it is | per-stream window |
 |---|---|---|
 | `ssh` | the default, `golang.org/x/crypto/ssh` | fixed at 2 MB |
-| `yamux` | yamux over TLS 1.3, both ends' keys pinned to the secret | [tunable](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) |
-| `yamux-insecure` | the same with the TLS removed | tunable |
+| `yamux` | yamux over TLS 1.3, both ends' keys pinned to the secret | 8 MB, [tunable](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) |
+| `yamux-insecure` | the same with the TLS removed | 8 MB, tunable |
 
-**The window is the reason there is a second one.** A stream cannot exceed window/RTT whatever the bandwidth, and 2 MB over a 50 ms link is 40 MB/s — a ceiling `x/crypto/ssh` hard-codes and offers no way to lift. Measured through the full tunnel at 50 ms with `-window 16777216`:
+**The window is the reason there is a second one.** A stream cannot exceed window/RTT whatever the bandwidth, so `x/crypto/ssh`'s hard-coded 2 MB caps one connection at 40 MB/s against a sandbox 50 ms away — on any link, however fat. `yamux` makes that number a setting and defaults it to 8 MB. None of this shows up on loopback: it matters when the sandbox is far away, not when it is a container on the same host.
 
-| protocol | throughput | allocated per MB moved |
-|---|---|---|
-| `ssh` | 37 MB/s | 2.40 MB |
-| `yamux` | 161 MB/s | 1.12 MB |
+Allocation is a separate win and applies everywhere: `ssh` allocates more bytes than it carries, roughly a hundred times what `yamux` does for the same traffic.
 
-Reproduce with `go run ./cmd/bench -latency 50ms -window 16777216 -mode direct`. On loopback the difference nearly vanishes, which is the honest caveat: this matters when the sandbox is far away, and the allocation gap matters everywhere — SSH allocates more bytes than it moves.
+Measure your own link with `go run ./cmd/bench -latency 50ms -window … -mode direct`.
 
-**`yamux-insecure` has no encryption and no authentication**, and ignores the secret even when one is set. Whoever reaches the port owns the tunnel, and that includes every [`Client.Listen`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Client.Listen) target and the credential-injecting proxy behind it. It exists so the cost of the cryptography can be measured against the same code path without it — and the measurement says that cost is nothing: at 50 ms it runs at 162 MB/s against `yamux`'s 161. Both ends log a warning naming it, every time they start.
+**`yamux-insecure` has no encryption and no authentication**, and ignores the secret even when one is set. Whoever reaches the port owns the tunnel, and that includes every [`Client.Listen`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Client.Listen) target and the credential-injecting proxy behind it. It exists so the cost of the cryptography can be measured against the same code path without it — and the measurement says that cost is nothing once there is any latency to speak of, the two being indistinguishable at 50 ms. Both ends log a warning naming it, every time they start.
 
 ## Raw port forwards
 
@@ -280,7 +277,7 @@ client.Listen(8085, "tls://www.google.com:443")
 
 ## Reconnection
 
-Automatic, with exponential backoff. Server-side listeners persist across reconnections, and forwards are replayed once the tunnel is back, so a dropped link recovers without intervention. Tunable with [`WithReconnectBackoff`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithReconnectBackoff), [`WithKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithKeepAlive) and [`WithPingInterval`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithPingInterval); [`WithHeaders`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithHeaders) adds WebSocket headers for a corporate proxy in the way. Covered by [`vtunnel_reconnect_test.go`](vtunnel_reconnect_test.go).
+Automatic, with exponential backoff. Server-side listeners persist across reconnections, and forwards are replayed once the tunnel is back, so a dropped link recovers without intervention. Tunable with [`WithReconnectBackoff`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithReconnectBackoff) and [`WithKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithKeepAlive). Every reconnect redials through the same [`Dialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Dialer), so a transport with its own setup — handshake headers for a corporate proxy, a credential to refresh — gets it applied each time. Covered by [`vtunnel_reconnect_test.go`](vtunnel_reconnect_test.go).
 
 ---
 
@@ -578,16 +575,22 @@ Passed to [`NewClient`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewCli
 | Option | What it does | Default |
 |---|---|---|
 | [`WithSecret`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSecret) | The shared tunnel secret; see [Authentication](#authentication) | none — unauthenticated, and warned about |
-| [`WithProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithProtocol) | Session protocol; must match the sandbox | `ProtocolSSH` |
-| [`WithDialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithDialer) | A transport of your own, for what the URL schemes do not cover | from the URL scheme |
-| [`WithStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) | How much the sandbox may send into one connection before this end acknowledges it — a speed limit, see below. Ignored by `ssh` | 2 MB |
+| [`WithProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithProtocol) | How streams are multiplexed and both ends authenticated. A sandbox set to anything else refuses the connection | `ssh` |
+| [`WithDialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithDialer) | A transport of your own, and where transport-shaped settings live — WebSocket handshake headers among them | from the URL scheme |
+| [`WithStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) | How much the sandbox may send into one connection before this end acknowledges it — a speed limit, see below. Ignored by `ssh` | 8 MB |
 | [`WithMitm`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithMitm) | Turn on TLS interception with this CA | off — TLS piped through untouched |
 | [`WithProxy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithProxy) | Supply the controlplane proxy yourself, to share one between clients or pin its address | one is created |
-| [`WithHeaders`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithHeaders) | Extra headers for the WebSocket handshake, for a corporate proxy in the way | none |
 | [`WithKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithKeepAlive) | Ping interval; negative disables | 30s |
 | [`WithReconnectBackoff`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithReconnectBackoff) | Reconnect backoff window | 1s → 5s |
 
-[`WithPingInterval`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithPingInterval) is a deprecated alias for `WithKeepAlive`.
+[`WithPingInterval`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithPingInterval) is a deprecated alias for `WithKeepAlive`. Headers for the WebSocket handshake — a corporate proxy wanting `Proxy-Authorization`, say — belong to the WebSocket rather than to the tunnel, so they go on the dialer:
+
+```go
+d, _ := vtunnel.NewDialer("wss://sandbox:3001/", http.Header{
+    "Proxy-Authorization": {"Basic " + creds},
+})
+client := vtunnel.NewClient("wss://sandbox:3001/", vtunnel.WithDialer(d), vtunnel.WithSecret(secret))
+```
 
 ### Server options
 
@@ -596,11 +599,11 @@ Passed to [`NewServer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewSer
 | Option | What it does | Default |
 |---|---|---|
 | [`WithServerSecret`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerSecret) | The same secret the client is given | none — unauthenticated, and warned about |
-| [`WithServerProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerProtocol) | Session protocol; must match the client | `ProtocolSSH` |
-| [`WithServerStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerStreamWindow) | The same thing for the other direction: how much the controlplane may send into one connection before the sandbox acknowledges it | 2 MB |
+| [`WithServerProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerProtocol) | How streams are multiplexed and both ends authenticated. A client set to anything else is refused | `ssh` |
+| [`WithServerStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerStreamWindow) | The same thing for the other direction: how much the controlplane may send into one connection before the sandbox acknowledges it | 8 MB |
 | [`WithServerKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerKeepAlive) | Ping interval | 30s |
 
-**About the stream window.** It reads like a buffer size and behaves like a speed limit: one tunnelled connection can go no faster than the window divided by the round trip, whatever the bandwidth. 2 MB against a sandbox 50 ms away is 40 MB/s on a gigabit link and 40 MB/s on a ten-gigabit one. Raising it is what [Session protocols](#session-protocols) measures. Two things to know: each direction has its own, so raising one raises one; and the cost is memory, because that much may sit buffered for every connection open at the time.
+**About the stream window.** It reads like a buffer size and behaves like a speed limit: one tunnelled connection can go no faster than the window divided by the round trip, whatever the bandwidth. 2 MB against a sandbox 50 ms away is 40 MB/s on a gigabit link and 40 MB/s on a ten-gigabit one. Two things to know: each direction has its own, so raising one raises one; and the worst-case cost is memory, because a stalled target can leave that much buffered for every connection open at the time.
 
 ### Route options
 

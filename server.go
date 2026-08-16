@@ -64,7 +64,7 @@ func WithServerProtocol(p Protocol) ServerOption {
 
 // WithServerStreamWindow sets how much the controlplane may send into one
 // tunnelled connection before this sandbox has acknowledged any of it. Zero
-// keeps the default of 256 KB.
+// keeps the default of 8 MB.
 //
 // It is [WithStreamWindow] for the other direction, and everything said there
 // about what it costs and when to raise it applies here too.

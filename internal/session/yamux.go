@@ -8,21 +8,21 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
-// The per-stream window is left at yamux's own default of 256 KB, which is
-// also what gost settles for — it overrides nothing either.
+// defaultMuxWindow is the per-stream receive window when Config says nothing.
 //
-// It is a deliberate choice against the throughput this backend exists to
-// offer, and the reason is memory. yamux does not grow the window towards a
-// ceiling: sendWindowUpdate hands out the whole of MaxStreamWindowSize as soon
-// as the application reads, so the figure is a flat per-stream buffer, paid
-// for every tunnelled connection at once. A sandbox with fifty of them open
-// costs fifty times whatever this is, on both ends, and a container is a place
-// where that is noticed.
+// It is not yamux's own default, and not gost's — both leave it at 256 KB.
+// Taking that would ship a backend slower than the one it exists to beat: a
+// stream cannot exceed window/RTT, and SSH's hard-coded 2 MB would win by
+// almost an order of magnitude on any link with latency. This is the smallest
+// round number that is comfortably ahead of it instead.
 //
-// So the default is the cheap one and the fast one is asked for:
+// The figure is a ceiling on what may be in flight, not memory reserved: yamux
+// grows recvBuf only while the local reader falls behind the tunnel, and the
+// tunnel's reader is a copy loop that does not. The worst case is real, though
+// — a stalled target can hold this much per connection — so it is a setting:
 // Config.StreamWindow, reachable as WithStreamWindow and
-// WithServerStreamWindow. Anyone moving large objects over a link with real
-// latency wants it, and the arithmetic for how much is in those docs.
+// WithServerStreamWindow.
+const defaultMuxWindow = 8 * 1024 * 1024
 
 // conn arrives already authenticated and encrypted — see secureClient and
 // secureServer. yamux itself brings no cryptography, and nothing in this file
@@ -33,6 +33,7 @@ func muxConfig(cfg Config) *yamux.Config {
 	// Keepalive is the tunnel layer's job, done the same way on every backend
 	// rather than once per multiplexer that happens to offer it.
 	c.EnableKeepAlive = false
+	c.MaxStreamWindowSize = defaultMuxWindow
 	if cfg.StreamWindow > 0 {
 		c.MaxStreamWindowSize = uint32(cfg.StreamWindow)
 	}

@@ -27,7 +27,7 @@ func main() {
 	protocol := flag.String("protocol", "all", "session protocol: ssh, yamux, yamux-insecure, all")
 	transport := flag.String("transport", "ws", "transport under the session: ws or tcp")
 	latency := flag.Duration("latency", 0, "round trip added to the transport, e.g. 50ms (0 = loopback)")
-	window := flag.Int("window", 0, "per-stream receive window in bytes (0 = default 2MB; ssh ignores it)")
+	window := flag.Int("window", 0, "per-stream receive window in bytes (0 = the yamux default; ssh ignores it)")
 	iters := flag.Int("n", 2000, "iterations for the stream and handshake modes")
 	cpuprofile := flag.String("cpuprofile", "", "write cpu profile to file")
 	memprofile := flag.String("memprofile", "", "write memory profile to file")

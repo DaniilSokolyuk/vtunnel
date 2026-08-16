@@ -171,25 +171,26 @@ on its own mux — to keep a health endpoint on the same port — changes one wo
 match on both ends — there is no negotiation, so a mismatch fails rather than
 falling back.
 
-`ssh` stays the default. `yamux` exists for one reason: `golang.org/x/crypto/ssh`
-fixes its per-stream window at 2 MB and offers no way to lift it, and a stream
-cannot exceed window/RTT. Measured through the full tunnel at 50 ms of round
-trip, with the window raised to 16 MB:
+`ssh` stays the default, so switching is opt-in. `yamux` exists for one reason:
+`golang.org/x/crypto/ssh` fixes its per-stream window at 2 MB and offers no way
+to lift it, and a stream cannot exceed window/RTT — which caps one connection
+at 40 MB/s against a sandbox 50 ms away, however fat the link. `yamux` makes
+that a setting, defaulting to 8 MB, through
+[`WithStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow)
+and [`WithServerStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerStreamWindow),
+one per direction.
 
-| protocol | throughput | allocated per MB moved |
-|---|---|---|
-| `ssh` | 37 MB/s | 2.40 MB |
-| `yamux` | 161 MB/s | 1.12 MB |
-
-Reproduce with `go run ./cmd/bench -latency 50ms -window 16777216 -mode direct`.
-On loopback the gap nearly disappears — this is worth switching for when the
-sandbox is far away, and the allocation difference is worth knowing about
-everywhere.
+None of this shows on loopback, so switch for a sandbox that is far away rather
+than one on the same host. Allocation is a separate matter and applies
+everywhere: `ssh` allocates more bytes than it carries, roughly a hundred times
+what `yamux` does. Measure your own link with
+`go run ./cmd/bench -latency 50ms -window … -mode direct`.
 
 There is also `yamux-insecure`: the same path with the TLS removed, **no
 encryption, no authentication, the secret ignored**. It is there so the cost of
 the cryptography can be measured, and the measurement says that cost is nothing
-once there is any latency — 162 MB/s against `yamux`'s 161. Both ends log a
+once there is any latency to speak of, the two being indistinguishable at 50 ms.
+Both ends log a
 warning naming it at every start. Do not run it.
 
 ## Rollback

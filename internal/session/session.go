@@ -73,7 +73,7 @@ type Config struct {
 	Handshake time.Duration
 
 	// StreamWindow is the per-stream receive window, in bytes. Zero takes
-	// yamux's own default of 256 KB.
+	// defaultMuxWindow, which explains why it is not yamux's own default.
 	//
 	// It is the ceiling on one stream: a sender may have this much in flight
 	// unacknowledged, so a single stream tops out at StreamWindow/RTT no matter

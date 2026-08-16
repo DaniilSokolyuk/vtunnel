@@ -28,7 +28,6 @@ const (
 // Client connects to a vtunnel server and forwards connections.
 type Client struct {
 	url          string
-	headers      http.Header
 	dialer       Dialer
 	protocol     Protocol
 	streamWindow int
@@ -83,13 +82,6 @@ func WithPingInterval(d time.Duration) Option {
 	return WithKeepAlive(d)
 }
 
-// WithHeaders sets HTTP headers for the WebSocket handshake.
-func WithHeaders(h http.Header) Option {
-	return func(c *Client) {
-		c.headers = h
-	}
-}
-
 // WithReconnectBackoff configures the reconnect backoff window.
 func WithReconnectBackoff(min, max time.Duration) Option {
 	return func(c *Client) {
@@ -131,9 +123,20 @@ func WithSecret(secret string) Option {
 	}
 }
 
-// WithDialer replaces the transport with one of your own, for anything the
-// URL schemes do not cover. The URL passed to [NewClient] is then only a label
-// for logs.
+// WithDialer replaces the transport with one of your own, and is where
+// anything transport-shaped is configured. Headers on the WebSocket handshake,
+// for a corporate proxy in the way, are a property of that WebSocket rather
+// than of the tunnel, so they are set on the dialer that opens it:
+//
+//	d, err := vtunnel.NewDialer("wss://sandbox:3001/", http.Header{
+//	    "Proxy-Authorization": {"Basic " + creds},
+//	})
+//	client := vtunnel.NewClient("wss://sandbox:3001/",
+//	    vtunnel.WithDialer(d), vtunnel.WithSecret(secret))
+//
+// Wrapping [NewDialer] is the way to add behaviour the tunnel has no opinion
+// about — a retry, a dial through something else, artificial latency for a
+// benchmark. The URL passed to [NewClient] is then only a label for logs.
 //
 // Reaching a sandbox over TCP instead of a WebSocket needs no option at all —
 // see [NewClient].
@@ -153,20 +156,17 @@ func WithProtocol(p Protocol) Option {
 
 // WithStreamWindow sets how much the sandbox may send into one tunnelled
 // connection before this client has acknowledged any of it. Zero keeps the
-// default of 256 KB.
+// default of 8 MB.
 //
-// It is a speed limit wearing the clothes of a buffer size. One connection can
+// It is a speed limit wearing the clothes of a buffer size: one connection can
 // go no faster than the window divided by the round trip, and bandwidth does
-// not enter into it: 256 KB against a sandbox 50 ms away is 5 MB/s, on a
-// gigabit link and on a ten-gigabit one alike. 16 MB against that same sandbox
-// is measured at 161 MB/s.
+// not enter into it. Raise it for a distant sandbox moving large objects; lower
+// it if many connections are open at once and memory is tight. The window is an
+// allowance rather than memory reserved — yamux buffers only while the local
+// reader falls behind — but a stalled target can hold the whole of it, per
+// connection.
 //
-// The default is small because the cost is memory, paid per connection rather
-// than per tunnel: this much may sit buffered for every tunnelled connection
-// open at the time, and a sandbox mid-build has plenty. Raise it when the
-// sandbox is far away and the traffic is large objects rather than many small
-// requests, which is the case where the arithmetic above bites and the
-// connection count is low.
+// To put numbers on your own link, cmd/bench takes -window and -latency.
 //
 // This governs sandbox to controlplane. The other direction is the sandbox's to
 // set, with [WithServerStreamWindow], and raising only one of them raises only
@@ -447,7 +447,7 @@ func (c *Client) transport() (Dialer, error) {
 	if c.dialer != nil {
 		return c.dialer, nil
 	}
-	d, err := NewDialer(c.url, c.headers)
+	d, err := NewDialer(c.url, nil)
 	if err != nil {
 		return nil, err
 	}
