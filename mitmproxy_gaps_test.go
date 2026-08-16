@@ -357,3 +357,45 @@ func TestMismatchedHostInsideMITMIsStillRefused(t *testing.T) {
 		t.Fatalf("status = %s, want 421", resp.Status)
 	}
 }
+
+// Expect: 100-continue is a conversation between the client and whoever reads
+// its body, and net/http holds up that end itself — it answers 100 the moment
+// the handler starts reading. Forwarding the upstream's 100 as well left the
+// client with two of them for one request.
+func TestExpectContinueIsAnsweredExactlyOnce(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "got %q", body)
+	}))
+	defer backend.Close()
+
+	addr, ca := gapProxy(t, backend.Listener.Addr().String())
+	tc := connectThenTLS(t, addr, "probe.test:443", "probe.test", "", ca)
+
+	fmt.Fprint(tc, "POST /x HTTP/1.1\r\nHost: probe.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+
+	br := bufio.NewReader(tc)
+	interim, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read interim: %v", err)
+	}
+	if interim.StatusCode != http.StatusContinue {
+		t.Fatalf("interim = %s, want 100 Continue", interim.Status)
+	}
+
+	fmt.Fprint(tc, "HELLO")
+
+	final, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read final: %v", err)
+	}
+	if final.StatusCode == http.StatusContinue {
+		t.Fatal("the client was told 100 Continue twice: net/http answers the expectation " +
+			"itself, and the upstream's answer to the same expectation was forwarded on top")
+	}
+	body, _ := io.ReadAll(final.Body)
+	final.Body.Close()
+	if final.StatusCode != http.StatusOK || string(body) != `got "HELLO"` {
+		t.Fatalf("final = %s %q", final.Status, body)
+	}
+}

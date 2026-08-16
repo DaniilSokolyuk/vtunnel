@@ -1671,8 +1671,29 @@ func (p *MITMProxy) forwardingHandler(authority string, rt route, up *upstreamTL
 		// the upstream is still working. RoundTrip does not surface them at
 		// all, so they were dropped here — the same plumbing net/http's own
 		// reverse proxy uses is what gets them out.
+		var (
+			roundTripMu   sync.Mutex
+			roundTripDone bool
+		)
 		r = r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{
 			Got1xxResponse: func(code int, header textproto.MIMEHeader) error {
+				// 100 Continue is not passed on. It answers an expectation the
+				// client made of whoever reads its body, and net/http answers
+				// that itself the moment this handler's transport starts
+				// reading — forwarding the upstream's answer to the same
+				// question gave the client two of them.
+				if code == http.StatusContinue {
+					return nil
+				}
+
+				roundTripMu.Lock()
+				defer roundTripMu.Unlock()
+				if roundTripDone {
+					// The response is already being written; the header map is
+					// no longer ours to touch.
+					return nil
+				}
+
 				h := w.Header()
 				for k, vv := range header {
 					for _, v := range vv {
@@ -1688,6 +1709,9 @@ func (p *MITMProxy) forwardingHandler(authority string, rt route, up *upstreamTL
 		}))
 
 		resp, err := transport.RoundTrip(r)
+		roundTripMu.Lock()
+		roundTripDone = true
+		roundTripMu.Unlock()
 		if err != nil {
 			// TLS 1.3 sends the client certificate after the handshake has
 			// otherwise completed, so an upstream that requires one accepts the
