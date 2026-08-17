@@ -9,29 +9,21 @@ A reverse tunnel with a full TLS-intercepting proxy on the far end. Set `HTTPS_P
 **Tunnel**
 
 * Reverse — the client dials in; the sandbox needs no route back out
-* Transports: WebSocket, `wss`, TCP, or a `net.Conn` of your own
-* Sessions: SSH, or yamux over TLS 1.3 pinned to a shared secret
+* Transports `ws` / `wss` / `tcp`, or a `net.Conn` of your own; sessions SSH or yamux over TLS 1.3 pinned to a shared secret
 * Domain routing in the sandbox, without decrypting anything
 * Egress rules the sandbox enforces: CIDRs, addresses and wildcard names, allow or deny
-* Only domain names and egress rules cross the tunnel — no targets, no credentials, no CA
-* Raw TCP port forwards
-* Reconnect with backoff; listeners and routes replayed
+* Only domain names and those rules cross the tunnel — no targets, no credentials, no CA
+* Raw TCP port forwards; reconnect with backoff, listeners and routes replayed
 
 **MITM proxy**
 
 * Full TLS interception, leaf certificates signed on the fly and cached
-* HTTP/1.1, HTTP/2, cleartext h2c over `CONNECT`
-* ALPN mirrored from the real upstream, translated on mismatch
-* gRPC with trailer forwarding, announced and unannounced
-* SSE streamed event by event, on every route shape
+* HTTP/1.1, HTTP/2 and cleartext h2c, with ALPN mirrored from the real upstream and translated on mismatch
+* gRPC with trailers, SSE streamed event by event, gzip correct whether or not the client asked for it
 * WebSocket spliced, not re-terminated — subprotocol, `permessage-deflate` and fragmentation intact
-* Header injection per domain, `tls://` / `h2c://` / `http://` targets, SNI override
-* Wildcard domains with nginx-like precedence
-* Routes: your `http.Handler` in-process, another target, a raw pipe, or a refusal
+* Routes: your `http.Handler` in-process, another target, a raw pipe, or a refusal — with per-domain header injection, `tls://` / `h2c://` / `http://` targets, SNI override and wildcards
 * Middleware on every terminated request — read or rewrite bodies, SSE and WebSocket frames
-* gzip handled correctly whether or not the client asked for it
 * Automatic passthrough for pinning and mTLS upstreams
-* `Close` / `Shutdown(ctx)`, `SSLKEYLOGFILE` on both legs
 * Works standalone, with no tunnel at all
 
 ```
@@ -401,9 +393,13 @@ A domain is served in exactly one of three shapes. Which one you pick decides wh
 |---|---|---|---|
 | [`ForwardTo(domain, target)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo) | TLS is terminated and the request re-issued to `target` | yes | **yes** |
 | [`Handle(domain, h)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Handle) | served by your `http.Handler` in this process; no upstream connection at all | yes | n/a |
-| [`Forward(domain)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Forward) | piped to the host the client asked for, TLS untouched | no | no |
+| [`Forward(domain)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Forward) | the target is the host the client asked for, filled in per request | no | no |
 
-`Forward` is the only shape that works against an upstream that pins certificates, precisely because nothing is terminated.
+They differ in **where** the request goes, not in whether it is decrypted. With a CA configured, everything routed through this proxy is intercepted — including `Forward`, whose target is simply the authority the client named. Without one nothing can be, so `Forward` is piped and `ForwardTo` degrades to a pipe aimed at its target.
+
+The way out of interception is [`MITMExceptions`](#when-interception-cannot-work), which is also what the proxy records for itself after a handshake that could not have worked. Reach for it when the client pins certificates, or when what rides inside the TLS is not HTTP.
+
+`Forward` is the only shape a wildcard can carry: its target comes from the request, so `*.corp` sends every host under it to itself, where a fixed target would send them all to one place.
 
 Anything in the "needs a CA" column is **refused when no CA is configured**, at the point the route is declared rather than on every request that reaches it. Injection happens after TLS is terminated, so on a proxy that cannot terminate it a route carrying headers would answer requests perfectly normally and simply never add the credential — a failure with no error to see. A CA-less proxy is still fully useful for routing and passthrough; it just cannot promise what it cannot do.
 
@@ -526,7 +522,7 @@ HTTP/1.1 and HTTP/2 on both legs, plus cleartext h2c inside a `CONNECT` tunnel.
 
 **ALPN is mirrored, not guessed.** The proxy establishes the upstream connection before finishing the client's handshake, so the protocol it offers the application is one the upstream actually supports. When the client's ALPN excludes what the upstream settled on, the proxy translates between the two instead of failing the handshake — it re-issues requests rather than piping them, so the two sides need not agree ([`mitmproxy_alpn_mirror_test.go`](mitmproxy_alpn_mirror_test.go)).
 
-**gRPC works, trailers included.** `grpc-status` arrives after the body, so it is forwarded separately from the headers; unannounced trailers are handled too ([`mitmproxy_trailers_test.go`](mitmproxy_trailers_test.go), [`mitmproxy_grpcurl_test.go`](mitmproxy_grpcurl_test.go)). Cleartext h2c over `CONNECT` is terminated without a certificate, which is what makes header injection into plain gRPC possible ([`proxy_h2c_connect_fallback_test.go`](proxy_h2c_connect_fallback_test.go)).
+**gRPC works, trailers included.** `grpc-status` arrives after the body, so it is forwarded separately from the headers; unannounced trailers are handled too ([`mitmproxy_trailers_test.go`](mitmproxy_trailers_test.go), [`mitmproxy_grpcurl_test.go`](mitmproxy_grpcurl_test.go)). Cleartext h2c over `CONNECT` is terminated without a certificate, which is what makes header injection into plain gRPC possible ([`mitmproxy_h2c_connect_test.go`](mitmproxy_h2c_connect_test.go)).
 
 **Compression passes through correctly.** If the application asked for `gzip`, the compressed bytes are forwarded untouched with `Content-Encoding` intact. If it did not, the proxy's own transport asks for compression, decompresses, and drops the header — so the body and the headers describing it always agree ([`mitmproxy_gzip_test.go`](mitmproxy_gzip_test.go)).
 
@@ -567,6 +563,8 @@ Changing WebSocket frames rather than only watching them is the same hook plus a
 ## When interception cannot work
 
 Some upstreams cannot be intercepted at all: a client that pins certificates refuses the generated leaf every time, and an upstream demanding mutual TLS refuses the proxy every time. Rather than failing identically on every request, the proxy notices and stops trying — the domain is piped through untouched for the next 10 minutes, with a `WARNING` naming it. Interception resumes afterwards, so installing the CA in the client takes effect without a restart.
+
+This is the only way out, which is deliberate: a proxy holding a CA intercepts everything routed through it, so "leave this one alone" is something you say rather than something you get by spelling a route differently.
 
 Two cases deliberately keep failing instead:
 
@@ -674,8 +672,9 @@ Nothing dials in, no client exists, and the rules apply from the first connectio
 ### `-forward` formats
 
 ```bash
-# Route the domain to itself, TLS untouched. No target means no interception,
-# which is what an upstream that pins certificates needs. -H does not apply.
+# No target: go to whatever host was asked for. Intercepted like any other
+# route when -mitm-ca is given. -H does not apply — attach headers to the
+# target form below.
 -forward gitlab.corp
 
 # Intercepted and re-issued to the real host — the form to use when you want
@@ -685,15 +684,20 @@ Nothing dials in, no client exists, and the rules apply from the first connectio
 # Route to a service on the controlplane
 -forward myapi.local=localhost:8080
 
-# Controlplane-side TLS: intercepted, sent as plain HTTP through the tunnel,
-# re-encrypted by the client on the way to the real host
--forward myapi.local=tls://api.example.com:443
+# State how to reach the target instead of leaving it to be discovered. The
+# client terminates the application's TLS and opens this second hop itself,
+# so the two legs are independent and only this one needs a scheme.
+-forward myapi.local=tls://api.example.com:443   # TLS, SNI from the host
+-forward grpc.corp=h2c://api.internal:13002      # cleartext HTTP/2, nothing probed
+-forward legacy.corp=http://api.internal:8080    # cleartext, no TLS probe
 
 # Wildcards
 -forward '*.example.test=localhost:8080'
 -forward 'mail.*=localhost:8080'
 
-# Port forward: the server opens a TCP port and tunnels every connection
+# Port forward: the server opens a TCP port and tunnels every connection.
+# tls:// is the client wrapping that pipe; a raw pipe parses nothing, so no
+# other scheme means anything here.
 -forward 9000=localhost:3000
 -forward 8085=tls://www.google.com:443
 ```
@@ -720,7 +724,7 @@ Passed to [`NewClient`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewCli
 | [`WithSecret`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSecret) | The shared tunnel secret; see [Authentication](#authentication) | none — unauthenticated, and warned about |
 | [`WithProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithProtocol) | How streams are multiplexed and both ends authenticated. A sandbox set to anything else refuses the connection | `ssh` |
 | [`WithDialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithDialer) | A transport of your own, and where transport-shaped settings live — WebSocket handshake headers among them | from the URL scheme |
-| [`WithStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) | How much the sandbox may send into one connection before this end acknowledges it — a speed limit, see below. Ignored by `ssh` | 8 MB |
+| [`WithStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithStreamWindow) | How much the sandbox may send into one connection before this end acknowledges it — a speed limit, see [Session protocols](#session-protocols). Ignored by `ssh` | 8 MB |
 | [`WithMitm`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithMitm) | Turn on TLS interception with this CA | off — TLS piped through untouched |
 | [`WithProxy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithProxy) | Supply the controlplane proxy yourself, to share one between clients or pin its address | one is created |
 | [`WithKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithKeepAlive) | Ping interval; negative disables | 30s |
@@ -744,11 +748,12 @@ Passed to [`NewServer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewSer
 | [`WithServerSecret`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerSecret) | The same secret the client is given | none — unauthenticated, and warned about |
 | [`WithServerProtocol`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerProtocol) | How streams are multiplexed and both ends authenticated. A client set to anything else is refused | `ssh` |
 | [`WithServerStreamWindow`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerStreamWindow) | The same thing for the other direction: how much the controlplane may send into one connection before the sandbox acknowledges it | 8 MB |
+| [`WithServerEgressPolicy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerEgressPolicy) | Egress rules in force from startup, for the window before a controlplane connects; see [Egress policy](#egress-policy) | none — anything unrouted is dialled |
 | [`WithServerKeepAlive`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerKeepAlive) | Ping interval | 30s |
 
 One client at a time: a second connection takes the tunnel over and the previous session is closed, with a line in the log. Refusing it instead would lock a client out of its own sandbox after a half-open connection, which nothing notices until the keepalive does.
 
-**About the stream window.** It reads like a buffer size and behaves like a speed limit: one tunnelled connection can go no faster than the window divided by the round trip, whatever the bandwidth. 2 MB against a sandbox 50 ms away is 40 MB/s on a gigabit link and 40 MB/s on a ten-gigabit one. Two things to know: each direction has its own, so raising one raises one; and the worst-case cost is memory, because a stalled target can leave that much buffered for every connection open at the time.
+The two stream windows are independent, so raising one raises one — and the worst case is memory, since a stalled target can leave a window's worth buffered for every connection open at the time.
 
 ### Route options
 

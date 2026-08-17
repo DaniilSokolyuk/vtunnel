@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,14 +15,15 @@ import (
 	"github.com/vivid-money/vtunnel"
 )
 
-// Forward and ForwardTo are the whole interception story: a forward with no
-// target is piped through untouched, a forward with one is terminated and
-// re-issued. These two tests pin that difference from the application's side.
+// Forward and ForwardTo differ in where the target comes from, and in nothing
+// else: whether the connection is decrypted is the CA's business and the
+// exceptions', not the route's. These tests pin that from the application's
+// side, which is the only side that can tell.
 
-// No target: the application must end up talking to the upstream's own
-// certificate, not one minted by the CA. This is what makes pinned upstreams
-// usable, and it needs no CA at all.
-func TestForwardWithoutTargetKeepsTLSEndToEnd(t *testing.T) {
+// A CA is configured, so a forward with no target is intercepted like any
+// other route: what reaches the application is a leaf this proxy minted, and
+// the proxy holds the upstream's certificate rather than passing it on.
+func TestForwardWithoutTargetIsInterceptedWhenThereIsACA(t *testing.T) {
 	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "upstream")
 	}))
@@ -29,10 +31,45 @@ func TestForwardWithoutTargetKeepsTLSEndToEnd(t *testing.T) {
 	defer upstream.Close()
 
 	// The forwarded domain has to be an address the egress proxy can actually dial,
-	// since "route it to itself" means exactly that.
+	// since "go to the host you asked for" means exactly that.
 	authority := upstream.Listener.Addr().String()
 
-	egressAddr, ca, client, cleanup := startForwardFixture(t)
+	ca := generateTestCA(t)
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+	// Terminating means this proxy is now the one verifying the upstream, which
+	// is the whole cost of the change: a privately signed upstream has to be
+	// trusted here rather than by the application.
+	proxy.SetTransportTLSConfig(&tls.Config{RootCAs: poolWith(t, upstream.Certificate())})
+
+	egressAddr, _, client, cleanup := startForwardFixtureWithProxy(t, proxy)
+	defer cleanup()
+
+	client.Proxy().Forward(authority)
+	time.Sleep(150 * time.Millisecond)
+
+	tlsConn := connectThroughEgress(t, egressAddr, authority, nil)
+	defer tlsConn.Close()
+
+	if peer := tlsConn.ConnectionState().PeerCertificates[0]; !signedBy(t, peer, ca) {
+		t.Fatal("a forward with no target was piped; with a CA it must be intercepted")
+	}
+	if got := getOver(t, tlsConn, authority); got != "upstream" {
+		t.Fatalf("got %q, want the upstream's response through the intercepted connection", got)
+	}
+}
+
+// No CA: there is nothing to terminate with, so the application ends up
+// talking to the upstream's own certificate.
+func TestForwardWithoutTargetKeepsTLSEndToEndWithoutACA(t *testing.T) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "upstream")
+	}))
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	authority := upstream.Listener.Addr().String()
+
+	egressAddr, _, client, cleanup := startForwardFixtureWithProxy(t, vtunnel.NewMITMProxy())
 	defer cleanup()
 
 	client.Proxy().Forward(authority)
@@ -42,8 +79,39 @@ func TestForwardWithoutTargetKeepsTLSEndToEnd(t *testing.T) {
 	defer tlsConn.Close()
 
 	peer := tlsConn.ConnectionState().PeerCertificates[0]
-	if signedBy(t, peer, ca) {
-		t.Fatal("a forward with no target was intercepted; its TLS must reach the upstream untouched")
+	if !peer.Equal(upstream.Certificate()) {
+		t.Fatalf("the application was handed %v, want the upstream's own certificate", peer.Subject)
+	}
+}
+
+// And an upstream that must not be intercepted says so. This is the one way
+// out of interception now, which is why it has to work for a route whose
+// target is the host the client asked for — there is no configured address for
+// the pipe to aim at, only the authority.
+func TestMITMExceptionPipesAForwardWithNoTarget(t *testing.T) {
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "upstream")
+	}))
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	authority := upstream.Listener.Addr().String()
+
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(generateTestCA(t)))
+	proxy.MITMExceptions(authority)
+
+	egressAddr, _, client, cleanup := startForwardFixtureWithProxy(t, proxy)
+	defer cleanup()
+
+	client.Proxy().Forward(authority)
+	time.Sleep(150 * time.Millisecond)
+
+	tlsConn := connectThroughEgress(t, egressAddr, authority, nil)
+	defer tlsConn.Close()
+
+	peer := tlsConn.ConnectionState().PeerCertificates[0]
+	if !peer.Equal(upstream.Certificate()) {
+		t.Fatalf("the application was handed %v, want the upstream's own certificate", peer.Subject)
 	}
 }
 
@@ -141,6 +209,36 @@ func startForwardFixtureWithProxy(t *testing.T, proxy *vtunnel.MITMProxy) (strin
 		server.CloseProxy()
 		ts.Close()
 	}
+}
+
+// poolWith is a root pool holding one certificate, for an upstream this proxy
+// now has to verify itself.
+func poolWith(t *testing.T, cert *x509.Certificate) *x509.CertPool {
+	t.Helper()
+	pool := x509.NewCertPool()
+	pool.AddCert(cert)
+	return pool
+}
+
+// getOver issues one GET over an already-established TLS connection and returns
+// the body, so a test can check that the intercepted connection carries traffic
+// and not just a certificate.
+func getOver(t *testing.T, conn net.Conn, authority string) string {
+	t.Helper()
+
+	if _, err := fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", authority); err != nil {
+		t.Fatalf("write request: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return string(body)
 }
 
 // signedBy reports whether cert chains to the given CA.

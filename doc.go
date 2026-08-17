@@ -121,9 +121,9 @@
 //	routes.ForwardTo("api.corp", "localhost:8081",
 //	    vtunnel.WithHeader("Authorization", "Bearer "+token))
 //
-//	// Route it to itself with its TLS untouched — the only shape that works
-//	// against an upstream that pins certificates, and the one that cannot
-//	// carry an injected header.
+//	// Send it to the host the client asked for, whatever that turns out to
+//	// be — the one shape a wildcard can carry. It is intercepted like any
+//	// other route; [MITMProxy.MITMExceptions] is how a domain opts out.
 //	routes.Forward("gitlab.corp")
 //
 // [MITMProxy.ForwardTo], [MITMProxy.Handle], [MITMProxy.Forward] and

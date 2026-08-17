@@ -115,9 +115,10 @@ Client flags:
                     Port:   -forward 8080=localhost:3000
                     Domain: -forward llmproxy.local=localhost:8080
                     Real host: -forward gitlab.corp
-                            No target = route it to itself, TLS untouched.
-                            Use for upstreams that pin certificates; nothing
-                            is decrypted, so -H does not apply.
+                            No target = go to the host that was asked for.
+                            Intercepted like any other route when -mitm-ca is
+                            given; a wildcard is allowed here and nowhere else,
+                            since the target comes from the request.
                     TLS:    -forward 8085=tls://www.google.com:443
                     A domain target may state how to reach the upstream:
                       tls://host:port   TLS, SNI from the host (":443" too)
@@ -427,7 +428,7 @@ func runClient(args []string) {
 		if f.domain != "" {
 			// Routes live on the proxy; the client mirrors them into the sandbox.
 			if f.localAddr == "" {
-				// No target: route the domain to itself, TLS untouched.
+				// No target: go to whatever host the request named.
 				client.Proxy().Forward(f.domain)
 				continue
 			}
@@ -537,7 +538,7 @@ func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
 type forward struct {
 	remotePort int    // port-based forward (mutually exclusive with domain)
 	domain     string // domain-based forward (mutually exclusive with remotePort)
-	localAddr  string // empty for a domain = route it to itself, TLS untouched
+	localAddr  string // empty for a domain = go to the host that was asked for
 	headers    []forwardHeader
 }
 
@@ -570,9 +571,11 @@ func (f *forwardList) Set(val string) error {
 		if _, err := strconv.Atoi(left); err == nil {
 			return fmt.Errorf("invalid forward %q: a port forward needs a target, e.g. %s=localhost:3000", val, left)
 		}
-		if strings.Contains(left, "*") {
-			return fmt.Errorf("invalid forward %q: a wildcard has no host to stand for, give it a target", val)
-		}
+		// A wildcard is fine here, and used to be refused on the grounds that it
+		// had no host to stand for. It has one: the target of a targetless
+		// forward is whatever host the request named, so "*.corp" routes every
+		// host under it to itself. That is the only route shape a wildcard can
+		// carry, since a fixed target would send them all to one place.
 		*f = append(*f, forward{domain: left})
 		return nil
 	}
@@ -612,7 +615,7 @@ func (h *headerList) Set(val string) error {
 		return fmt.Errorf("-H/-header %q: empty header name", val)
 	}
 	if last.localAddr == "" {
-		return fmt.Errorf("-H %q: %s has no target, so its TLS is never terminated and there is nothing to inject into; give it one, e.g. -forward %s=%s:443",
+		return fmt.Errorf("-H %q: headers attach to a forward with a target; give %s one, e.g. -forward %s=%s:443",
 			val, last.domain, last.domain, last.domain)
 	}
 	last.headers = append(last.headers, forwardHeader{name: name, value: value})

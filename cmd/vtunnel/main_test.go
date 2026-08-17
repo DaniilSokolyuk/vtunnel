@@ -98,6 +98,15 @@ func TestParseClientFlags(t *testing.T) {
 			},
 		},
 
+		{
+			// A wildcard is only expressible without a target: the host to go
+			// to comes from the request, and a fixed target would send every
+			// host under the pattern to one place. This used to be refused.
+			name:         "wildcard forward, no target",
+			args:         []string{"-forward", "*.beta.corp"},
+			wantForwards: []forward{{domain: "*.beta.corp"}},
+		},
+
 		// --- error paths ---
 		{
 			name: "-H before any -forward",

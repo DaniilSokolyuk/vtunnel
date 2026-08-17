@@ -145,9 +145,9 @@ var errNoMitmCA = errors.New("no MITM CA is configured: pass WithMitmCA, or With
 //     ([MITMProxy.Handle]).
 //   - target set — TLS is terminated and the request re-issued to that address
 //     ([MITMProxy.ForwardTo]). This is the only shape that can inject headers.
-//   - neither — piped to the host the client asked for, TLS untouched
-//     ([MITMProxy.Forward]). Needs no CA, and is the only way to reach an
-//     upstream that pins certificates.
+//   - neither — the target is the host the client asked for ([MITMProxy.Forward]).
+//     Filled in per request, so it is terminated like any other route when
+//     there is a CA and piped when there is not.
 type route struct {
 	handler http.Handler
 	target  string
@@ -161,6 +161,15 @@ type route struct {
 	// the upstream is spoken to that way without being asked and whatever the
 	// client side settled on.
 	h2c bool
+	// selfTarget records that target was filled in from the authority the
+	// client asked for rather than configured — a [MITMProxy.Forward] route,
+	// served by a proxy that holds a CA.
+	//
+	// Such a route says where to go and nothing about how, so it follows the
+	// client: TLS inside the tunnel means TLS to the upstream, cleartext means
+	// cleartext. A configured target is the opposite — it says how, and the two
+	// legs are then independent.
+	selfTarget bool
 	// generation tells one revision of a route from another, so a connection
 	// that resolved this route when it opened can notice that the answer has
 	// changed since. Comparing the routes themselves would not do: a handler is
@@ -665,11 +674,18 @@ func (p *MITMProxy) Handle(domain string, h http.Handler, opts ...ForwardOption)
 	return nil
 }
 
-// Forward routes a domain through this proxy to the host the client asked for,
-// piping bytes without terminating TLS. It needs no CA and works with upstreams
-// that pin certificates — but nothing can be injected into it.
+// Forward routes a domain through this proxy to the host the client asked for.
+// The target comes from the request rather than from the route, which is what
+// lets one wildcard stand for a whole family of hosts.
+//
+// What happens to its TLS follows the proxy, not the route. With a CA it is
+// terminated like any other route, so middleware and [WithHeader] apply; with
+// no CA there is nothing to terminate with and the bytes are piped. An upstream
+// that must not be intercepted — one the client pins, or something that is not
+// HTTP — is [MITMProxy.MITMExceptions], which is also what the proxy records
+// for itself after a handshake that could not have worked.
 func (p *MITMProxy) Forward(domain string) {
-	p.setRoute(domain, route{}, "itself, TLS untouched")
+	p.setRoute(domain, route{}, "the host the client asked for")
 }
 
 // ForwardTo terminates the client's TLS and re-issues the request to target,
@@ -1117,6 +1133,24 @@ func (p *MITMProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[vtunnel-proxy] CONNECT %s: MITM cert cache unusable: %v", hostPort, err)
 	}
 
+	// A route with no target of its own means "go to the host you asked for",
+	// and on a proxy holding a CA that is still terminated. Anything routed
+	// through this proxy is decrypted if it can be: that is what the CA is for,
+	// and it is what makes middleware, in-process handlers and the injected
+	// credential apply uniformly instead of depending on which spelling of a
+	// route somebody picked.
+	//
+	// The cleartext path has always done this — see handleHTTP, which fills in
+	// the same target — so before this the same route was re-issued on :80 and
+	// piped on :443.
+	//
+	// An upstream that must not be intercepted is still reachable, and now says
+	// so explicitly: MITMExceptions, or the exclusion the proxy learns for
+	// itself from a handshake that could not have worked.
+	if isRouted && certs != nil && rt.target == "" && rt.handler == nil {
+		rt.target, rt.selfTarget = hostPort, true
+	}
+
 	// A routed domain may carry cleartext h2c gRPC, not only TLS.
 	intercept := isRouted && rt.terminates() && certs != nil
 	if intercept {
@@ -1163,13 +1197,20 @@ func (p *MITMProxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Pipe bytes: to the route's target, to the requested host itself for a
 	// Forward route, or straight out for anything unrouted.
+	//
+	// With a CA configured, reaching here for a routed domain means the
+	// interception that would otherwise have happened was excepted — so the log
+	// says which of the two it is rather than announcing "untouched", which on
+	// an intercepting proxy reads as a contradiction.
 	target := hostPort
 	switch {
+	case isRouted && rt.selfTarget:
+		log.Printf("[vtunnel-proxy] CONNECT %s -> itself, not intercepted", hostPort)
 	case isRouted && rt.target != "":
 		target = rt.target
-		log.Printf("[vtunnel-proxy] CONNECT %s -> %s (TLS untouched, no CA)", hostPort, target)
+		log.Printf("[vtunnel-proxy] CONNECT %s -> %s, not intercepted", hostPort, target)
 	case isRouted:
-		log.Printf("[vtunnel-proxy] CONNECT %s -> itself (TLS untouched)", hostPort)
+		log.Printf("[vtunnel-proxy] CONNECT %s -> itself, no MITM CA to intercept with", hostPort)
 	default:
 		log.Printf("[vtunnel-proxy] CONNECT %s -> direct", hostPort)
 	}
@@ -1279,6 +1320,15 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 
 	switch {
 	case kind == tunnelTLS:
+		if rt.selfTarget {
+			// The client is speaking TLS to the host it named, so this proxy
+			// speaks TLS to that same host under that same name. Decided here
+			// rather than when the target was filled in, because a route with
+			// no configured target says where to go and nothing about how: it
+			// follows the client, and until the tunnel was classified there was
+			// nothing to follow.
+			rt.tlsHost = hostFromAuthority(connectAuthority)
+		}
 		p.serveMITMTLS(tunnelConn, connectAuthority, rt, certs)
 	case kind == tunnelH2C && overHijackedSocket:
 		defer tunnelConn.Close()
@@ -2040,6 +2090,15 @@ func (p *MITMProxy) routeHandler(authority string, rt route, up *upstreamTLSConn
 		current, routed := rt, true
 		if reresolve {
 			current, routed = p.resolveDomain(authority)
+			if routed && current.target == "" && current.handler == nil {
+				// The table holds a route with no target of its own; the
+				// connection was set up with that filled in from the authority,
+				// and re-reading it lost that. Put it back, on the same terms —
+				// including the upstream scheme this connection settled on,
+				// since a route like this follows its client.
+				current.target, current.selfTarget = authority, true
+				current.tlsHost = rt.tlsHost
+			}
 		}
 		if !routed {
 			if unmapped := p.unmappedHandler(); unmapped != nil {
@@ -2664,9 +2723,9 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// Nothing routed and nothing to refuse with: send it where it asked to go.
 		rt = route{target: hostPort, tlsHost: schemeTLSHost(r, hostPort)}
 	case rt.target == "" && rt.handler == nil:
-		// A Forward route is a pipe for TLS; in the clear there is nothing to
-		// pipe, so it behaves as "go to the host you asked for".
-		rt.target = hostPort
+		// A Forward route names no target of its own, so it means "go to the
+		// host you asked for" — here as on the CONNECT path.
+		rt.target, rt.selfTarget = hostPort, true
 		rt.tlsHost = schemeTLSHost(r, hostPort)
 	}
 
