@@ -190,16 +190,16 @@ func TestProxyPlainHTTPHeaderInjection(t *testing.T) {
 }
 
 // TestClientForwardWithHeader exercises the whole architecture: an application
-// in the sandbox talks to the router, which chains through the tunnel to the
+// in the sandbox talks to the egress proxy, which chains through the tunnel to the
 // controlplane proxy, which is the only side holding the CA and the headers.
 func TestClientForwardWithHeader(t *testing.T) {
 	b := captureBackend(t)
 	defer b.srv.Close()
 
-	// --- Sandbox: router only. No CA, no headers. ---
+	// --- Sandbox: egress proxy only. No CA, no headers. ---
 	server := vtunnel.NewServer()
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy error: %v", err)
 	}
 	defer server.CloseProxy()
@@ -228,8 +228,8 @@ func TestClientForwardWithHeader(t *testing.T) {
 	)
 	time.Sleep(100 * time.Millisecond)
 
-	// The application only ever sees the router.
-	httpClient := newMitmProxyClient(t, routerAddr)
+	// The application only ever sees the egress proxy.
+	httpClient := newMitmProxyClient(t, egressAddr)
 	resp, err := httpClient.Get("https://api.test/hello")
 	if err != nil {
 		t.Fatalf("HTTPS GET error: %v", err)

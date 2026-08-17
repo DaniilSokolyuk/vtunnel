@@ -3,14 +3,14 @@ package vtunnel_test
 // Clearing the last route.
 //
 // Removing a forward is not a controlplane-only affair: while the sandbox
-// router still holds the domain, every request for it is chained into a
+// egress proxy still holds the domain, every request for it is chained into a
 // controlplane that no longer knows it, and comes back 403 — forever, across
 // reconnects, with the route the operator already deleted. Direct egress, which
 // is what "not forwarded" means everywhere else, never comes back.
 //
 // ExampleMITMProxy_Remove promises exactly this ("api.corp now egresses from
 // the sandbox directly"), and doc.go promises the mechanism ("each call
-// re-sends the full domain list, which the router applies wholesale").
+// re-sends the full domain list, which the egress proxy applies wholesale").
 
 import (
 	"fmt"
@@ -40,8 +40,8 @@ func TestRemovingTheLastRouteReachesTheSandbox(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -52,7 +52,7 @@ func TestRemovingTheLastRouteReachesTheSandbox(t *testing.T) {
 	}
 	defer client.Close()
 
-	httpClient := routerClient(t, routerAddr)
+	httpClient := egressClient(t, egressAddr)
 	authority := decoy.Listener.Addr().String()
 	decoyURL := "https://" + authority + "/"
 
@@ -90,8 +90,8 @@ func TestClearedRoutesStayClearedAfterReconnect(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -103,7 +103,7 @@ func TestClearedRoutesStayClearedAfterReconnect(t *testing.T) {
 	}
 	defer client.Close()
 
-	httpClient := routerClient(t, routerAddr)
+	httpClient := egressClient(t, egressAddr)
 	authority := decoy.Listener.Addr().String()
 	decoyURL := "https://" + authority + "/"
 

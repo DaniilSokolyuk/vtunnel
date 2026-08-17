@@ -28,17 +28,17 @@ func TestForwardWithoutTargetKeepsTLSEndToEnd(t *testing.T) {
 	upstream.StartTLS()
 	defer upstream.Close()
 
-	// The forwarded domain has to be an address the router can actually dial,
+	// The forwarded domain has to be an address the egress proxy can actually dial,
 	// since "route it to itself" means exactly that.
 	authority := upstream.Listener.Addr().String()
 
-	routerAddr, ca, client, cleanup := startForwardFixture(t)
+	egressAddr, ca, client, cleanup := startForwardFixture(t)
 	defer cleanup()
 
 	client.Proxy().Forward(authority)
 	time.Sleep(150 * time.Millisecond)
 
-	tlsConn := connectThroughRouter(t, routerAddr, authority, nil)
+	tlsConn := connectThroughEgress(t, egressAddr, authority, nil)
 	defer tlsConn.Close()
 
 	peer := tlsConn.ConnectionState().PeerCertificates[0]
@@ -77,7 +77,7 @@ func TestForwardToMirrorsUpstreamALPN(t *testing.T) {
 			proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(generateTestCA(t)))
 			proxy.SetTransportTLSConfig(&tls.Config{RootCAs: roots})
 
-			routerAddr, _, client, cleanup := startForwardFixtureWithProxy(t, proxy)
+			egressAddr, _, client, cleanup := startForwardFixtureWithProxy(t, proxy)
 			defer cleanup()
 
 			// An explicit tls:// target, because the upstream is TLS on a port
@@ -85,7 +85,7 @@ func TestForwardToMirrorsUpstreamALPN(t *testing.T) {
 			client.Proxy().ForwardTo("alpn.test:443", "tls://"+upstream.Listener.Addr().String())
 			time.Sleep(150 * time.Millisecond)
 
-			tlsConn := connectThroughRouter(t, routerAddr, "alpn.test:443", []string{"h2", "http/1.1"})
+			tlsConn := connectThroughEgress(t, egressAddr, "alpn.test:443", []string{"h2", "http/1.1"})
 			defer tlsConn.Close()
 
 			if got := tlsConn.ConnectionState().NegotiatedProtocol; got != tc.want {
@@ -115,19 +115,19 @@ func TestForwardWildcardRegistersBothPorts(t *testing.T) {
 
 // --- helpers ---
 
-func startForwardFixture(t *testing.T) (routerAddr string, ca tls.Certificate, client *vtunnel.Client, cleanup func()) {
+func startForwardFixture(t *testing.T) (egressAddr string, ca tls.Certificate, client *vtunnel.Client, cleanup func()) {
 	t.Helper()
 	ca = generateTestCA(t)
-	routerAddr, _, client, cleanup = startForwardFixtureWithProxy(t, vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca)))
-	return routerAddr, ca, client, cleanup
+	egressAddr, _, client, cleanup = startForwardFixtureWithProxy(t, vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca)))
+	return egressAddr, ca, client, cleanup
 }
 
 func startForwardFixtureWithProxy(t *testing.T, proxy *vtunnel.MITMProxy) (string, tls.Certificate, *vtunnel.Client, func()) {
 	t.Helper()
 
 	ts, server := startTunnelServer(t)
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 
@@ -136,7 +136,7 @@ func startForwardFixtureWithProxy(t *testing.T, proxy *vtunnel.MITMProxy) (strin
 		t.Fatalf("Connect: %v", err)
 	}
 
-	return routerAddr, tls.Certificate{}, client, func() {
+	return egressAddr, tls.Certificate{}, client, func() {
 		client.Close()
 		server.CloseProxy()
 		ts.Close()
@@ -159,15 +159,15 @@ func signedBy(t *testing.T, cert *x509.Certificate, ca tls.Certificate) bool {
 	return err == nil
 }
 
-// connectThroughRouter issues CONNECT to the sandbox router and completes a TLS
+// connectThroughEgress issues CONNECT to the sandbox egress proxy and completes a TLS
 // handshake inside the tunnel, standing in for an application with HTTPS_PROXY
 // set. Passing nil for alpn offers no ALPN at all.
-func connectThroughRouter(t *testing.T, routerAddr, authority string, alpn []string) *tls.Conn {
+func connectThroughEgress(t *testing.T, egressAddr, authority string, alpn []string) *tls.Conn {
 	t.Helper()
 
-	conn, err := net.DialTimeout("tcp", routerAddr, 2*time.Second)
+	conn, err := net.DialTimeout("tcp", egressAddr, 2*time.Second)
 	if err != nil {
-		t.Fatalf("dial router: %v", err)
+		t.Fatalf("dial the egress proxy: %v", err)
 	}
 	conn.SetDeadline(time.Now().Add(5 * time.Second))
 
@@ -192,7 +192,7 @@ func connectThroughRouter(t *testing.T, routerAddr, authority string, alpn []str
 		NextProtos:         alpn,
 	})
 	if err := tlsConn.Handshake(); err != nil {
-		t.Fatalf("TLS handshake through router: %v", err)
+		t.Fatalf("TLS handshake through the egress proxy: %v", err)
 	}
 	return tlsConn
 }

@@ -9,7 +9,7 @@ package vtunnel_test
 // delivered as "this connection is over", the response dies in flight and the
 // caller sees a truncated or empty body with no error anywhere.
 //
-// The sandbox-side router already sends half-close deliberately: dualStream
+// The sandbox-side egress proxy already sends half-close deliberately: dualStream
 // calls CloseWrite on the tunnel socket as soon as the application has finished
 // its request. So this is not an exotic path, it is the ordinary one.
 

@@ -266,3 +266,115 @@ func selfSignedFor(t *testing.T, name string) (tls.Certificate, *x509.CertPool) 
 	pool.AddCert(parsed)
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: parsed}, pool
 }
+
+// An upstream that answers neither way is refused, not guessed at.
+//
+// The probe can come back with three answers, and only two of them are answers:
+// a handshake means TLS, a refusal or a plain reply means cleartext, and silence
+// means nothing at all. Reading silence as cleartext is the same bug as reading
+// it off the port number — it puts the credential on the wire to find out.
+func TestAnUpstreamThatWillNotSayIsRefusedRatherThanGuessed(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	// Accepts, reads, and never says anything back.
+	var mu sync.Mutex
+	var seen bytes.Buffer
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go io.Copy(&lockedWriter{mu: &mu, w: &seen}, conn)
+		}
+	}()
+
+	ca := generateTestCA(t)
+	p := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+	if err := p.ForwardTo("api.corp", ln.Addr().String(),
+		vtunnel.WithHeader("Authorization", "Bearer s3cret")); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	if err := p.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close()
+
+	resp, err := proxyClientFor(t, p.Addr().String(), ca).Get("https://api.corp/x")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502: the scheme is unknown and unknowable here", resp.StatusCode)
+	}
+
+	mu.Lock()
+	sent := append([]byte(nil), seen.Bytes()...)
+	mu.Unlock()
+	if bytes.Contains(sent, []byte("s3cret")) {
+		t.Fatalf("the credential was written to an upstream whose scheme was never established:\n%s", sent)
+	}
+}
+
+// A TLS upstream named by address and no scheme is refused too, and for a
+// different reason: an address is not a name, so Go will not send it as SNI and
+// cannot check a certificate against it. There is no honest way to open TLS, and
+// the error says which two things to write instead.
+func TestATLSUpstreamConfiguredByAddressIsRefused(t *testing.T) {
+	named, roots, wire := wiretapTLSUpstream(t)
+	_, port, _ := net.SplitHostPort(named)
+	byAddress := net.JoinHostPort("127.0.0.1", port)
+
+	ca := generateTestCA(t)
+	p := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+	p.SetTransportTLSConfig(&tls.Config{RootCAs: roots})
+	if err := p.ForwardTo("api.corp", byAddress,
+		vtunnel.WithHeader("Authorization", "Bearer s3cret")); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	if err := p.Start("127.0.0.1:0"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer p.Close()
+
+	client := proxyClientFor(t, p.Addr().String(), ca)
+	resp, err := client.Get("https://api.corp/x")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	if sent := wire(); bytes.Contains(sent, []byte("s3cret")) {
+		t.Fatalf("the credential went to an upstream that could not be verified:\n%s", sent)
+	}
+
+	// And the fix the error names actually works: say it is TLS, and say which
+	// name its certificate is for.
+	if err := p.ForwardTo("api.corp", "tls://"+byAddress,
+		vtunnel.WithSNI("localhost"),
+		vtunnel.WithHeader("Authorization", "Bearer s3cret")); err != nil {
+		t.Fatalf("ForwardTo with tls:// and WithSNI: %v", err)
+	}
+
+	resp, err = client.Get("https://api.corp/x")
+	if err != nil {
+		t.Fatalf("GET after the fix: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK || string(body) != "upstream" {
+		t.Fatalf("after tls:// + WithSNI: %s %q, want the upstream's answer", resp.Status, body)
+	}
+}

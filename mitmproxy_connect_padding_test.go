@@ -45,9 +45,9 @@ func TestExtraCRLFAfterConnectStillIntercepts(t *testing.T) {
 	}
 }
 
-// The same padding through the sandbox router, where it used to be copied
+// The same padding through the sandbox egress proxy, where it used to be copied
 // verbatim into the upstream and arrive in front of the ClientHello.
-func TestExtraCRLFThroughTheRouter(t *testing.T) {
+func TestExtraCRLFThroughTheEgressProxy(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "auth=%s", r.Header.Get("Authorization"))
 	}))
@@ -56,8 +56,8 @@ func TestExtraCRLFThroughTheRouter(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -74,7 +74,7 @@ func TestExtraCRLFThroughTheRouter(t *testing.T) {
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	tc := connectThenTLS(t, routerAddr, "probe.test:443", "probe.test", "\r\n", ca)
+	tc := connectThenTLS(t, egressAddr, "probe.test:443", "probe.test", "\r\n", ca)
 	resp := requestOver(t, tc, "GET / HTTP/1.1\r\nHost: probe.test\r\n\r\n")
 	body, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()

@@ -130,8 +130,8 @@ func TestSocks5CleartextHTTPReachesAHandlerRoute(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -147,7 +147,7 @@ func TestSocks5CleartextHTTPReachesAHandlerRoute(t *testing.T) {
 	}))
 	time.Sleep(150 * time.Millisecond)
 
-	dialer, err := proxy.SOCKS5("tcp", routerAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", egressAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("socks5 dialer: %v", err)
 	}

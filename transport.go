@@ -136,7 +136,7 @@ func NewWSConn(conn *websocket.Conn) net.Conn { return ws.Conn(conn) }
 // direction goes on. Closing both on the first EOF instead, which is the
 // obvious way to write this, silently truncates every request/response
 // exchange where the caller shuts down its write side before reading the
-// answer: curl --http1.0, git over a plain forward, and the sandbox router
+// answer: curl --http1.0, git over a plain forward, and the sandbox egress proxy
 // itself, whose dualStream half-closes the tunnel socket the moment the
 // application has finished its request.
 //

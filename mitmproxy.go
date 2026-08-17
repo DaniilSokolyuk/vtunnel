@@ -48,7 +48,7 @@ const tunnelSegmentGrace = time.Second
 
 // peekTimeout bounds the wait for the client's first tunnel byte, so an idle
 // CONNECT can't park a goroutine and fd indefinitely. It bounds the sandbox
-// router's SOCKS5 handshake too — a greeting that stops halfway is the same
+// egress proxy's SOCKS5 handshake too — a greeting that stops halfway is the same
 // shape of idle client. A variable rather than a constant so a test can prove
 // the bound is applied instead of waiting one out.
 var peekTimeout = newDurationVar(30 * time.Second)
@@ -152,11 +152,15 @@ type route struct {
 	handler http.Handler
 	target  string
 	headers http.Header
-	// cleartext records that the target was declared cleartext ("http://"),
-	// rather than merely written without a scheme. The difference matters only
-	// for a route that injects headers: an unstated scheme is asked about
-	// before the credential is written, a stated one is taken at its word.
+	// cleartext records that the target was declared cleartext ("http://" or
+	// "h2c://"), rather than merely written without a scheme. The difference
+	// matters only for a route that injects headers: an unstated scheme is asked
+	// about before the credential is written, a stated one is taken at its word.
 	cleartext bool
+	// h2c records that the target was declared cleartext HTTP/2 ("h2c://"), so
+	// the upstream is spoken to that way without being asked and whatever the
+	// client side settled on.
+	h2c bool
 	// generation tells one revision of a route from another, so a connection
 	// that resolved this route when it opened can notice that the answer has
 	// changed since. Comparing the routes themselves would not do: a handler is
@@ -245,7 +249,7 @@ type MITMProxy struct {
 	// idle reaper, and the clone goes out of scope after RoundTrip with nobody
 	// left to call CloseIdleConnections — an idle connection plus its read and
 	// write goroutines then live until the process exits. Keep-alive never
-	// worked either, since every request opened a fresh connection. Router
+	// worked either, since every request opened a fresh connection. EgressProxy
 	// already fixed this for its own chained transports; this is the same fix.
 	upstreams   map[upstreamKey]http.RoundTripper
 	upstreamsMu sync.Mutex
@@ -669,9 +673,24 @@ func (p *MITMProxy) Forward(domain string) {
 }
 
 // ForwardTo terminates the client's TLS and re-issues the request to target,
-// which may be a plain address ("localhost:8080"), a TLS endpoint (":443" or an
-// explicit "tls://host:port"), and carries any headers declared with
-// [WithHeader].
+// carrying any headers declared with [WithHeader].
+//
+// How to speak to that target can be stated or left to be discovered:
+//
+//	localhost:8080        asked about, if the route carries a header
+//	tls://host:port       TLS, SNI from the host; a bare ":443" says the same
+//	h2c://host:port       cleartext HTTP/2, so nothing is probed for it
+//	http://host:port      cleartext, and do not ask
+//
+// Discovery is the right default for an address somebody typed, and it is not
+// free. An unstated scheme on a route that injects a credential costs a probe
+// before the first request, because writing the credential to find out is the
+// one thing that must not happen. And h2c is only ever looked for when the
+// client side is HTTP/2 as well, so an h2c-only upstream behind an HTTP/1.1
+// client is reachable by saying "h2c://" and not otherwise.
+//
+// "h2c://" and [WithSNI] contradict each other and are refused together: one is
+// cleartext, the other names the server for a TLS handshake.
 func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) error {
 	if target == "" {
 		return fmt.Errorf("forward %s: empty target; use Forward to route a domain to itself", domain)
@@ -687,15 +706,27 @@ func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) erro
 			domain, len(cfg.headers), errNoMitmCA)
 	}
 
-	cleartext := strings.HasPrefix(target, "http://")
-	addr, tlsHost, upstreamIsTLS := parseForwardTarget(target)
+	addr, tlsHost, upstreamIsTLS, h2c := parseForwardTarget(target)
+	if addr == "" {
+		// A scheme and nothing else. Left alone this becomes a dial to an empty
+		// host, which in Go is this machine — so it is refused where it is
+		// written rather than discovered as a connection to the wrong place.
+		return fmt.Errorf("forward %s: target %q names no host", domain, target)
+	}
 	if cfg.sni != "" {
+		if h2c {
+			return fmt.Errorf("forward %s: WithSNI names the server for a TLS handshake, and an "+
+				"h2c:// target is cleartext; drop one of the two", domain)
+		}
 		tlsHost, upstreamIsTLS = cfg.sni, true
 	}
 	if !upstreamIsTLS {
 		tlsHost = ""
 	}
-	p.setRoute(domain, route{target: addr, headers: cfg.headers, tlsHost: tlsHost, cleartext: cleartext}, addr)
+	// Both stated schemes are cleartext, and stating one is what excuses the
+	// route from being asked whether its upstream speaks TLS.
+	cleartext := strings.HasPrefix(target, "http://") || h2c
+	p.setRoute(domain, route{target: addr, headers: cfg.headers, tlsHost: tlsHost, cleartext: cleartext, h2c: h2c}, addr)
 	return nil
 }
 
@@ -842,9 +873,6 @@ func (p *MITMProxy) setRoute(domain string, rt route, describe string) {
 	}
 	changed := p.changedLocked()
 	p.domainMu.Unlock()
-
-	// Replacing a route can orphan a TLS mark too: the same domain pointed at a
-	// tls:// target a moment ago and at a cleartext one now.
 
 	log.Printf("[vtunnel-proxy] Route: %s -> %s", domain, describe)
 	notify(changed)
@@ -1260,7 +1288,7 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 		p.serveH2(tunnelConn, connectAuthority, rt, nil)
 	case kind == tunnelHTTP1 && overHijackedSocket:
 		// Cleartext HTTP/1.1 inside the tunnel. Every SOCKS5 client arrives
-		// this way — it has no CONNECT of its own, so the router makes one, and
+		// this way — it has no CONNECT of its own, so the egress proxy makes one, and
 		// `curl http://api.corp/` becomes CONNECT api.corp:80 followed by an
 		// ordinary request.
 		//
@@ -2351,6 +2379,22 @@ func (p *MITMProxy) upstreamTransport(rt route, up *upstreamTLSConn, preferH2 bo
 
 	noRelease := func() {}
 
+	if rt.h2c {
+		// Stated, so there is nothing to probe and nothing to infer from what
+		// the client happened to negotiate. This is also the only way to reach
+		// an h2c-only upstream from an HTTP/1.1 client: the probe below is asked
+		// only when the client side is HTTP/2 too.
+		transport := p.cachedTransport(upstreamKey{target: target, h2: true}, func() http.RoundTripper {
+			return &http2.Transport{
+				AllowHTTP: true,
+				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+					return net.DialTimeout(network, addr, dialTimeout)
+				},
+			}
+		})
+		return transport, "http", noRelease
+	}
+
 	tlsHost := rt.tlsHost
 	if tlsHost == "" && len(rt.headers) > 0 && !rt.cleartext {
 		// Nobody said how to reach this upstream, and this route carries a
@@ -2672,8 +2716,6 @@ func acceptConnectTunnel(w http.ResponseWriter, r *http.Request) net.Conn {
 	return newBufferedConn(clientConn, brw.Reader)
 }
 
-// dialAndPipe lets cleartext traffic on a MITM-configured domain still reach
-// its upstream, reusing the no-MITM raw byte pipe.
 // raceForFirstBytes dials the upstream and waits for whichever side speaks
 // first, so a tunnel whose client is silent is decided by evidence rather than
 // by a timeout.
@@ -2732,6 +2774,8 @@ func (p *MITMProxy) raceForFirstBytes(rawConn net.Conn, br *bufio.Reader, target
 	return newBufferedConn(conn, upBr), upstreamFirst
 }
 
+// dialAndPipe lets cleartext traffic on a MITM-configured domain still reach
+// its upstream, reusing the no-MITM raw byte pipe.
 func (p *MITMProxy) dialAndPipe(target string, clientConn net.Conn) {
 	targetConn, err := net.DialTimeout("tcp", target, dialTimeout)
 	if err != nil {
@@ -2773,7 +2817,7 @@ const (
 //
 // The hard part is not recognising each protocol, it is knowing when to stop
 // waiting. Deciding from one read misreads a request line that TCP split across
-// two segments — and the sandbox router's tunnel hop re-segments everything it
+// two segments — and the sandbox egress proxy's tunnel hop re-segments everything it
 // carries, so the same client, sending the same bytes, was injected into on one
 // connection and piped on the next. Waiting for a whole line instead hangs every
 // protocol whose server greets first, which says nothing at all until it is

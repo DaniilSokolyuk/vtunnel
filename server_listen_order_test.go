@@ -13,7 +13,7 @@ import (
 // The reply is what starts the client: it publishes the tunnel port and lets
 // traffic flow. Sending it before the routes were installed left a window in
 // which an application inside the sandbox could ask for a domain whose route
-// had been promised but not yet set — and a miss in the router is not an error,
+// had been promised but not yet set — and a miss in the egress proxy is not an error,
 // it is direct egress, past the tunnel and past the credential.
 //
 // Checked at the moment of the write rather than after it, because after it the
@@ -24,7 +24,7 @@ func TestListenRepliesOnlyOnceTheRoutesAreLive(t *testing.T) {
 
 	var routedAtReply bool
 	stream := &hookedStream{onWrite: func() {
-		_, routedAtReply = server.router.route("api.corp:443")
+		_, routedAtReply = server.egress.route("api.corp:443")
 	}}
 
 	server.handleListen(stream, streamHeader{Type: streamListen, Domains: []string{"api.corp"}})

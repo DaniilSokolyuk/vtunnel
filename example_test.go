@@ -25,7 +25,7 @@ import (
 )
 
 // The sandbox side: a WebSocket endpoint for the controlplane to dial into, and
-// a routing proxy for the application to point HTTPS_PROXY at. No CA and no
+// an egress proxy for the application to point HTTPS_PROXY at. No CA and no
 // credentials appear anywhere here — this side cannot decrypt.
 func Example_sandbox() {
 	// The same secret the controlplane dials in with, handed to this container

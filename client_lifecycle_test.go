@@ -14,7 +14,7 @@ import (
 
 // The tunnel port on the sandbox is pointed at the whole controlplane proxy,
 // not at one forward target. A process inside the sandbox that dials that port
-// directly never passes through the Router or its allowlist — and a proxy that
+// directly never passes through the EgressProxy or its allowlist — and a proxy that
 // dials whatever it is asked for would hand it the controlplane's entire
 // network, cloud metadata endpoint included.
 //
@@ -76,7 +76,7 @@ func TestClientOwnedProxyRefusesUnroutedDomainsByDefault(t *testing.T) {
 // a taken port, a refused bind, a CA that would not load — the reconnect
 // goroutine dereferenced a nil Addr and took the whole controlplane down with
 // it. That goroutine has no recover.
-func TestSendRouterListenSurvivesUnstartedProxy(t *testing.T) {
+func TestSendEgressListenSurvivesUnstartedProxy(t *testing.T) {
 	// A CA that cannot be parsed makes Start fail before it ever listens, which
 	// is the shape of every real cause.
 	broken := tls.Certificate{Certificate: [][]byte{[]byte("not a certificate")}}
@@ -87,9 +87,9 @@ func TestSendRouterListenSurvivesUnstartedProxy(t *testing.T) {
 		t.Fatal("the proxy started despite an unusable CA; pick another way to fail Start")
 	}
 
-	err := c.sendRouterListen(nil)
+	err := c.sendEgressListen(nil)
 	if err == nil {
-		t.Fatal("sendRouterListen accepted a proxy with no address")
+		t.Fatal("sendEgressListen accepted a proxy with no address")
 	}
 	if !strings.Contains(err.Error(), "proxy") {
 		t.Fatalf("err = %v, want it to name the proxy", err)

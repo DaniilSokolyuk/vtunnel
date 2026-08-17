@@ -4,7 +4,7 @@ import "testing"
 
 // A hostname is case-insensitive (RFC 4343). Matching it exactly means a config
 // or a client with one capital letter misses the allowlist — which fails closed
-// on the controlplane but fails OPEN on the sandbox router, where a miss is
+// on the controlplane but fails OPEN on the sandbox egress proxy, where a miss is
 // egress straight out of the sandbox, past the tunnel and past injection.
 func TestBestDomainMatchIsCaseInsensitive(t *testing.T) {
 	patterns := map[string]int{

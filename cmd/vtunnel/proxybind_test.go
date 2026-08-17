@@ -1,9 +1,9 @@
 package main
 
-// Where the sandbox's routing proxy listens.
+// Where the sandbox's egress proxy listens.
 //
 // It used to be `-proxy 9090` and a hardcoded `:9090` — every interface — with
-// no way to say otherwise. The router authenticates nobody: it relays to any
+// no way to say otherwise. The egress proxy authenticates nobody: it relays to any
 // host it is asked for, and for an allowlisted domain it returns what the
 // controlplane fetched with the credentials it injected. Anything that can
 // reach the port therefore gets an open relay and the controlplane's
@@ -36,7 +36,7 @@ func TestProxyListenAddr(t *testing.T) {
 		{name: "port out of range", in: "70000", wantErr: true},
 
 		// A scheme picks which front ends the port serves, and is passed
-		// through to the router untouched; the address inside it still decides
+		// through to the egress proxy untouched; the address inside it still decides
 		// whether anything outside the sandbox can reach it.
 		{name: "mixed, loopback", in: "mixed://127.0.0.1:9090", wantAddr: "mixed://127.0.0.1:9090"},
 		{name: "mixed, every interface", in: "mixed://:8080", wantAddr: "mixed://:8080", wantPublic: true},

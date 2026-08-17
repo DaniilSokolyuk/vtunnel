@@ -12,7 +12,8 @@ A reverse tunnel with a full TLS-intercepting proxy on the far end. Set `HTTPS_P
 * Transports: WebSocket, `wss`, TCP, or a `net.Conn` of your own
 * Sessions: SSH, or yamux over TLS 1.3 pinned to a shared secret
 * Domain routing in the sandbox, without decrypting anything
-* Only domain names cross the tunnel — no targets, no credentials, no CA
+* Egress rules the sandbox enforces: CIDRs, addresses and wildcard names, allow or deny
+* Only domain names and egress rules cross the tunnel — no targets, no credentials, no CA
 * Raw TCP port forwards
 * Reconnect with backoff; listeners and routes replayed
 
@@ -24,7 +25,7 @@ A reverse tunnel with a full TLS-intercepting proxy on the far end. Set `HTTPS_P
 * gRPC with trailer forwarding, announced and unannounced
 * SSE streamed event by event, on every route shape
 * WebSocket spliced, not re-terminated — subprotocol, `permessage-deflate` and fragmentation intact
-* Header injection per domain, `tls://` targets, SNI override
+* Header injection per domain, `tls://` / `h2c://` / `http://` targets, SNI override
 * Wildcard domains with nginx-like precedence
 * Routes: your `http.Handler` in-process, another target, a raw pipe, or a refusal
 * Middleware on every terminated request — read or rewrite bodies, SSE and WebSocket frames
@@ -43,7 +44,7 @@ A reverse tunnel with a full TLS-intercepting proxy on the far end. Set `HTTPS_P
 │ HTTPS_PROXY=:9090     │◀══════▶│   + credentials                    │
 │        │              │        │      │                             │
 │ vtunnel server :3001  │        │      ├─ api.anthropic.com          │
-│   + router :9090      │        │      │    inject key ──▶ anthropic │
+│   + egress :9090      │        │      │    inject key ──▶ anthropic │
 │                       │        │      │                             │
 │ routes by domain,     │        │      ├─ github.com                 │
 │ never decrypts:       │        │      │    inject PAT ──▶ github    │
@@ -70,6 +71,8 @@ One binary, two pieces — **[the tunnel](#the-tunnel)** and **[the MITM proxy](
   - [Transports](#transports)
   - [Session protocols](#session-protocols)
   - [Raw port forwards](#raw-port-forwards)
+  - [SOCKS5](#socks5)
+  - [Egress policy](#egress-policy)
   - [Reconnection](#reconnection)
 - [**The MITM proxy**](#the-mitm-proxy)
   - [Routes](#routes)
@@ -150,15 +153,26 @@ Three layers, each replaceable without touching the others:
 | **session** | multiplexes streams, authenticates both ends | `ssh`, `yamux` |
 | **tunnel** | opens ports, routes by domain, pipes | [`server.go`](server.go), [`client.go`](client.go) |
 
+Which makes four parts to assemble, and each is usable on its own:
+
+| part | where | what it is |
+|---|---|---|
+| [`EgressProxy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#EgressProxy) | sandbox | the proxy the application points `HTTPS_PROXY` at; decides deny, direct, or through the tunnel |
+| [`Listen`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Listen) | sandbox | the accepting half of the transport, a plain `net.Listener` |
+| [`NewDialer`](https://pkg.go.dev/github.com/vivid-money/vtunnel#NewDialer) | controlplane | the dialling half, and where a proxy or a retry is wrapped in |
+| [`MITMProxy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy) | controlplane | the CA, the real targets and the injected credentials |
+
+The two proxies are the useful ones to take on their own: `MITMProxy` as an intercepting forward proxy and `EgressProxy` as an allowlisting one, with no tunnel involved either way. See [Using it without a tunnel](#using-it-without-a-tunnel).
+
 The split is worth stating because it decides where security lives: **the session authenticates, always, and the transport contributes nothing.** Running over `wss://` proves nothing about who is on the other end — a TLS endpoint is whoever holds a certificate for that name, and that is not the same question as whether the peer knows this tunnel's secret. So `ws://` and `tcp://` are exactly as safe as `wss://`, and picking between them is a networking decision.
 
 Above the session sits one small protocol ([`protocol.go`](protocol.go)): every stream opens with a length-prefixed JSON header saying what it is for, and a control stream reads one reply back. That is deliberately not built out of SSH channel types and global requests, which a multiplexer like yamux does not have — written above the session instead, it is written once for every backend.
 
 **The client dials in.** A [`Server`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Server) runs inside the sandbox and accepts connections; a [`Client`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Client) runs on your machine and connects to it. The sandbox therefore needs no route back out to you, and no inbound port beyond the one the tunnel arrives on.
 
-**The two sides are deliberately unequal.** The [`Router`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Router) in the sandbox ([`router.go`](router.go)) holds a list of domain names and nothing else. It reads the domain from the `CONNECT` request line — which the application sends in cleartext, before any TLS — and either chains the connection to the controlplane or dials it directly. It has no CA and cannot decrypt.
+**The two sides are deliberately unequal.** The [`EgressProxy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#EgressProxy) in the sandbox ([`egress.go`](egress.go)) holds domain names and, if you give it any, egress rules — no CA, no credentials. It reads the domain from the `CONNECT` request line, which the application sends in cleartext before any TLS, and then either chains the connection to the controlplane, dials it directly, or refuses it. It cannot decrypt.
 
-**Only domain names cross the tunnel.** Targets, injected headers and the CA private key never do. The controlplane sends the sandbox one list of names; everything else stays behind.
+**Only domain names and the sandbox's own egress rules cross the tunnel.** Targets, injected headers and the CA private key never do. A rule and a target look similar from a distance and are not the same thing: a rule says what this sandbox may reach, which the sandbox is the one enforcing and could discover by trying; a target says where a name really goes on the controlplane's network, which the sandbox has no way to learn and no business holding.
 
 ## Sandbox side
 
@@ -315,17 +329,19 @@ curl takes `http_proxy` in lower case only — [deliberately](https://everything
 
 It exists for the traffic that has no other way in — `psql`, `redis-cli`, `mongosh`, ssh, anything that never reads `HTTPS_PROXY`. Such a client used to leave the sandbox directly, past the allowlist and past the credential the controlplane would have injected, not by decision but because nothing asked it where it was going.
 
-Nothing new crosses the tunnel: SOCKS5 only learns the destination, and the router then chains it as the same `CONNECT` an HTTPS client produces. The controlplane matches that name against its own routes and dials `ForwardTo`'s target, never an address from the wire — which is what keeps a compromised sandbox from using the tunnel as a door into the controlplane's network.
+Nothing new crosses the tunnel: SOCKS5 only learns the destination, and the egress proxy then chains it as the same `CONNECT` an HTTPS client produces. The controlplane matches that name against its own routes and dials `ForwardTo`'s target, never an address from the wire — which is what keeps a compromised sandbox from using the tunnel as a door into the controlplane's network.
 
 Two things follow from that, and both are deliberate:
 
 **`socks5h`, not `socks5`.** The `h` leaves name resolution to the far side, so the name reaches the proxy and can be matched. A `socks5://` client resolves first and sends an address instead.
 
-**An address nobody forwarded is refused** (`0x02 connection not allowed by ruleset`), rather than dialled. Policy here is written in names, and an address cannot be matched against one, so allowing it would mean a client that resolves its own names slips past the allowlist without a word. Forward the address explicitly if it really is meant to be reachable:
+**An address nobody forwarded is refused** (`0x02 connection not allowed by ruleset`), rather than dialled. With no [egress policy](#egress-policy) there is nothing but names to match against, so allowing it would mean a client that resolves its own names slips past the allowlist without a word. Forward the address explicitly if it really is meant to be reachable:
 
 ```go
 client.Proxy().ForwardTo("10.0.0.9:5432", "10.0.0.9:5432")
 ```
+
+Set an egress policy and that blanket refusal is retired rather than added to: addresses are first-class once there are rules written in them, so a literal is judged by those rules — and judged the same way `CONNECT` judges it, which has accepted literals all along.
 
 A non-HTTP target needs its port in the route, since a bare domain covers `:80` and `:443` only:
 
@@ -334,6 +350,38 @@ client.Proxy().ForwardTo("db.corp:5432", "10.0.0.9:5432")
 ```
 
 Only `CONNECT` is implemented. `BIND` and `UDP ASSOCIATE` are answered with `0x07 command not supported`, which is what mitmproxy answers too — a UDP association needs a datagram path the tunnel does not have, and refusing it up front lets a client fail immediately instead of waiting for something that is not coming.
+
+## Egress policy
+
+Everything above decides which domains go **through the tunnel**. What happens to the rest is a separate question, and by default the answer is "dial it" — right for a proxy whose job is routing, wrong for a sandbox somebody has been promised is contained.
+
+A [`Policy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Policy) is how that changes. It is declared on the controlplane and enforced in the sandbox:
+
+```go
+client.SetEgressPolicy(vtunnel.Policy{
+    Default: vtunnel.ActionDeny,
+    Allow:   []string{"*.example.com", "10.0.0.0/8", "db.corp:5432"},
+    Deny:    []string{"169.254.0.0/16"},
+})
+```
+
+A rule is a CIDR, an address, a hostname or a wildcard hostname, each optionally carrying a port; without one it covers every port. Between two rules the more specific wins — an exact name or a single address beats a wildcard or a prefix, a longer suffix or prefix beats a shorter one, a rule naming a port beats one that does not — and on a tie, deny wins.
+
+**Names are judged before resolution, addresses after it.** That split is the design. A name rule is the only thing that can be said about a name, and an address rule is about where the bytes actually go — so `Deny: ["169.254.0.0/16"]` holds even against a hostname pointing at cloud metadata, which is the case that matters. The address is checked from inside the dialler, on the address the kernel is about to connect to, so there is no window between checking and connecting for a name to change its answer in.
+
+**Write a deny-all as `Default: ActionDeny`, not as `Deny: ["0.0.0.0/0"]`.** They are not the same and the difference is deliberate. A default is a backdrop an allowlist of names is written against; a `/0` deny rule is an explicit address deny, which outranks an allowed name and refuses everything. Keeping them distinct is what lets `Default: ActionDeny` + `Allow: ["*.example.com"]` and `Deny: ["169.254.0.0/16"]` both mean what they look like.
+
+Three things are outside it, and worth knowing before relying on it:
+
+- **A routed domain is not affected.** It does not egress from this sandbox at all — the controlplane dials it — so a route outranks every rule. `SetPolicy` logs a warning when a route contradicts one. What the controlplane dials on the sandbox's behalf is governed by the routes declared there and by [`HandleUnmapped`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.HandleUnmapped).
+- **It is not a packet filter.** It sees what comes through the proxy. A process that ignores `HTTPS_PROXY` and opens its own socket is not covered, and cannot be without capabilities a container usually does not have.
+- **Nothing here sees UDP**, DNS included.
+
+A refusal answers `403` on HTTP and `0x02` on SOCKS5 — never a timeout, so "blocked" and "unreachable" stay distinguishable.
+
+**Before the controlplane connects** the sandbox has no policy, and that window is real: a sandbox is serving as soon as its process is. [`WithServerEgressPolicy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithServerEgressPolicy), or `-default-egress deny` on the CLI, starts it closed instead, and whatever the controlplane later sends replaces it. It cannot lock the sandbox out of its own tunnel: the client dials in, and the hop to a tunnel port is exempt.
+
+Covered by [`policy_test.go`](policy_test.go), [`egress_policy_test.go`](egress_policy_test.go) and [`egress_policy_e2e_test.go`](egress_policy_e2e_test.go).
 
 ## Reconnection
 
@@ -367,7 +415,18 @@ proxy.HandleUnmapped(http.HandlerFunc(func(w http.ResponseWriter, r *http.Reques
 }))
 ```
 
-A target may be a plain address (`localhost:8080`), or `tls://host:port` to have the proxy re-encrypt on the way out, with [`WithSNI`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSNI) when the certificate is issued for a name the address does not carry. A domain given without a port registers on both `:80` and `:443`.
+How to reach the target can be stated, or left to be discovered:
+
+| target | the hop to the upstream |
+|---|---|
+| `localhost:8080` | asked about, if the route injects a header |
+| `tls://host:port` | TLS, SNI from the host — a bare `:443` says the same |
+| `h2c://host:port` | cleartext HTTP/2, nothing probed for it |
+| `http://host:port` | cleartext, and do not ask |
+
+[`WithSNI`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSNI) overrides the name presented in the handshake, for a certificate issued for something the address does not carry; it contradicts `h2c://` and is refused with it. A domain given without a port registers on both `:80` and `:443`.
+
+Discovery is the right default for an address somebody typed, and it costs something. An unstated scheme on a route that injects a credential is probed before the first request, because writing the credential to find out is exactly what must not happen — and an upstream that answers neither way is refused rather than guessed at. h2c is only ever looked for when the client side is HTTP/2 too, so an h2c-only upstream behind an HTTP/1.1 client is reachable by saying `h2c://` and not otherwise ([`mitmproxy_h2c_target_test.go`](mitmproxy_h2c_target_test.go), [`mitmproxy_upstream_scheme_test.go`](mitmproxy_upstream_scheme_test.go)).
 
 ## Wildcard domains
 
@@ -483,7 +542,7 @@ Upgrades are **spliced, not re-terminated**. The handshake is re-issued as an or
 
 That is what keeps the negotiation between the endpoints: **subprotocols, `permessage-deflate` and frame boundaries survive exactly as agreed**. A proxy that terminates the WebSocket in the middle has to re-negotiate both and in practice drops compression.
 
-Works on every route shape and on both transports — `wss` through `CONNECT`, and cleartext `ws://` through the sandbox router, which cannot use an ordinary HTTP transport because it has no way to return a `101`. Covered by [`mitmproxy_websocket_test.go`](mitmproxy_websocket_test.go); see [`ExampleMITMProxy_ForwardTo_webSocket`](example_test.go).
+Works on every route shape and on both transports — `wss` through `CONNECT`, and cleartext `ws://` through the sandbox egress proxy, which cannot use an ordinary HTTP transport because it has no way to return a `101`. Covered by [`mitmproxy_websocket_test.go`](mitmproxy_websocket_test.go); see [`ExampleMITMProxy_ForwardTo_webSocket`](example_test.go).
 
 ## Inspecting and rewriting traffic
 
@@ -561,6 +620,19 @@ proxy.ForwardTo("api.test:443", "localhost:8081",
 
 Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalone_test.go`](mitmproxy_standalone_test.go).
 
+`EgressProxy` stands on its own too, as the other half of the same idea: no CA, no interception, just an allowlisting forward proxy on HTTP and SOCKS5. A `Server` with no tunnel attached is the way to reach one:
+
+```go
+sandbox := vtunnel.NewServer(vtunnel.WithServerEgressPolicy(vtunnel.Policy{
+    Default: vtunnel.ActionDeny,
+    Allow:   []string{"*.example.com"},
+}))
+sandbox.StartProxy("127.0.0.1:9090")
+defer sandbox.Close()
+```
+
+Nothing dials in, no client exists, and the rules apply from the first connection. `sandbox.Egress()` reaches the proxy itself, for `SetPolicy` and `SetRoutes` at runtime.
+
 ---
 
 ## CLI reference
@@ -573,6 +645,9 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 | `-proxy` | Where the routing proxy listens, serving HTTP and SOCKS5 on one port: `9090` (loopback), `127.0.0.1:9090`, `:9090` for every interface, or a scheme in front of a full `host:port` to pick the front ends — `mixed://` (both, the default), `http://127.0.0.1:8080`, `socks5://127.0.0.1:1080`. A scheme does not carry the bare-port shorthand or its loopback default: `socks5://1080` is an error, `socks5://:1080` is every interface. SOCKS5 clients want `socks5h://`, see [SOCKS5](#socks5). Empty disables it. It authenticates nobody, so keep it on loopback unless something else guards the port | `$VTUNNEL_PROXY`, else empty |
 | `-secret` | Shared tunnel secret, or `@/path` to a file | `$VTUNNEL_SECRET` |
 | `-protocol` | Session protocol: `ssh`, `yamux`, `yamux-insecure`. Must match the client | `$VTUNNEL_PROTOCOL`, else `ssh` |
+| `-default-egress` | What happens to a destination no rule names: `allow` or `deny`. See [Egress policy](#egress-policy) | `$VTUNNEL_DEFAULT_EGRESS`, else `allow` |
+| `-allow-out` | Permit a CIDR, address, hostname or `*.hostname`, optionally `:port` (repeatable) | — |
+| `-deny-out` | Refuse one, same syntax (repeatable) | — |
 
 ### `vtunnel client`
 
@@ -584,6 +659,9 @@ Point `HTTPS_PROXY` at `proxy.Addr()` and trust the CA. See [`mitmproxy_standalo
 | `-mitm-ca` | PEM with CA cert+key for HTTPS MITM; created if missing. Without it TLS is piped through untouched and `-H` is rejected | `$VTUNNEL_MITM_CA` (unset = no interception) |
 | `-forward` | Forward mapping (repeatable, at least one required) | — |
 | `-H` / `-header` | Header injected into requests for the preceding `-forward` (repeatable) | — |
+| `-default-egress` | What happens to a destination no rule names: `allow` or `deny`. See [Egress policy](#egress-policy) | `$VTUNNEL_DEFAULT_EGRESS`, else `allow` |
+| `-allow-out` | Permit a CIDR, address, hostname or `*.hostname`, optionally `:port` (repeatable) | — |
+| `-deny-out` | Refuse one, same syntax (repeatable) | — |
 
 ### `vtunnel ca`
 

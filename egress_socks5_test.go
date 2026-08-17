@@ -1,6 +1,6 @@
 package vtunnel_test
 
-// SOCKS5 into the sandbox router.
+// SOCKS5 into the sandbox egress proxy.
 //
 // The point of it is the traffic that never had a way in: psql, redis-cli, ssh,
 // anything that does not read HTTPS_PROXY. Such a client egressed from the
@@ -61,16 +61,16 @@ func tcpEcho(t *testing.T, who string) (addr string, hits *atomic.Int32) {
 	return ln.Addr().String(), hits
 }
 
-// sandbox brings up a server with its router, a client with a MITM CA, and the
+// sandbox brings up a server with its egress proxy, a client with a MITM CA, and the
 // tunnel between them — the whole chain an application in a sandbox sees.
-func sandbox(t *testing.T) (routerAddr string, client *vtunnel.Client) {
+func sandbox(t *testing.T) (egressAddr string, client *vtunnel.Client) {
 	t.Helper()
 
 	ts, server := startTunnelServer(t)
 	t.Cleanup(ts.Close)
 
-	routerAddr = fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr = fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	t.Cleanup(server.CloseProxy)
@@ -80,14 +80,14 @@ func sandbox(t *testing.T) (routerAddr string, client *vtunnel.Client) {
 		t.Fatalf("Connect: %v", err)
 	}
 	t.Cleanup(func() { client.Close() })
-	return routerAddr, client
+	return egressAddr, client
 }
 
-// socksDial dials target through the router's SOCKS5 front end, the way a
+// socksDial dials target through the egress proxy's SOCKS5 front end, the way a
 // client with ALL_PROXY=socks5h://… does: the name travels, unresolved.
-func socksDial(t *testing.T, routerAddr, target string) net.Conn {
+func socksDial(t *testing.T, egressAddr, target string) net.Conn {
 	t.Helper()
-	dialer, err := proxy.SOCKS5("tcp", routerAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", egressAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("socks5 dialer: %v", err)
 	}
@@ -119,7 +119,7 @@ func ask(t *testing.T, conn net.Conn, what string) string {
 // through the tunnel. This is the whole feature: postgres, redis, ssh.
 func TestSocks5ForwardedPortGoesThroughTheTunnel(t *testing.T) {
 	controlplaneOnly, _ := tcpEcho(t, "controlplane")
-	routerAddr, client := sandbox(t)
+	egressAddr, client := sandbox(t)
 
 	// The name the application uses, and the address only the controlplane
 	// knows. Nothing but the name crosses the tunnel.
@@ -128,7 +128,7 @@ func TestSocks5ForwardedPortGoesThroughTheTunnel(t *testing.T) {
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	conn := socksDial(t, routerAddr, "db.corp:5432")
+	conn := socksDial(t, egressAddr, "db.corp:5432")
 	if got := ask(t, conn, "SELECT 1"); got != "controlplane: SELECT 1" {
 		t.Fatalf("answer = %q, want the controlplane's target", got)
 	}
@@ -141,7 +141,7 @@ func TestSocks5UnroutedDomainNeverEntersTheTunnel(t *testing.T) {
 	tunnelSide, tunnelHits := tcpEcho(t, "controlplane")
 	direct, _ := tcpEcho(t, "direct")
 
-	routerAddr, client := sandbox(t)
+	egressAddr, client := sandbox(t)
 	// One route exists, for something else entirely.
 	if err := client.Proxy().ForwardTo("db.corp:5432", tunnelSide); err != nil {
 		t.Fatalf("ForwardTo: %v", err)
@@ -154,7 +154,7 @@ func TestSocks5UnroutedDomainNeverEntersTheTunnel(t *testing.T) {
 	// ordinary sandbox egress. (An unrouted address is refused outright — see
 	// TestSocks5UnroutedIPLiteralIsRefused.)
 	_, directPort, _ := net.SplitHostPort(direct)
-	conn := socksDial(t, routerAddr, net.JoinHostPort("localhost", directPort))
+	conn := socksDial(t, egressAddr, net.JoinHostPort("localhost", directPort))
 	if got := ask(t, conn, "hello"); !strings.HasPrefix(got, "direct:") {
 		t.Fatalf("answer = %q, want the direct target", got)
 	}
@@ -170,17 +170,17 @@ func TestSocks5UnroutedDomainNeverEntersTheTunnel(t *testing.T) {
 // and forwarding ssh.
 func TestSocks5RouteDoesNotLeakToOtherPorts(t *testing.T) {
 	tunnelSide, tunnelHits := tcpEcho(t, "controlplane")
-	routerAddr, client := sandbox(t)
+	egressAddr, client := sandbox(t)
 
 	if err := client.Proxy().ForwardTo("*.corp:5432", tunnelSide); err != nil {
 		t.Fatalf("ForwardTo: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	// Nothing listens on this port anywhere; what matters is where the router
+	// Nothing listens on this port anywhere; what matters is where the egress proxy
 	// tried to go, not whether it arrived.
 	before := tunnelHits.Load()
-	dialer, err := proxy.SOCKS5("tcp", routerAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", egressAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("socks5 dialer: %v", err)
 	}
@@ -203,9 +203,9 @@ func TestSocks5RouteDoesNotLeakToOtherPorts(t *testing.T) {
 // it really is meant to be reachable.
 func TestSocks5UnroutedIPLiteralIsRefused(t *testing.T) {
 	reachable, hits := tcpEcho(t, "direct")
-	routerAddr, _ := sandbox(t)
+	egressAddr, _ := sandbox(t)
 
-	dialer, err := proxy.SOCKS5("tcp", routerAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", egressAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("socks5 dialer: %v", err)
 	}
@@ -227,13 +227,13 @@ func TestSocks5ForwardedIPLiteralIsAllowed(t *testing.T) {
 	tunnelSide, tunnelHits := tcpEcho(t, "controlplane")
 	sandboxSide, _ := tcpEcho(t, "unused")
 
-	routerAddr, client := sandbox(t)
+	egressAddr, client := sandbox(t)
 	if err := client.Proxy().ForwardTo(sandboxSide, tunnelSide); err != nil {
 		t.Fatalf("ForwardTo: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	conn := socksDial(t, routerAddr, sandboxSide)
+	conn := socksDial(t, egressAddr, sandboxSide)
 	if got := ask(t, conn, "ping"); got != "controlplane: ping" {
 		t.Fatalf("answer = %q, want the controlplane's target", got)
 	}
@@ -244,9 +244,9 @@ func TestSocks5ForwardedIPLiteralIsAllowed(t *testing.T) {
 
 // The same port still serves HTTP: that is what makes one address enough for
 // HTTP_PROXY and ALL_PROXY together.
-func TestRouterServesHTTPAndSocks5OnTheSamePort(t *testing.T) {
+func TestEgressServesHTTPAndSocks5OnTheSamePort(t *testing.T) {
 	controlplaneOnly, _ := tcpEcho(t, "controlplane")
-	routerAddr, client := sandbox(t)
+	egressAddr, client := sandbox(t)
 
 	if err := client.Proxy().ForwardTo("db.corp:5432", controlplaneOnly); err != nil {
 		t.Fatalf("ForwardTo: %v", err)
@@ -254,7 +254,7 @@ func TestRouterServesHTTPAndSocks5OnTheSamePort(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// SOCKS5 …
-	conn := socksDial(t, routerAddr, "db.corp:5432")
+	conn := socksDial(t, egressAddr, "db.corp:5432")
 	if got := ask(t, conn, "ping"); got != "controlplane: ping" {
 		t.Fatalf("socks5 answer = %q", got)
 	}
@@ -266,9 +266,9 @@ func TestRouterServesHTTPAndSocks5OnTheSamePort(t *testing.T) {
 	}))
 	defer web.Close()
 
-	httpClient := routerClient(t, routerAddr)
+	httpClient := egressClient(t, egressAddr)
 	if got := getBody(t, httpClient, web.URL+"/"); got != "web" {
-		t.Fatalf("HTTP through the router = %q, want web", got)
+		t.Fatalf("HTTP through the egress proxy = %q, want web", got)
 	}
 }
 
@@ -284,8 +284,8 @@ func TestSocks5TLSTargetIsInterceptedAndInjected(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -304,7 +304,7 @@ func TestSocks5TLSTargetIsInterceptedAndInjected(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	// An HTTPS client whose only way out is SOCKS5.
-	dialer, err := proxy.SOCKS5("tcp", routerAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", egressAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("socks5 dialer: %v", err)
 	}
@@ -341,11 +341,11 @@ func TestSocks5TLSTargetIsInterceptedAndInjected(t *testing.T) {
 // than left waiting for an association that is not coming. It is what
 // mitmproxy answers too.
 func TestSocks5UDPAssociateIsRefused(t *testing.T) {
-	routerAddr, _ := sandbox(t)
+	egressAddr, _ := sandbox(t)
 
-	conn, err := net.DialTimeout("tcp", routerAddr, 2*time.Second)
+	conn, err := net.DialTimeout("tcp", egressAddr, 2*time.Second)
 	if err != nil {
-		t.Fatalf("dial router: %v", err)
+		t.Fatalf("dial the egress proxy: %v", err)
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(5 * time.Second))

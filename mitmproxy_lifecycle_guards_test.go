@@ -130,7 +130,7 @@ func TestShutdownDrainsInterceptedHTTP2(t *testing.T) {
 // Cloning a transport per request leaks it: the clone inherits a zero
 // IdleConnTimeout, goes out of scope after RoundTrip with nobody to call
 // CloseIdleConnections, and its connection plus read and write goroutines then
-// live until the process exits. Router already fixed this per tunnel port; the
+// live until the process exits. EgressProxy already fixed this per tunnel port; the
 // same fix never reached here.
 func TestUpstreamTransportIsReusedAcrossRequests(t *testing.T) {
 	p := NewMITMProxy()
@@ -395,10 +395,10 @@ func TestClosingClosesTheListener(t *testing.T) {
 		assertAlreadyClosed(t, ln)
 	})
 
-	t.Run("router", func(t *testing.T) {
+	t.Run("egress", func(t *testing.T) {
 		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
 
-		r := newRouter()
+		r := newEgressProxy()
 		if err := r.Start("127.0.0.1:0"); err != nil {
 			t.Fatalf("Start: %v", err)
 		}

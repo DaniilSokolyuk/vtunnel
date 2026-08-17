@@ -214,14 +214,14 @@ func TestWebSocketUpstreamRefusalIsForwarded(t *testing.T) {
 // Cleartext ws:// never becomes a CONNECT, so it takes the plain-HTTP path on
 // both sides. In the sandbox that path goes through http.Transport, which cannot
 // carry an upgrade at all.
-func TestWebSocketCleartextThroughRouter(t *testing.T) {
+func TestWebSocketCleartextThroughEgress(t *testing.T) {
 	backend := wsEchoBackend(t, nil)
 
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerPort := freePort(t)
-	if err := server.StartProxy(fmt.Sprintf("127.0.0.1:%d", routerPort)); err != nil {
+	egressPort := freePort(t)
+	if err := server.StartProxy(fmt.Sprintf("127.0.0.1:%d", egressPort)); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -236,11 +236,11 @@ func TestWebSocketCleartextThroughRouter(t *testing.T) {
 	client.Proxy().ForwardTo("ws.test:80", backend.addr)
 
 	// Deliberately not the gorilla Dialer's Proxy option: that issues a CONNECT
-	// even for ws://, which would exercise the tunnel path and leave the router's
+	// even for ws://, which would exercise the tunnel path and leave the egress proxy's
 	// plain-HTTP path — the one that cannot carry an upgrade through
-	// http.Transport — completely untested. This speaks to the router the way a
+	// http.Transport — completely untested. This speaks to the egress proxy the way a
 	// client honouring HTTP_PROXY for a ws:// URL does.
-	conn := dialWSViaPlainProxy(t, fmt.Sprintf("127.0.0.1:%d", routerPort), "ws://ws.test/socket")
+	conn := dialWSViaPlainProxy(t, fmt.Sprintf("127.0.0.1:%d", egressPort), "ws://ws.test/socket")
 	defer conn.Close()
 
 	assertEchoes(t, conn, "cleartext through the tunnel")

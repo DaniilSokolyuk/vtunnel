@@ -1,6 +1,6 @@
 # Migrating to 1.0
 
-Coming from 0.6.x. Three changes, and both ends upgrade together:
+Coming from 0.6.x. Four changes, and both ends upgrade together:
 
 1. **TLS interception moved out of the sandbox.** The private CA key and the
    injected credentials now live only on the controlplane; the sandbox keeps a
@@ -10,9 +10,14 @@ Coming from 0.6.x. Three changes, and both ends upgrade together:
    existing `vt-pub-`/`vt-priv-` pair as compromised and replace it.
 3. **The tunnel was split into transport and session**, so what carries the
    bytes and what multiplexes them are separate choices.
+4. **The sandbox can be given egress rules** — CIDRs, addresses and wildcard
+   names, allowed or denied — which it enforces itself. New, so nothing
+   breaks by leaving it alone: a tunnel that sets no policy behaves exactly
+   as 0.6 did, and anything unrouted is dialled.
 
 The first two are the reasons to upgrade. The third is mostly invisible unless
-you want it: the defaults are still a WebSocket carrying SSH.
+you want it — the defaults are still a WebSocket carrying SSH — and the fourth
+is opt-in.
 
 **The wire protocol changed** — a 1.0 client cannot drive a 0.6 sandbox, or the
 reverse.
@@ -160,6 +165,9 @@ ls /etc/vtunnel-ca.pem                 # should not exist
 | — | `vtunnel.GenerateCA` / `CACertPEM` / `LoadCA` |
 | — | `vtunnel.Listen(url)`, `vtunnel.Serve(ln, srv)`, `vtunnel.NewDialer(url, headers)` |
 | — | `-protocol`, `$VTUNNEL_PROTOCOL`; `WithProtocol` / `WithServerProtocol` |
+| — | `Policy`, `Client.SetEgressPolicy`, `EgressProxy.SetPolicy`, `WithServerEgressPolicy` |
+| — | `-default-egress`, `-allow-out`, `-deny-out`, `$VTUNNEL_DEFAULT_EGRESS` |
+| `Router`, `Server.Router()` | `EgressProxy`, `Server.Egress()` |
 | — | `WithDialer`, `WithStreamWindow` / `WithServerStreamWindow` |
 
 `client.Listen` and `vtunnel.WithHeader` keep their signatures and behaviour.

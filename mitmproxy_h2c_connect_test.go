@@ -3,7 +3,7 @@ package vtunnel_test
 // These tests drive MITMProxy directly, without a tunnel, to cover proxy
 // behaviour in isolation. That is not how the library is normally used: see
 // doc.go and example_test.go for the Client.Forward entry point, and
-// router_e2e_test.go for the full sandbox-to-controlplane path.
+// egress_e2e_test.go for the full sandbox-to-controlplane path.
 
 // A mapped domain configured with a MITM CA is not always TLS traffic — h2c
 // gRPC clients (e.g. grpcurl -plaintext) send the plaintext HTTP/2 preface

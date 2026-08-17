@@ -359,8 +359,8 @@ func (errConnRefused) Error() string { return "connection refused" }
 
 // The domain field is 255 arbitrary bytes, and nothing between the socket and
 // the allowlist looked at them. Whatever the client wrote travelled on as a
-// hostname: into the request line and Host header of the CONNECT the router
-// synthesises for the controlplane, and into the logs. A name is a name — the
+// hostname: into the request line and Host header of the CONNECT the egress
+// proxy synthesises for the controlplane, and into the logs. A name is a name — the
 // characters a hostname may contain are not a matter of taste here, they are
 // what keeps a client from writing a second request inside the first.
 func TestAcceptRefusesDomainsThatAreNotHostnames(t *testing.T) {

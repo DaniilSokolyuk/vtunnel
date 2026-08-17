@@ -22,7 +22,7 @@ import (
 	"time"
 )
 
-// fuzzDoors builds the proxy and router once for the whole run: a listener per
+// fuzzDoors builds the proxy and egress proxy once for the whole run: a listener per
 // execution would spend the budget on setup and run out of ports.
 var fuzzDoors = sync.OnceValues(func() (doors, error) {
 	echo, err := listenEcho("echo")
@@ -64,17 +64,17 @@ var fuzzDoors = sync.OnceValues(func() (doors, error) {
 		return doors{}, err
 	}
 
-	r := newRouter()
+	r := newEgressProxy()
 	if err := r.Start("127.0.0.1:0"); err != nil {
 		return doors{}, err
 	}
 
-	return doors{proxy: p.Addr().String(), router: r.Addr().String(), echo: echo}, nil
+	return doors{proxy: p.Addr().String(), egress: r.Addr().String(), echo: echo}, nil
 })
 
 type doors struct {
 	proxy  string
-	router string
+	egress string
 	echo   string
 }
 
@@ -190,9 +190,9 @@ func FuzzProxyPortSurvivesAnything(f *testing.F) {
 	fuzzOverASocket(f, func(d doors) string { return d.proxy })
 }
 
-// The sandbox router's mixed port, which sorts HTTP from SOCKS5 by one byte and
+// The sandbox egress proxy's mixed port, which sorts HTTP from SOCKS5 by one byte and
 // therefore has two parsers behind it.
-func FuzzRouterPortSurvivesAnything(f *testing.F) {
+func FuzzEgressPortSurvivesAnything(f *testing.F) {
 	f.Add([]byte{5, 1, 0, 5, 1, 0, 3, 9, 'l', 'o', 'c', 'a', 'l', 'h', 'o', 's', 't', 0, 80}, 1)
 	f.Add([]byte{5, 1, 0, 5, 1, 0, 3, 255}, 1)
 	f.Add([]byte{5, 255}, 1)
@@ -200,7 +200,7 @@ func FuzzRouterPortSurvivesAnything(f *testing.F) {
 	f.Add([]byte("GET http://localhost:9/ HTTP/1.1\r\n\r\n"), 3)
 	f.Add([]byte{5, 1, 0, 5, 1, 0, 4, 0, 0}, 1)
 
-	fuzzOverASocket(f, func(d doors) string { return d.router })
+	fuzzOverASocket(f, func(d doors) string { return d.egress })
 }
 
 func fuzzOverASocket(f *testing.F, pick func(doors) string) {

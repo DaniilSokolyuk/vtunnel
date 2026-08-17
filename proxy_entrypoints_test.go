@@ -30,7 +30,7 @@ import (
 // chain is the whole thing standing up: an application's proxy address in a
 // sandbox, a tunnel, and a controlplane proxy holding the CA and the routes.
 type chain struct {
-	routerAddr string
+	egressAddr string
 	ca         tls.Certificate
 	// unrouted is a plain HTTP server nobody forwarded, reachable from the
 	// "sandbox" — which is this process, so its own address stands in for the
@@ -58,8 +58,8 @@ func newChain(t *testing.T) *chain {
 	ts, server := startTunnelServer(t)
 	t.Cleanup(ts.Close)
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	t.Cleanup(server.CloseProxy)
@@ -93,7 +93,7 @@ func newChain(t *testing.T) *chain {
 	time.Sleep(200 * time.Millisecond) // let the routes reach the sandbox
 
 	return &chain{
-		routerAddr:    routerAddr,
+		egressAddr:    egressAddr,
 		ca:            ca,
 		unroutedAddr:  unrouted.Listener.Addr().String(),
 		rawTargetAddr: rawTarget,
@@ -118,7 +118,7 @@ func (c *chain) caPool(t *testing.T) *x509.CertPool {
 // CONNECT.
 func (c *chain) viaHTTPProxy(t *testing.T) *http.Client {
 	t.Helper()
-	proxyURL, err := url.Parse("http://" + c.routerAddr)
+	proxyURL, err := url.Parse("http://" + c.egressAddr)
 	if err != nil {
 		t.Fatalf("parse proxy URL: %v", err)
 	}
@@ -136,7 +136,7 @@ func (c *chain) viaHTTPProxy(t *testing.T) *http.Client {
 // every connection is opened through SOCKS5, and the name travels unresolved.
 func (c *chain) viaSocks5(t *testing.T) *http.Client {
 	t.Helper()
-	dialer, err := proxy.SOCKS5("tcp", c.routerAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", c.egressAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("socks5 dialer: %v", err)
 	}
@@ -152,7 +152,7 @@ func (c *chain) viaSocks5(t *testing.T) *http.Client {
 
 func (c *chain) socksDialer(t *testing.T) proxy.Dialer {
 	t.Helper()
-	dialer, err := proxy.SOCKS5("tcp", c.routerAddr, nil, proxy.Direct)
+	dialer, err := proxy.SOCKS5("tcp", c.egressAddr, nil, proxy.Direct)
 	if err != nil {
 		t.Fatalf("socks5 dialer: %v", err)
 	}

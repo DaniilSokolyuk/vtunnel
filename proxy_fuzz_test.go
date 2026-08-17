@@ -47,7 +47,7 @@ func classify(chunks ...[]byte) tunnelKind {
 //
 // This is the property the split-request-line bug broke: the same client
 // sending the same bytes was intercepted on one connection and piped on the
-// next, according to where a segment boundary fell — and the sandbox router's
+// next, according to where a segment boundary fell — and the sandbox egress proxy's
 // tunnel hop re-segments everything it carries, so the boundary is not even the
 // client's to control.
 func FuzzTunnelClassificationIgnoresSegmentation(f *testing.F) {
@@ -139,7 +139,7 @@ func FuzzConnectPaddingOnlyEatsPadding(f *testing.F) {
 }
 
 // The allowlist is the sandbox's boundary, and it is matched against a name the
-// sandbox chose. A miss on the router is egress, so the properties that matter
+// sandbox chose. A miss on the egress proxy is egress, so the properties that matter
 // are about what must never match.
 func FuzzDomainMatchingHoldsItsBoundaries(f *testing.F) {
 	patterns := map[string]int{
@@ -291,12 +291,12 @@ func FuzzCookieMergeKeepsEveryPair(f *testing.F) {
 
 // The two sides of the tunnel must agree about what is allowlisted.
 //
-// They keep separate tables — the router's, filled from the domain list the
+// They keep separate tables — the egress proxy's, filled from the domain list the
 // client publishes, and the proxy's, filled by ForwardTo — and they must reach
 // the same verdict for every name, because disagreeing is not a draw. If the
-// router says routed and the proxy says not, the request crosses the tunnel to
-// be refused with a 403 that no retry will fix. If the router says not and the
-// proxy says routed, the router dials the name itself and the connection leaves
+// the egress proxy says routed and the proxy says not, the request crosses the tunnel to
+// be refused with a 403 that no retry will fix. If the egress proxy says not and the
+// proxy says routed, the egress proxy dials the name itself and the connection leaves
 // the sandbox: no tunnel, no interception, no credential. That second one is
 // the whole allowlist failing open, and it is what a single unnormalised
 // spelling used to cause.
@@ -314,21 +314,21 @@ func FuzzBothSidesAgreeOnWhatIsRouted(f *testing.F) {
 			t.Skipf("not a route: %v", err)
 		}
 
-		r := newRouter()
+		r := newEgressProxy()
 		// The list the client publishes is exactly what Routes() returns, so
-		// the router is filled the way it is in production.
+		// the egress proxy is filled the way it is in production.
 		r.SetRoutes(7, p.Routes())
 
 		_, viaProxy := p.resolveDomain(authority)
-		_, viaRouter := r.route(authority)
+		_, viaEgress := r.route(authority)
 
-		if viaProxy != viaRouter {
-			side := "the router would dial it out of the sandbox itself"
-			if viaRouter {
+		if viaProxy != viaEgress {
+			side := "the egress proxy would dial it out of the sandbox itself"
+			if viaEgress {
 				side = "the controlplane would refuse it after it crossed the tunnel"
 			}
-			t.Fatalf("route %q, authority %q: proxy says routed=%v, router says routed=%v — %s\n"+
-				"published list: %v", domain, authority, viaProxy, viaRouter, side, p.Routes())
+			t.Fatalf("route %q, authority %q: proxy says routed=%v, egress says routed=%v — %s\n"+
+				"published list: %v", domain, authority, viaProxy, viaEgress, side, p.Routes())
 		}
 	})
 }
@@ -427,18 +427,27 @@ func FuzzForwardTargetIsCoherent(f *testing.F) {
 	f.Add("gw.internal:8443")
 	f.Add("tls://gw.internal")
 	f.Add("http://gw.internal:80")
+	f.Add("h2c://gw.internal:13002")
 	f.Add("tls://127.0.0.1:443")
 	f.Add("")
 
 	f.Fuzz(func(t *testing.T, addr string) {
-		target, tlsHost, isTLS := parseForwardTarget(addr)
+		target, tlsHost, isTLS, h2c := parseForwardTarget(addr)
 
 		if (tlsHost != "") != isTLS {
 			t.Fatalf("parseForwardTarget(%q) = %q, %q, %v: a server name without TLS, "+
 				"or TLS without a server name", addr, target, tlsHost, isTLS)
 		}
-		if strings.HasPrefix(target, "tls://") || strings.HasPrefix(target, "http://") {
-			t.Fatalf("parseForwardTarget(%q) left a scheme on the dial address %q", addr, target)
+		// The two stated schemes are mutually exclusive: h2c is cleartext, and
+		// TLS is not. A target that came back as both would leave
+		// upstreamTransport picking between them by the order of its branches.
+		if h2c && isTLS {
+			t.Fatalf("parseForwardTarget(%q) says both h2c and TLS", addr)
+		}
+		for _, scheme := range []string{"tls://", "http://", "h2c://"} {
+			if strings.HasPrefix(target, scheme) {
+				t.Fatalf("parseForwardTarget(%q) left a scheme on the dial address %q", addr, target)
+			}
 		}
 		if isTLS {
 			// A TLS target is dialled, so it must carry a port for the dial and

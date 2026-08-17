@@ -159,12 +159,12 @@ func TestDirectHTTP1RequestsAreUnchanged(t *testing.T) {
 	}
 }
 
-// The sandbox router has the same cleartext path, and the same sweep. It cannot
+// The sandbox egress proxy has the same cleartext path, and the same sweep. It cannot
 // keep the request on HTTP/2 — chaining goes through net/http's proxy support,
 // which is HTTP/1.1 — but TE: trailers is what the upstream reads to decide
 // whether to send trailers at all, and dropping it loses a gRPC status just as
 // thoroughly.
-func TestRouterKeepsTrailersOnDirectH2C(t *testing.T) {
+func TestEgressKeepsTrailersOnDirectH2C(t *testing.T) {
 	gotTE := make(chan string, 4)
 	backend := httptest.NewServer(h2c.NewHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotTE <- r.Header.Get("Te")
@@ -177,14 +177,14 @@ func TestRouterKeepsTrailersOnDirectH2C(t *testing.T) {
 	if err := server.StartProxy("127.0.0.1:0"); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
-	routerAddr := server.Router().Addr().String()
+	egressAddr := server.Egress().Addr().String()
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http2.Transport{
 			AllowHTTP: true,
 			DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-				return net.Dial(network, routerAddr)
+				return net.Dial(network, egressAddr)
 			},
 		},
 	}

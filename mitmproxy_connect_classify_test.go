@@ -184,7 +184,7 @@ func TestBareLFRequestLineIsStillHTTP(t *testing.T) {
 	}
 }
 
-// TCP does not preserve write boundaries, and the sandbox router's tunnel hop
+// TCP does not preserve write boundaries, and the sandbox egress proxy's tunnel hop
 // re-segments whatever it carries. A request line that arrives in two pieces is
 // the same request; classifying it from the first piece alone made the same
 // client, sending the same bytes, injected into on one connection and piped on

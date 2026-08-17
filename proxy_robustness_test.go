@@ -64,7 +64,7 @@ func greetingBackend(t *testing.T, banner string) string {
 	return ln.Addr().String()
 }
 
-func robustnessDoors(t *testing.T) (proxyAddr, routerAddr string) {
+func robustnessDoors(t *testing.T) (proxyAddr, egressAddr string) {
 	t.Helper()
 
 	echo := echoBackend(t)
@@ -90,9 +90,9 @@ func robustnessDoors(t *testing.T) (proxyAddr, routerAddr string) {
 	}
 	t.Cleanup(p.Close)
 
-	r := newRouter()
+	r := newEgressProxy()
 	if err := r.Start("127.0.0.1:0"); err != nil {
-		t.Fatalf("router Start: %v", err)
+		t.Fatalf("egress Start: %v", err)
 	}
 	t.Cleanup(r.Close)
 
@@ -113,7 +113,7 @@ func TestBothFrontDoorsSurviveOddInput(t *testing.T) {
 	peekTimeout.Set(2 * time.Second)
 	const limit = 20 * time.Second
 
-	proxyAddr, routerAddr := robustnessDoors(t)
+	proxyAddr, egressAddr := robustnessDoors(t)
 
 	long := strings.Repeat("a", 300)
 	cases := []struct {
@@ -145,7 +145,7 @@ func TestBothFrontDoorsSurviveOddInput(t *testing.T) {
 
 	for _, door := range []struct{ name, addr string }{
 		{"proxy", proxyAddr},
-		{"router", routerAddr},
+		{"egress", egressAddr},
 	} {
 		for _, tc := range cases {
 			t.Run(door.name+"/"+tc.name, func(t *testing.T) {

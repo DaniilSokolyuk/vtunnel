@@ -1,7 +1,7 @@
 package vtunnel_test
 
 // A name has more than one spelling, and only one of them is in the allowlist.
-// On the sandbox router a miss is not a refusal — it is dialled directly, out
+// On the sandbox egress proxy a miss is not a refusal — it is dialled directly, out
 // of the sandbox, past the tunnel and past the credential the controlplane
 // would have injected. So every spelling that reaches the same server has to
 // reach the same route.
@@ -25,13 +25,13 @@ func routedThroughSpelling(t *testing.T, route, asked string) string {
 	direct, _ := tcpEcho(t, "direct")
 	_, port, _ := net.SplitHostPort(direct)
 
-	routerAddr, client := sandbox(t)
+	egressAddr, client := sandbox(t)
 	if err := client.Proxy().ForwardTo(fmt.Sprintf("%s:%s", route, port), tunnelSide); err != nil {
 		t.Fatalf("ForwardTo: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	conn := socksDial(t, routerAddr, fmt.Sprintf("%s:%s", asked, port))
+	conn := socksDial(t, egressAddr, fmt.Sprintf("%s:%s", asked, port))
 	return ask(t, conn, "hi")
 }
 
@@ -60,13 +60,13 @@ func TestZeroPaddedPortStaysInsideTheTunnel(t *testing.T) {
 	direct, _ := tcpEcho(t, "direct")
 	_, port, _ := net.SplitHostPort(direct)
 
-	routerAddr, client := sandbox(t)
+	egressAddr, client := sandbox(t)
 	if err := client.Proxy().ForwardTo("localhost:"+port, tunnelSide); err != nil {
 		t.Fatalf("ForwardTo: %v", err)
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	conn := socksDial(t, routerAddr, "localhost:0"+port)
+	conn := socksDial(t, egressAddr, "localhost:0"+port)
 	if got := ask(t, conn, "hi"); !strings.HasPrefix(got, "controlplane:") {
 		t.Fatalf("answer = %q, want the controlplane's target: a zero-padded port missed the "+
 			"allowlist and the connection left the sandbox directly", got)

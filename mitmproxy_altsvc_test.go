@@ -58,13 +58,13 @@ func TestAltSvcIsStrippedFromUpstreamResponses(t *testing.T) {
 		}
 	})
 
-	t.Run("through the sandbox router", func(t *testing.T) {
-		router := vtunnel.NewServer()
-		defer router.Close()
-		if err := router.StartProxy("127.0.0.1:0"); err != nil {
+	t.Run("through the sandbox egress proxy", func(t *testing.T) {
+		sandbox := vtunnel.NewServer()
+		defer sandbox.Close()
+		if err := sandbox.StartProxy("127.0.0.1:0"); err != nil {
 			t.Fatalf("StartProxy: %v", err)
 		}
-		proxyURL, _ := url.Parse("http://" + router.Router().Addr().String())
+		proxyURL, _ := url.Parse("http://" + sandbox.Egress().Addr().String())
 		client := &http.Client{
 			Timeout:   5 * time.Second,
 			Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
@@ -76,7 +76,7 @@ func TestAltSvcIsStrippedFromUpstreamResponses(t *testing.T) {
 		io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if got := resp.Header.Values("Alt-Svc"); len(got) != 0 {
-			t.Fatalf("client saw Alt-Svc %q through the router", got)
+			t.Fatalf("client saw Alt-Svc %q through the egress proxy", got)
 		}
 	})
 }

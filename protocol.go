@@ -64,6 +64,7 @@ func (p Protocol) insecure() bool { return p == ProtocolYamuxInsecure }
 const (
 	streamTunnel = "tunnel" // bytes for a forwarded port
 	streamListen = "listen" // ask the sandbox to open a port
+	streamPolicy = "policy" // tell the sandbox what it may reach directly
 	streamPing   = "ping"   // keepalive
 
 	// maxFrame bounds a header. Nothing legitimate approaches it; it is here so
@@ -85,8 +86,46 @@ const (
 type streamHeader struct {
 	Type string `json:"type"`
 	Port int    `json:"port,omitempty"`
-	// Domains are routed through this port by the sandbox router.
+	// Domains are routed through this port by the sandbox egress proxy.
 	Domains []string `json:"domains,omitempty"`
+	// Policy is what the sandbox may reach without crossing the tunnel, carried
+	// on a streamPolicy message. It is still not a target and still not a
+	// credential: it is the sandbox's own rules about its own egress, which the
+	// sandbox is the one enforcing.
+	Policy *wirePolicy `json:"policy,omitempty"`
+}
+
+// wirePolicy is [Policy] as it crosses the tunnel.
+//
+// Default is a string rather than the Go enum's number, and that is the whole
+// reason this type exists separately. ActionAllow is the zero value, so a
+// number would make "the field was absent", "the frame was truncated" and
+// "allow everything" the same message — and the direction that mistake fails in
+// is open. A word has no zero value to be confused with, and the sandbox
+// refuses a policy whose default it does not recognise.
+type wirePolicy struct {
+	Default string   `json:"default"`
+	Allow   []string `json:"allow,omitempty"`
+	Deny    []string `json:"deny,omitempty"`
+}
+
+func newWirePolicy(p Policy) *wirePolicy {
+	return &wirePolicy{Default: p.Default.String(), Allow: p.Allow, Deny: p.Deny}
+}
+
+// policy reads a wire policy back, refusing a default it does not know.
+func (w *wirePolicy) policy() (Policy, error) {
+	var def Action
+	switch w.Default {
+	case ActionAllow.String():
+		def = ActionAllow
+	case ActionDeny.String():
+		def = ActionDeny
+	default:
+		return Policy{}, fmt.Errorf("unknown egress default %q (want %q or %q)",
+			w.Default, ActionAllow, ActionDeny)
+	}
+	return Policy{Default: def, Allow: w.Allow, Deny: w.Deny}, nil
 }
 
 // streamReply answers a control stream.
@@ -94,6 +133,12 @@ type streamReply struct {
 	OK    bool   `json:"ok"`
 	Port  int    `json:"port,omitempty"`
 	Error string `json:"error,omitempty"`
+	// PolicyApplied answers a streamPolicy message, and answers it explicitly.
+	// A sandbox too old to know the message drops the unknown field and replies
+	// OK to what it read as an empty request, so silence would read as success:
+	// the controlplane would believe the sandbox was closed while it was wide
+	// open, with nothing anywhere to say otherwise.
+	PolicyApplied bool `json:"policyApplied,omitempty"`
 }
 
 func writeFrame(w io.Writer, v any) error {

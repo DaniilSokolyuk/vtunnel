@@ -26,12 +26,12 @@ import (
 //   - `*` must be a complete label on a dot border; no `*` in the middle.
 //
 // Priority: exact > leftmost > rightmost; within a group, the longest pattern
-// wins. Both the sandbox router and the controlplane proxy route through this,
+// wins. Both the sandbox egress proxy and the controlplane proxy route through this,
 // so a host resolves the same way on either side of a tunnel.
 //
 // Matching is case-insensitive, as hostnames are (RFC 4343). Comparing them
 // byte for byte meant a single capital letter missed the allowlist: on the
-// controlplane that fails closed, but on the sandbox router a miss is dialled
+// controlplane that fails closed, but on the sandbox egress proxy a miss is dialled
 // directly, so `https://API.corp/` egressed from the sandbox without ever
 // meeting the tunnel, the proxy or its injected credential.
 func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, bool) {
@@ -79,7 +79,7 @@ func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, boo
 // means the local machine.
 //
 // This is what keeps the allowlist honest. A miss fails closed on the
-// controlplane but fails open on the sandbox router, where it is dialled
+// controlplane but fails open on the sandbox egress proxy, where it is dialled
 // directly — past the tunnel, past interception and past the injected
 // credential. Every spelling that reaches the same server therefore has to
 // reach the same route, or the allowlist is one keystroke wide.
@@ -205,6 +205,16 @@ func wildcardMatches(pattern, host, port string) (bool, bool) {
 	if patPort != port {
 		return false, false
 	}
+	return wildcardHostMatches(patHost, host)
+}
+
+// wildcardHostMatches is the host half of wildcardMatches, with no opinion
+// about ports. It is separate because the egress policy shares these semantics
+// and not the port rule: a route is keyed by one port, while a policy rule
+// written without one covers every port. Two copies of "what does `*.corp`
+// mean" is exactly the kind of near-duplicate that ends up disagreeing, and
+// here the two readers are the two sides of the same allowlist.
+func wildcardHostMatches(patHost, host string) (isLeftmost, matched bool) {
 	if strings.HasPrefix(patHost, "*.") {
 		suffix := patHost[1:] // ".suffix"
 		if strings.HasSuffix(host, suffix) && len(host) > len(suffix) {

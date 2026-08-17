@@ -1,6 +1,6 @@
 package vtunnel
 
-// What Router.Start accepts, and what each form serves.
+// What EgressProxy.Start accepts, and what each form serves.
 //
 // The address may carry a scheme, the way gost and glider spell it, because a
 // sandbox that wants only one of the two protocols should not need a second
@@ -56,14 +56,14 @@ func TestParseProxyScheme(t *testing.T) {
 
 // socks5://: an HTTP client that wanders in is hung up on rather than served,
 // because the operator said what this port is for.
-func TestRouterSocks5OnlyRefusesHTTP(t *testing.T) {
-	router := newRouter()
-	if err := router.Start("socks5://127.0.0.1:0"); err != nil {
+func TestEgressSocks5OnlyRefusesHTTP(t *testing.T) {
+	egress := newEgressProxy()
+	if err := egress.Start("socks5://127.0.0.1:0"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer router.Close()
+	defer egress.Close()
 
-	conn, err := net.DialTimeout("tcp", router.Addr().String(), 2*time.Second)
+	conn, err := net.DialTimeout("tcp", egress.Addr().String(), 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestRouterSocks5OnlyRefusesHTTP(t *testing.T) {
 	// Reading to EOF is the assertion: a served connection would have answered.
 
 	// And SOCKS5 still works on it.
-	if greetSocks5(t, router.Addr().String()) != MethodNoAuthAccepted {
+	if greetSocks5(t, egress.Addr().String()) != MethodNoAuthAccepted {
 		t.Fatal("the SOCKS5-only listener did not answer a SOCKS5 greeting")
 	}
 }
@@ -87,14 +87,14 @@ func TestRouterSocks5OnlyRefusesHTTP(t *testing.T) {
 // http://: no sniffing, and a SOCKS5 greeting is answered by the HTTP server
 // with what it makes of it — the point being that the operator gets what they
 // asked for and nothing else is listening.
-func TestRouterHTTPOnlyDoesNotSpeakSocks5(t *testing.T) {
-	router := newRouter()
-	if err := router.Start("http://127.0.0.1:0"); err != nil {
+func TestEgressHTTPOnlyDoesNotSpeakSocks5(t *testing.T) {
+	egress := newEgressProxy()
+	if err := egress.Start("http://127.0.0.1:0"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	defer router.Close()
+	defer egress.Close()
 
-	conn, err := net.DialTimeout("tcp", router.Addr().String(), 2*time.Second)
+	conn, err := net.DialTimeout("tcp", egress.Addr().String(), 2*time.Second)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -121,13 +121,13 @@ func TestRouterHTTPOnlyDoesNotSpeakSocks5(t *testing.T) {
 }
 
 // A bad scheme is refused at Start, before a port is opened.
-func TestRouterStartRejectsUnknownScheme(t *testing.T) {
-	router := newRouter()
-	if err := router.Start("gopher://127.0.0.1:0"); err == nil {
-		router.Close()
+func TestEgressStartRejectsUnknownScheme(t *testing.T) {
+	egress := newEgressProxy()
+	if err := egress.Start("gopher://127.0.0.1:0"); err == nil {
+		egress.Close()
 		t.Fatal("Start accepted a scheme it cannot serve")
 	}
-	if router.Addr() != nil {
+	if egress.Addr() != nil {
 		t.Fatal("Start opened a listener for an address it then refused")
 	}
 }

@@ -1,6 +1,6 @@
 package vtunnel
 
-// The sandbox router's lifecycle. Everything here is about what "the proxy is
+// The sandbox egress proxy's lifecycle. Everything here is about what "the proxy is
 // stopped" means: a listener nothing can close, and tunnels that keep relaying
 // after Close returned, are both ways of it not being true.
 
@@ -36,10 +36,10 @@ func echoBackend(t *testing.T) string {
 	return ln.Addr().String()
 }
 
-// openConnectTunnel opens a CONNECT tunnel through the router to target.
-func openConnectTunnel(t *testing.T, routerAddr, target string) net.Conn {
+// openConnectTunnel opens a CONNECT tunnel through the egress proxy to target.
+func openConnectTunnel(t *testing.T, egressAddr, target string) net.Conn {
 	t.Helper()
-	conn, err := net.DialTimeout("tcp", routerAddr, 5*time.Second)
+	conn, err := net.DialTimeout("tcp", egressAddr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,9 +57,9 @@ func openConnectTunnel(t *testing.T, routerAddr, target string) net.Conn {
 }
 
 // openSocksTunnel does the same through the SOCKS5 front end.
-func openSocksTunnel(t *testing.T, routerAddr, host string, port int) net.Conn {
+func openSocksTunnel(t *testing.T, egressAddr, host string, port int) net.Conn {
 	t.Helper()
-	conn, err := net.DialTimeout("tcp", routerAddr, 5*time.Second)
+	conn, err := net.DialTimeout("tcp", egressAddr, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,28 +99,28 @@ func stillRelaying(t *testing.T, conn net.Conn) bool {
 
 // Close is documented as reaching connections already established, "a CONNECT
 // tunnel mid-transfer" among them. It reached neither of the two things the
-// router is mostly made of: net/http stops tracking a connection the moment it
+// the egress proxy is mostly made of: net/http stops tracking a connection the moment it
 // is hijacked, and a SOCKS5 connection never passes through net/http at all. So
 // stopping the sandbox proxy left every tunnel it had opened still relaying,
 // each holding a socket out of the sandbox.
-func TestRouterCloseEndsHijackedTunnels(t *testing.T) {
+func TestEgressCloseEndsHijackedTunnels(t *testing.T) {
 	backend := echoBackend(t)
 	_, port, _ := net.SplitHostPort(backend)
 
-	r := newRouter()
+	r := newEgressProxy()
 	if err := r.Start("127.0.0.1:0"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	routerAddr := r.Addr().String()
+	egressAddr := r.Addr().String()
 
-	connect := openConnectTunnel(t, routerAddr, backend)
+	connect := openConnectTunnel(t, egressAddr, backend)
 	if !stillRelaying(t, connect) {
 		t.Fatal("the CONNECT tunnel does not work to begin with")
 	}
 
 	var socksPort int
 	fmt.Sscanf(port, "%d", &socksPort)
-	socks := openSocksTunnel(t, routerAddr, "localhost", socksPort)
+	socks := openSocksTunnel(t, egressAddr, "localhost", socksPort)
 	if !stillRelaying(t, socks) {
 		t.Fatal("the SOCKS5 tunnel does not work to begin with")
 	}
@@ -139,8 +139,8 @@ func TestRouterCloseEndsHijackedTunnels(t *testing.T) {
 // Close before Start used to spend the once on a listener that did not exist
 // yet, so the Start that followed installed one nothing could ever close. The
 // proxy has the same guard, added for the same reason.
-func TestRouterCloseBeforeStartStillArmsTheGuard(t *testing.T) {
-	r := newRouter()
+func TestEgressCloseBeforeStartStillArmsTheGuard(t *testing.T) {
+	r := newEgressProxy()
 	r.Close()
 
 	if err := r.Start("127.0.0.1:0"); err == nil {
@@ -157,8 +157,8 @@ func TestRouterCloseBeforeStartStillArmsTheGuard(t *testing.T) {
 
 // A second Start used to overwrite the first listener, leaving it accepting
 // with nobody holding a reference to close it.
-func TestRouterRefusesASecondStart(t *testing.T) {
-	r := newRouter()
+func TestEgressRefusesASecondStart(t *testing.T) {
+	r := newEgressProxy()
 	if err := r.Start("127.0.0.1:0"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
@@ -173,23 +173,23 @@ func TestRouterRefusesASecondStart(t *testing.T) {
 	}
 }
 
-// The router's own transport had none of the bounds the proxy's has: a dial
+// The egress proxy's own transport had none of the bounds the proxy's has: a dial
 // with no timeout at all, and idle connections that never expire — one leak per
 // distinct host a sandbox application touches over cleartext.
-func TestRouterTransportIsBounded(t *testing.T) {
-	r := newRouter()
+func TestEgressTransportIsBounded(t *testing.T) {
+	r := newEgressProxy()
 	if r.transport.DialContext == nil {
-		t.Error("the router's transport dials with no timeout")
+		t.Error("the egress proxy's transport dials with no timeout")
 	}
 	if r.transport.IdleConnTimeout == 0 {
-		t.Error("the router's transport keeps idle connections forever")
+		t.Error("the egress proxy's transport keeps idle connections forever")
 	}
 }
 
 // A black-holed cleartext request answers within the dial timeout instead of
 // hanging until the client gives up.
-func TestRouterCleartextDialIsBounded(t *testing.T) {
-	r := newRouter()
+func TestEgressCleartextDialIsBounded(t *testing.T) {
+	r := newEgressProxy()
 	if err := r.Start("127.0.0.1:0"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}

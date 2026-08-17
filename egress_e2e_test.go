@@ -14,17 +14,17 @@ import (
 	"github.com/vivid-money/vtunnel"
 )
 
-// End-to-end through the whole chain: application -> sandbox router -> tunnel ->
+// End-to-end through the whole chain: application -> sandbox egress proxy -> tunnel ->
 // controlplane proxy -> backend. Asserts the security property the architecture
 // exists for: an allowlisted domain is intercepted on the controlplane, and an
 // unmapped one leaves the sandbox directly without ever meeting the MITM CA.
-func TestRouterChainsMappedAndBypassesUnmapped(t *testing.T) {
+func TestEgressChainsMappedAndBypassesUnmapped(t *testing.T) {
 	mapped := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "mapped:%s", r.Header.Get("Authorization"))
 	}))
 	defer mapped.Close()
 
-	// A TLS backend the router must reach untouched. Its own certificate is the
+	// A TLS backend the egress proxy must reach untouched. Its own certificate is the
 	// evidence: if the request had gone through the controlplane proxy, the
 	// client would see a cert signed by the MITM CA instead.
 	direct := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -36,8 +36,8 @@ func TestRouterChainsMappedAndBypassesUnmapped(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -55,7 +55,7 @@ func TestRouterChainsMappedAndBypassesUnmapped(t *testing.T) {
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	httpClient := routerClient(t, routerAddr)
+	httpClient := egressClient(t, egressAddr)
 
 	// Mapped: chained to the controlplane, which injects the credential.
 	resp, err := httpClient.Get("https://mapped.test/hello")
@@ -92,12 +92,12 @@ func TestRouterChainsMappedAndBypassesUnmapped(t *testing.T) {
 }
 
 // Forward and Unforward may be called repeatedly while connected: each call
-// re-sends the full domain list and the router applies it wholesale.
+// re-sends the full domain list and the egress proxy applies it wholesale.
 //
 // Routing is observed without relying on DNS: the forwarded authority is a real
 // listener (the decoy). While mapped, requests reach the chained target; once
 // unmapped, the very same request reaches the decoy directly.
-func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
+func TestEgressRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	chained := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "chained")
 	}))
@@ -117,8 +117,8 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -130,7 +130,7 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	}
 	defer client.Close()
 
-	httpClient := routerClient(t, routerAddr)
+	httpClient := egressClient(t, egressAddr)
 	decoyAuthority := decoy.Listener.Addr().String()
 	decoyURL := "https://" + decoyAuthority + "/"
 
@@ -172,10 +172,10 @@ func TestRouterRoutesUpdateAcrossMultipleForwards(t *testing.T) {
 	}
 }
 
-// Wildcards resolve identically on both sides of the tunnel: the router
+// Wildcards resolve identically on both sides of the tunnel: the egress proxy
 // allowlists by pattern and the controlplane proxy resolves the same pattern
 // to a target.
-func TestRouterWildcardThroughTunnel(t *testing.T) {
+func TestEgressWildcardThroughTunnel(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "wild:%s", r.Host)
 	}))
@@ -184,8 +184,8 @@ func TestRouterWildcardThroughTunnel(t *testing.T) {
 	ts, server := startTunnelServer(t)
 	defer ts.Close()
 
-	routerAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
-	if err := server.StartProxy(routerAddr); err != nil {
+	egressAddr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	if err := server.StartProxy(egressAddr); err != nil {
 		t.Fatalf("StartProxy: %v", err)
 	}
 	defer server.CloseProxy()
@@ -202,7 +202,7 @@ func TestRouterWildcardThroughTunnel(t *testing.T) {
 	}
 	time.Sleep(150 * time.Millisecond)
 
-	httpClient := routerClient(t, routerAddr)
+	httpClient := egressClient(t, egressAddr)
 	for _, host := range []string{"a.wild.test", "deep.b.wild.test"} {
 		if got := getBody(t, httpClient, "https://"+host+"/"); got != "wild:"+host {
 			t.Fatalf("%s = %q", host, got)
@@ -212,13 +212,13 @@ func TestRouterWildcardThroughTunnel(t *testing.T) {
 
 // --- helpers ---
 
-// routerClient is an HTTP client pointed at the sandbox router, standing in for
+// egressClient is an HTTP client pointed at the sandbox egress proxy, standing in for
 // an application with HTTPS_PROXY set.
-func routerClient(t *testing.T, routerAddr string) *http.Client {
+func egressClient(t *testing.T, egressAddr string) *http.Client {
 	t.Helper()
-	proxyURL, err := url.Parse("http://" + routerAddr)
+	proxyURL, err := url.Parse("http://" + egressAddr)
 	if err != nil {
-		t.Fatalf("parse router URL: %v", err)
+		t.Fatalf("parse egress URL: %v", err)
 	}
 	return &http.Client{
 		Timeout: 5 * time.Second,

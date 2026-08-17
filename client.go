@@ -51,7 +51,7 @@ type Client struct {
 	// proxy is the controlplane-side MITM proxy and the single place routes are
 	// declared. It holds every target, header and the MITM CA — none of which
 	// crosses the tunnel; the sandbox is told domain names and nothing else.
-	// The sandbox router chains matching requests to it through routerPort.
+	// The sandbox egress proxy chains matching requests to it through egressPort.
 	//
 	// It listens on loopback because that is how tunnelled connections reach it:
 	// an incoming SSH channel is piped into a fresh TCP connection to this
@@ -67,7 +67,12 @@ type Client struct {
 	// by startProxy, which runs on whoever declared a route, and read by Close,
 	// on the owner's.
 	proxyOwned atomic.Bool
-	routerPort int
+	egressPort int
+
+	// egressPolicy is what the sandbox may reach on its own. Guarded by mu, and
+	// replayed on every reconnect: a sandbox that came back, or came up fresh,
+	// knows nothing until it is told again.
+	egressPolicy *Policy
 }
 
 // Option configures a Client.
@@ -293,7 +298,7 @@ func NewClient(tunnelURL string, opts ...Option) *Client {
 	//
 	// The tunnel port on the sandbox is pointed at this proxy as a whole, not at
 	// one forward target, and a process inside the sandbox that dials that port
-	// directly never passes through the Router or its allowlist. A proxy that
+	// directly never passes through the EgressProxy or its allowlist. A proxy that
 	// dials whatever it is asked for would then hand the sandbox the
 	// controlplane's entire network — the cloud metadata endpoint included.
 	// Dialling on demand is the right default for a sandbox-side proxy and the
@@ -357,20 +362,20 @@ func (c *Client) Listen(remotePort int, localAddr string) error {
 	return c.sendListen(sess, remotePort, localAddr)
 }
 
-// syncRoutes brings the sandbox router in step with the proxy's routes. It runs
+// syncRoutes brings the sandbox egress proxy in step with the proxy's routes. It runs
 // on connect and again whenever the proxy's routes change, which is how routes
 // declared on the proxy reach the sandbox without a second API to call.
 func (c *Client) syncRoutes() {
 	c.mu.RLock()
-	routerPort := c.routerPort
+	egressPort := c.egressPort
 	c.mu.RUnlock()
 
 	// No routes and none ever announced: nothing for the sandbox to hear about.
-	// With a router port already open the empty list is the message — it is how
+	// With an egress proxy port already open the empty list is the message — it is how
 	// the last forward is withdrawn. Returning here instead left the sandbox
 	// chaining a domain into a controlplane that had forgotten it, answering 403
 	// for as long as the tunnel lived.
-	if len(c.proxy.Routes()) == 0 && routerPort == 0 {
+	if len(c.proxy.Routes()) == 0 && egressPort == 0 {
 		return
 	}
 	if err := c.startProxy(); err != nil {
@@ -382,9 +387,70 @@ func (c *Client) syncRoutes() {
 	if sess == nil {
 		return // replayed once connected
 	}
-	if err := c.sendRouterListen(sess); err != nil {
+	if err := c.sendEgressListen(sess); err != nil {
 		log.Printf("[vtunnel-client] Route sync failed: %v", err)
 	}
+}
+
+// SetEgressPolicy tells the sandbox what it may reach without crossing the
+// tunnel: a default, and the exceptions to it. See [Policy].
+//
+// It takes effect immediately when connected and is replayed on every
+// reconnect, because a sandbox that comes back is a sandbox that has to be told
+// again — and on a fresh sandbox process there is nothing to tell it otherwise.
+// Passing a policy with no rules and [ActionAllow] is how it is withdrawn.
+//
+// The rules are parsed here before they are sent, so a typo is an error the
+// caller gets back rather than one the sandbox reports to a log nobody is
+// reading. A sandbox too old to understand the message is also an error: it
+// would go on with open egress while this end believed otherwise.
+//
+// It governs the sandbox's own egress and nothing else. What the controlplane
+// dials on the sandbox's behalf — the targets behind [MITMProxy.ForwardTo] — is
+// governed by the routes declared there, and by [MITMProxy.HandleUnmapped].
+func (c *Client) SetEgressPolicy(p Policy) error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+
+	c.mu.Lock()
+	c.egressPolicy = &p
+	c.mu.Unlock()
+
+	sess := c.getSession()
+	if sess == nil {
+		return nil // replayed once connected
+	}
+	return c.sendPolicy(sess)
+}
+
+// sendPolicy hands the current policy to the sandbox.
+func (c *Client) sendPolicy(sess session.Session) error {
+	c.mu.RLock()
+	p := c.egressPolicy
+	c.mu.RUnlock()
+	if p == nil {
+		return nil
+	}
+
+	reply, err := request(sess, streamHeader{Type: streamPolicy, Policy: newWirePolicy(*p)})
+	if err != nil {
+		return fmt.Errorf("egress policy: %w", err)
+	}
+	if !reply.OK {
+		return fmt.Errorf("egress policy rejected: %s", reply.Error)
+	}
+	if !reply.PolicyApplied {
+		// It answered, and it answered the wrong question. Everything else in
+		// this protocol can be read as "the sandbox did what was asked"; this
+		// cannot, and reading it that way would mean believing a sandbox is
+		// contained while it egresses freely.
+		return fmt.Errorf("the sandbox acknowledged the request but not the policy: " +
+			"it is too old to understand one, and its egress is unrestricted")
+	}
+	log.Printf("[vtunnel-client] Egress policy applied: default %s, %d allow, %d deny",
+		p.Default, len(p.Allow), len(p.Deny))
+	return nil
 }
 
 // Proxy returns the controlplane-side proxy. Routes are declared on it, and
@@ -415,10 +481,42 @@ func (c *Client) startProxy() error {
 	return c.proxyErr
 }
 
-// parseForwardTarget splits a forward target into a dialable address and, when
-// the upstream speaks TLS, the hostname to use for SNI. An explicit "tls://"
-// prefix and a bare ":443" target mean the same thing.
-func parseForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS bool) {
+// parseForwardTarget splits a forward target into a dialable address and how to
+// speak to it: the hostname for SNI when the upstream speaks TLS, and whether it
+// was declared as cleartext HTTP/2.
+//
+// Three schemes, and each exists to replace a guess with a statement:
+//
+//	tls://host:port   TLS, SNI from the host. A bare ":443" says the same.
+//	h2c://host:port   cleartext HTTP/2, so nothing is probed for it.
+//	http://host:port  cleartext, and do not ask.
+//
+// Everything else is a bare address, about which the proxy asks the upstream
+// rather than reading its intentions off a port number.
+//
+// A target that names no host is no target: an empty host is dialable in Go and
+// means this machine, so "tls://", "tls://:0" and a bare ":443" all come back
+// empty rather than as a quiet connection to local port 443 — with, on a route
+// configured for one, the credential attached. Found by
+// FuzzForwardTargetIsCoherent.
+func parseForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS, h2c bool) {
+	target, tlsHost, upstreamIsTLS, h2c = readForwardTarget(addr)
+
+	// A scheme that survived the strip means there was a second one behind it —
+	// "tls://tls://" left "tls://" to be dialled as a hostname.
+	if strings.Contains(target, "://") {
+		return "", "", false, false
+	}
+	if host, _, err := net.SplitHostPort(target); err == nil && host == "" {
+		return "", "", false, false
+	}
+	return target, tlsHost, upstreamIsTLS, h2c
+}
+
+// readForwardTarget is parseForwardTarget without the check that the result
+// names somewhere. Split out so that check is written once, on every shape,
+// rather than per branch — which is how the shapes that lacked it got missed.
+func readForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS, h2c bool) {
 	if after, ok := strings.CutPrefix(addr, "tls://"); ok {
 		host, _, err := net.SplitHostPort(after)
 		if err != nil {
@@ -431,22 +529,42 @@ func parseForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS bool
 			// them back, and leaving them on produced "[[::1]]:443", which is
 			// not an address anything can dial.
 			bare := strings.TrimSuffix(strings.TrimPrefix(after, "["), "]")
-			return net.JoinHostPort(bare, "443"), bare, true
+			joined := net.JoinHostPort(bare, "443")
+			if _, _, err := net.SplitHostPort(joined); err != nil {
+				// The port was supplied here rather than written by the caller,
+				// so what came out is this function's own work and has to be
+				// dialable. A stray bracket produced "]0:443", which is not an
+				// address and would have been discovered as a failed dial.
+				return "", "", false, false
+			}
+			return joined, bare, true, false
 		}
-		return after, host, true
+		return after, host, true, false
+	}
+	if after, ok := strings.CutPrefix(addr, "h2c://"); ok {
+		// Cleartext HTTP/2, said outright. The proxy can find this by asking —
+		// see MITMProxy.probeH2C — but asking costs a dial and a wait for the
+		// peer's SETTINGS on the first request, and it is only ever asked when
+		// the client side is HTTP/2 as well. Stating it skips both: an h2c
+		// upstream stays h2c even for an HTTP/1.1 client, which is the one case
+		// the probe cannot reach.
+		if after == "" {
+			return "", "", false, false
+		}
+		return after, "", false, true
 	}
 	if after, ok := strings.CutPrefix(addr, "http://"); ok {
 		// Said outright: reach this one in the clear, do not ask.
-		return after, "", false
+		return after, "", false, false
 	}
 	if host, port, err := net.SplitHostPort(addr); err == nil && port == "443" {
-		return addr, host, true
+		return addr, host, true, false
 	}
 	// No scheme and no well-known port. Whether this upstream speaks TLS is
 	// decided by asking it — see MITMProxy.upstreamTLSName — because reading it
 	// off the port number is what sent a credential to an HTTPS backend on 8443
 	// in plaintext.
-	return addr, "", false
+	return addr, "", false, false
 }
 
 // domainKeys expands a forward domain into proxy mapping keys. A domain
@@ -566,7 +684,7 @@ func (c *Client) dialTarget(addr string) (net.Conn, error) {
 	if strings.HasPrefix(addr, "tls://") {
 		// Same rule as parseForwardTarget: the prefix is the instruction, and a
 		// missing port is 443 rather than a reason to ignore it.
-		target, host, _ := parseForwardTarget(addr)
+		target, host, _, _ := parseForwardTarget(addr)
 		dialer := &net.Dialer{Timeout: defaultDialTimeout}
 		conn, err := tls.DialWithDialer(dialer, "tcp", target, &tls.Config{ServerName: host})
 		if err != nil {
@@ -599,13 +717,13 @@ func (c *Client) sendListen(sess session.Session, port int, localAddr string) er
 	return nil
 }
 
-// sendRouterListen asks the server for one tunnel port serving every forwarded
-// domain and points the sandbox router at it. Only domain names travel.
-func (c *Client) sendRouterListen(sess session.Session) error {
+// sendEgressListen asks the server for one tunnel port serving every forwarded
+// domain and points the sandbox egress proxy at it. Only domain names travel.
+func (c *Client) sendEgressListen(sess session.Session) error {
 	domains := c.proxy.Routes()
 
 	c.mu.RLock()
-	port := c.routerPort
+	port := c.egressPort
 	c.mu.RUnlock()
 
 	if len(domains) == 0 && port == 0 {
@@ -634,15 +752,15 @@ func (c *Client) sendRouterListen(sess session.Session) error {
 		// failing forever, silently sending every forwarded domain straight out
 		// of the sandbox instead of through the tunnel.
 		c.mu.Lock()
-		delete(c.forwards, c.routerPort)
-		c.routerPort = 0
+		delete(c.forwards, c.egressPort)
+		c.egressPort = 0
 		c.mu.Unlock()
 		return fmt.Errorf("forward rejected: %s", reply.Error)
 	}
 
 	if reply.Port > 0 {
 		c.mu.Lock()
-		c.routerPort = reply.Port
+		c.egressPort = reply.Port
 		// Tunnel streams for this port are piped into the local proxy.
 		c.forwards[reply.Port] = proxyAddr.String()
 		c.mu.Unlock()
@@ -759,28 +877,37 @@ func (c *Client) replayForwards() {
 		fwds[port] = addr
 	}
 	// Read under the same lock as the snapshot: it is written from
-	// sendRouterListen on another goroutine.
-	routerPort := c.routerPort
+	// sendEgressListen on another goroutine.
+	egressPort := c.egressPort
 	c.mu.RUnlock()
 
 	sess := c.getSession()
 	if sess == nil {
 		return
 	}
+
+	// The policy goes first, before anything can be forwarded through this
+	// session. The order is the same argument handleListen already makes about
+	// installing routes before answering: between a sandbox being usable and a
+	// sandbox being ruled, whatever the application does is unruled.
+	if err := c.sendPolicy(sess); err != nil {
+		log.Printf("[vtunnel-client] %v", err)
+	}
+
 	for port, addr := range fwds {
-		if port == routerPort {
-			continue // replayed as one router listen below
+		if port == egressPort {
+			continue // replayed as one egress listen below
 		}
 		if err := c.sendListen(sess, port, addr); err != nil {
 			log.Printf("[vtunnel-client] Re-listen failed for port %d: %v", port, err)
 		}
 	}
 
-	// An empty list is replayed too, once a router port exists: a fresh sandbox
+	// An empty list is replayed too, once an egress proxy port exists: a fresh sandbox
 	// process, or one whose routes were cleared while the tunnel was down, must
 	// end up with the same allowlist this client has, which may be none.
-	if len(c.proxy.Routes()) > 0 || routerPort != 0 {
-		if err := c.sendRouterListen(sess); err != nil {
+	if len(c.proxy.Routes()) > 0 || egressPort != 0 {
+		if err := c.sendEgressListen(sess); err != nil {
 			log.Printf("[vtunnel-client] Re-forward failed: %v", err)
 		}
 	}

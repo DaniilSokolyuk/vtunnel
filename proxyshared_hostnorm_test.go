@@ -4,7 +4,7 @@ import "testing"
 
 // One hostname has several spellings, and the allowlist is keyed by exactly
 // one of them. Every spelling that misses is egress: on the controlplane a miss
-// fails closed, but on the sandbox router it is dialled directly, past the
+// fails closed, but on the sandbox egress proxy it is dialled directly, past the
 // tunnel and past the injected credential — the same shape as the letter-case
 // miss that bestDomainMatch already folds away.
 //

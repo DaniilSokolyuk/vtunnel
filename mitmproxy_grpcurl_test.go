@@ -24,7 +24,7 @@ func TestProxyGrpcurlMITMTunnel(t *testing.T) {
 	}
 
 	ca := generateTestCA(t)
-	server := vtunnel.NewServer() // sandbox side: router only, CA lives on the client
+	server := vtunnel.NewServer() // sandbox side: egress proxy only, CA lives on the client
 
 	proxyPort := freePort(t)
 	proxyAddr := fmt.Sprintf("127.0.0.1:%d", proxyPort)

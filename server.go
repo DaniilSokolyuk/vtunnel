@@ -38,12 +38,12 @@ type Server struct {
 
 	// Persistent listeners (survive reconnections)
 	listeners map[int]net.Listener
-	// routerPorts records which of those ports were opened to carry domains, so
+	// egressPorts records which of those ports were opened to carry domains, so
 	// an empty domain list can be told apart from a plain port forward that
 	// never had any. Without it the two are indistinguishable and one of them
 	// has to be guessed wrong: either a port forward clears the whole allowlist,
 	// or withdrawing the last forward is impossible.
-	routerPorts map[int]bool
+	egressPorts map[int]bool
 	listenersMu sync.Mutex
 
 	// done is closed by Close, so anything parked waiting for the client to
@@ -55,9 +55,14 @@ type Server struct {
 	// still running when Close lands must not end up publishing its session.
 	closed atomic.Bool
 
-	// router is the sandbox-side forward proxy. Its allowlist survives
+	// egress is the sandbox-side forward proxy. Its allowlist survives
 	// reconnections; the client replays it on every connect.
-	router *Router
+	egress *EgressProxy
+
+	// egressPolicy is what WithServerEgressPolicy asked for, held until the
+	// proxy exists to receive it. Options run before that, so it cannot be
+	// installed where it is configured.
+	egressPolicy *Policy
 }
 
 // ServerOption configures a Server.
@@ -116,6 +121,33 @@ func WithServerSecret(secret string) ServerOption {
 	}
 }
 
+// WithServerEgressPolicy starts the sandbox with egress rules already in force,
+// before any controlplane has connected.
+//
+// That window is the reason this exists. A sandbox is up and serving as soon as
+// its process is, and the controlplane's policy arrives some time afterwards —
+// so without this the sandbox spends its first moments with open egress, which
+// is exactly the state the policy was written to prevent. Starting closed turns
+// that into "nothing until told", and a controlplane that later sends its own
+// policy replaces this one wholesale.
+//
+// It cannot lock the sandbox out of its own tunnel: the tunnel is dialled by the
+// client, from the controlplane, and this end only ever accepts. The loopback
+// hop to a tunnel port is exempt too, so a routed domain keeps working under
+// any policy at all.
+//
+// A policy that does not parse panics, for the same reason a bad secret does:
+// it is a configuration error, and a sandbox that came up with rules it had
+// silently dropped would be worse than one that did not come up.
+func WithServerEgressPolicy(p Policy) ServerOption {
+	return func(s *Server) {
+		if err := p.Validate(); err != nil {
+			panic(fmt.Sprintf("vtunnel: %v", err))
+		}
+		s.egressPolicy = &p
+	}
+}
+
 // NewServer creates a new vtunnel server.
 func NewServer(opts ...ServerOption) *Server {
 	s := &Server{
@@ -123,13 +155,19 @@ func NewServer(opts ...ServerOption) *Server {
 		connReady:   make(chan struct{}),
 		done:        make(chan struct{}),
 		listeners:   make(map[int]net.Listener),
-		routerPorts: make(map[int]bool),
+		egressPorts: make(map[int]bool),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
 
-	s.router = newRouter()
+	s.egress = newEgressProxy()
+	if s.egressPolicy != nil {
+		// Validated in the option, so this cannot fail here — and installed
+		// before StartProxy could possibly have been called, which is the point:
+		// the proxy must never accept a connection it has no rules for.
+		_ = s.egress.SetPolicy(s.egressPolicy)
+	}
 
 	if s.protocol.insecure() {
 		log.Printf("[vtunnel-server] WARNING: protocol %q has no encryption and no authentication. "+
@@ -283,12 +321,48 @@ func (s *Server) getSession() session.Session {
 func (s *Server) handleStream(stream net.Conn, h streamHeader) {
 	defer stream.Close()
 
-	if h.Type != streamListen {
+	switch h.Type {
+	case streamListen:
+		s.handleListen(stream, h)
+	case streamPolicy:
+		s.handlePolicy(stream, h)
+	default:
 		log.Printf("[vtunnel-server] Unknown stream type %q", h.Type)
 		writeFrame(stream, streamReply{Error: "unknown stream type"})
+	}
+}
+
+// handlePolicy installs the egress rules the controlplane sent.
+//
+// It is a message of its own rather than a field on the listen request, because
+// the configuration that needs it most declares no forwarded domain at all —
+// "deny everything except these names" has nothing to listen for. Riding the
+// listen request would have meant sending one with no port and no domains,
+// which allocates a listener and an accept loop nothing will ever connect to.
+//
+// The reply says so explicitly. A sandbox old enough not to know this message
+// answers the same "OK" to a request it read as empty, and the controlplane
+// would take that for a sandbox that had closed itself.
+func (s *Server) handlePolicy(stream net.Conn, h streamHeader) {
+	if h.Policy == nil {
+		// Clearing is spelled with an explicit allow-everything policy, so a nil
+		// here is a malformed message rather than a request to open up.
+		writeFrame(stream, streamReply{Error: "policy message carried no policy"})
 		return
 	}
-	s.handleListen(stream, h)
+
+	p, err := h.Policy.policy()
+	if err != nil {
+		log.Printf("[vtunnel-server] Refusing an egress policy: %v", err)
+		writeFrame(stream, streamReply{Error: err.Error()})
+		return
+	}
+	if err := s.egress.SetPolicy(&p); err != nil {
+		log.Printf("[vtunnel-server] Refusing an egress policy: %v", err)
+		writeFrame(stream, streamReply{Error: err.Error()})
+		return
+	}
+	writeFrame(stream, streamReply{OK: true, PolicyApplied: true})
 }
 
 // handleListen processes a listen request from the client.
@@ -298,9 +372,9 @@ func (s *Server) handleStream(stream net.Conn, h streamHeader) {
 //  1. Port-based (Listen): h.Port is set, h.Domains is empty.
 //     Server opens the requested TCP port and tunnels all connections.
 //
-//  2. Router-based (Forward): h.Port is 0, h.Domains lists the domains the
+//  2. EgressProxy-based (Forward): h.Port is 0, h.Domains lists the domains the
 //     controlplane proxy handles. The server allocates a port and points the
-//     router at it, so allowlisted requests are chained through the tunnel.
+//     egress proxy at it, so allowlisted requests are chained through the tunnel.
 //
 // Listeners are persistent — they survive client reconnects. On reconnect the
 // client replays its calls; an existing listener is reused and its routes are
@@ -328,12 +402,12 @@ func (s *Server) handleListen(stream net.Conn, h streamHeader) {
 			// including down to none, which is how the last forward is
 			// withdrawn. A plain port forward sends no domains and never had
 			// any, and clearing on its behalf would send every forwarded domain
-			// straight out of the sandbox, quietly; routerPorts is what tells
+			// straight out of the sandbox, quietly; egressPorts is what tells
 			// the two apart.
-			if len(h.Domains) > 0 || s.routerPorts[port] {
-				s.routerPorts[port] = true
+			if len(h.Domains) > 0 || s.egressPorts[port] {
+				s.egressPorts[port] = true
 				s.listenersMu.Unlock()
-				s.router.SetRoutes(port, h.Domains)
+				s.egress.SetRoutes(port, h.Domains)
 			} else {
 				s.listenersMu.Unlock()
 			}
@@ -358,7 +432,7 @@ func (s *Server) handleListen(stream net.Conn, h streamHeader) {
 
 	s.listeners[port] = ln
 	if len(h.Domains) > 0 {
-		s.routerPorts[port] = true
+		s.egressPorts[port] = true
 	}
 	s.listenersMu.Unlock()
 
@@ -366,10 +440,10 @@ func (s *Server) handleListen(stream net.Conn, h streamHeader) {
 
 	// Routes first, answer second. The answer is what starts the client, and
 	// between the two an application in the sandbox could ask for a domain
-	// whose route was promised but not yet installed — which the router does
+	// whose route was promised but not yet installed — which the egress proxy does
 	// not treat as an error, it treats it as direct egress, past the tunnel and
 	// past the credential.
-	s.router.SetRoutes(port, h.Domains)
+	s.egress.SetRoutes(port, h.Domains)
 
 	// Reply with the allocated port (no LocalAddr rewrite — client dials plain TCP).
 	writeFrame(stream, streamReply{OK: true, Port: port})
@@ -380,7 +454,7 @@ func (s *Server) handleListen(stream net.Conn, h streamHeader) {
 }
 
 // Close releases everything the server owns: every forwarded port and its
-// accept loop, the routing proxy, and the client session currently being
+// accept loop, the egress proxy, and the client session currently being
 // served. It is safe to call more than once, and safe to call while
 // [Server.HandleConn] is still running — that call returns as its session ends.
 //
@@ -403,7 +477,7 @@ func (s *Server) Close() error {
 		listeners = append(listeners, ln)
 		delete(s.listeners, port)
 	}
-	clear(s.routerPorts)
+	clear(s.egressPorts)
 	s.listenersMu.Unlock()
 
 	// Each close ends one acceptLoop, which is what removes the goroutine.
@@ -411,7 +485,7 @@ func (s *Server) Close() error {
 		ln.Close()
 	}
 
-	s.router.Close()
+	s.egress.Close()
 
 	s.activeConnMu.Lock()
 	sess := s.activeConn
@@ -423,15 +497,15 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// Router returns the sandbox-side forward proxy. Its allowlist survives client
+// EgressProxy returns the sandbox-side forward proxy. Its allowlist survives client
 // reconnections.
-func (s *Server) Router() *Router { return s.router }
+func (s *Server) Egress() *EgressProxy { return s.egress }
 
-// StartProxy starts the router on addr.
-func (s *Server) StartProxy(addr string) error { return s.router.Start(addr) }
+// StartProxy starts the egress proxy on addr.
+func (s *Server) StartProxy(addr string) error { return s.egress.Start(addr) }
 
-// CloseProxy stops the router.
-func (s *Server) CloseProxy() { s.router.Close() }
+// CloseProxy stops the egress proxy.
+func (s *Server) CloseProxy() { s.egress.Close() }
 
 // acceptLoop accepts TCP connections and tunnels them through session streams.
 // It NEVER stops — when the session dies, handleTunnelConn calls getSession()

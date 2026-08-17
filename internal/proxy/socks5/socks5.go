@@ -169,8 +169,8 @@ var (
 //
 // The field is 255 arbitrary bytes and nothing downstream re-checks them: they
 // become the hostname the allowlist is matched against, the request line and
-// Host header of the CONNECT the router writes into the tunnel, and a line in
-// the log. A client that can put a CRLF in a hostname can write a second
+// Host header of the CONNECT the egress proxy writes into the tunnel, and a
+// line in the log. A client that can put a CRLF in a hostname can write a second
 // request inside the first, and a wildcard route is enough to make such a name
 // match — so the characters a hostname may contain are checked here, once,
 // where the bytes come in.

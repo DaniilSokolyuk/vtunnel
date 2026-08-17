@@ -36,7 +36,7 @@ Server flags:
                          tcp://:3001    a raw socket, and cheaper
                        Neither is more secure — the session authenticates the
                        peer either way. [$VTUNNEL_LISTEN]
-  -proxy string        Where the routing proxy listens (empty = disabled).
+  -proxy string        Where the egress proxy listens (empty = disabled).
                        It serves HTTP and SOCKS5 on the one port, so the
                        sandbox can point HTTP_PROXY and ALL_PROXY at it:
                          9090                      loopback only  (do this)
@@ -62,6 +62,32 @@ Server flags:
                        ssh (default), yamux, or yamux-insecure — the last of
                        which has no encryption and no authentication, and is
                        there to be measured against. [$VTUNNEL_PROTOCOL]
+
+Egress policy (both server and client take these):
+  -default-egress      What happens to a destination no rule names:
+                       allow (default) or deny. [$VTUNNEL_DEFAULT_EGRESS]
+  -allow-out value     Permit a destination (repeatable).
+  -deny-out value      Refuse a destination (repeatable).
+                       Each is a CIDR, an address, a hostname or a wildcard
+                       hostname, optionally with a port; without one it covers
+                       every port:
+                         10.0.0.0/8   192.0.2.7   2001:db8::/32   [::1]:5432
+                         api.corp     *.corp      api.corp:443
+                       Names are matched before anything is resolved and
+                       addresses after, so a deny of 169.254.0.0/16 holds even
+                       against a hostname pointing there. Write a deny-all as
+                       -default-egress deny, not as -deny-out 0.0.0.0/0: the
+                       first is a backdrop an allowlist of names is written
+                       against, the second outranks those names and refuses
+                       everything.
+                       On the server they apply from startup, which is the only
+                       way to close the gap before a client connects; whatever
+                       the client sends then replaces them. They cannot cut off
+                       the tunnel itself — the client dials in, and the hop to
+                       a tunnel port is exempt.
+                       This governs what the sandbox reaches on its own. It
+                       cannot govern a process that ignores HTTPS_PROXY, and
+                       nothing here sees UDP, DNS included.
 
 CA flags:
   -mitm-ca string   PEM file with CA cert+key, created if missing. Same file
@@ -93,6 +119,13 @@ Client flags:
                             Use for upstreams that pin certificates; nothing
                             is decrypted, so -H does not apply.
                     TLS:    -forward 8085=tls://www.google.com:443
+                    A domain target may state how to reach the upstream:
+                      tls://host:port   TLS, SNI from the host (":443" too)
+                      h2c://host:port   cleartext HTTP/2, nothing probed
+                      http://host:port  cleartext, and do not ask
+                    Left unstated it is discovered, which costs a probe on a
+                    route carrying -H, and cannot find h2c behind an HTTP/1.1
+                    client.
   -H value          Inject HTTP header into requests for the preceding
   -header value     -forward (domain-flavored). Format "Name: Value".
                     Repeatable. Each -H attaches to the most recent -forward.
@@ -255,6 +288,7 @@ func runServer(args []string) {
 			"or mixed|http|socks5://host:port for one front end (empty = disabled)")
 	secret := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
 	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the client")
+	egress := egressFlags(fs)
 	fs.Parse(args)
 
 	listenURL, err := url.Parse(*listen)
@@ -266,6 +300,17 @@ func runServer(args []string) {
 	if *secret != "" {
 		opts = append(opts, vtunnel.WithServerSecret(readSecret(*secret)))
 		log.Println("[vtunnel] Tunnel authentication enabled")
+	}
+	// Installed before the proxy is started, which is the whole point: the port
+	// must never accept a connection it has no rules for.
+	policy, hasPolicy, err := egress.policy()
+	if err != nil {
+		log.Fatalf("[vtunnel] %v", err)
+	}
+	if hasPolicy {
+		opts = append(opts, vtunnel.WithServerEgressPolicy(policy))
+		log.Printf("[vtunnel] Egress policy: default %s, %d allow, %d deny",
+			policy.Default, len(policy.Allow), len(policy.Deny))
 	}
 	srv = vtunnel.NewServer(opts...)
 
@@ -279,7 +324,7 @@ func runServer(args []string) {
 		}
 		log.Printf("[vtunnel] Routing proxy on %s (no TLS interception here)", addr)
 		if public {
-			log.Printf("[vtunnel] WARNING: the routing proxy on %s is reachable from outside "+
+			log.Printf("[vtunnel] WARNING: the egress proxy on %s is reachable from outside "+
 				"this sandbox. It authenticates nobody: whoever reaches it gets an open relay, "+
 				"and for every forwarded domain the controlplane's injected credentials with it. "+
 				"Use -proxy 9090 to keep it on loopback unless something else guards the port.",
@@ -320,6 +365,7 @@ func runClient(args []string) {
 	key := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
 	mitmCAFile := fs.String("mitm-ca", os.Getenv("VTUNNEL_MITM_CA"), "PEM file with CA cert+key for HTTPS MITM (created if missing); unset = no interception")
 	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the sandbox")
+	egress := egressFlags(fs)
 	var forwards forwardList
 	fs.Var(&forwards, "forward", "Port forward: remotePort=localAddr (repeatable)")
 	headers := headerList{forwards: &forwards}
@@ -358,6 +404,20 @@ func runClient(args []string) {
 	}
 
 	client := vtunnel.NewClient(*server, opts...)
+
+	// Declared before Connect, so the sandbox is told what it may reach as part
+	// of coming up rather than some moment afterwards. The client replays it on
+	// every reconnect either way.
+	policy, hasPolicy, err := egress.policy()
+	if err != nil {
+		log.Fatalf("[vtunnel] %v", err)
+	}
+	if hasPolicy {
+		if err := client.SetEgressPolicy(policy); err != nil {
+			log.Fatalf("[vtunnel] %v", err)
+		}
+	}
+
 	if err := client.Connect(); err != nil {
 		log.Fatalf("[vtunnel] Connect error: %v", err)
 	}
@@ -421,6 +481,57 @@ func parseProtocol(v string) vtunnel.Protocol {
 		return ""
 	}
 }
+
+// egressOptions gathers the three flags that make up an egress policy. Both
+// ends take the same three: the sandbox so it can start closed, the
+// controlplane so it can say what the sandbox may reach.
+type egressOptions struct {
+	def   *string
+	allow *stringList
+	deny  *stringList
+}
+
+func egressFlags(fs *flag.FlagSet) egressOptions {
+	o := egressOptions{
+		def:   fs.String("default-egress", os.Getenv("VTUNNEL_DEFAULT_EGRESS"), "What happens to a destination no rule names: allow (default) or deny"),
+		allow: &stringList{},
+		deny:  &stringList{},
+	}
+	fs.Var(o.allow, "allow-out", "Permit a CIDR, address, hostname or *.hostname, optionally :port (repeatable)")
+	fs.Var(o.deny, "deny-out", "Refuse a CIDR, address, hostname or *.hostname, optionally :port (repeatable)")
+	return o
+}
+
+// policy builds the policy these flags describe, and reports whether any were
+// given at all. None means none: a tunnel nobody configured a policy for keeps
+// the behaviour it has always had.
+func (o egressOptions) policy() (vtunnel.Policy, bool, error) {
+	if *o.def == "" && len(*o.allow) == 0 && len(*o.deny) == 0 {
+		return vtunnel.Policy{}, false, nil
+	}
+
+	var def vtunnel.Action
+	switch *o.def {
+	case "", "allow":
+		def = vtunnel.ActionAllow
+	case "deny":
+		def = vtunnel.ActionDeny
+	default:
+		return vtunnel.Policy{}, false, fmt.Errorf("unknown -default-egress %q: expected allow or deny", *o.def)
+	}
+
+	p := vtunnel.Policy{Default: def, Allow: *o.allow, Deny: *o.deny}
+	if err := p.Validate(); err != nil {
+		return vtunnel.Policy{}, false, err
+	}
+	return p, true, nil
+}
+
+// stringList implements flag.Value for a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
 
 // forward represents a single forward mapping (port-based or domain-based)
 type forward struct {
@@ -524,10 +635,10 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // proxyListenAddr resolves the -proxy flag into an address to listen on, and
 // reports whether that address faces anything beyond the sandbox. An empty
-// value means the routing proxy is off.
+// value means the egress proxy is off.
 //
 // A bare port is loopback, which is both the common case and the safe one: the
-// router has no authentication, so the port is worth exactly as much as the
+// egress proxy has no authentication, so the port is worth exactly as much as the
 // credentials the controlplane injects behind it. Anything wider has to be
 // written out in full.
 func proxyListenAddr(v string) (addr string, public bool, err error) {
@@ -535,7 +646,7 @@ func proxyListenAddr(v string) (addr string, public bool, err error) {
 		return "", false, nil
 	}
 
-	// A scheme says which protocols the port serves and belongs to the router;
+	// A scheme says which protocols the port serves and belongs to the egress proxy;
 	// everything below only decides whether the address is reachable from
 	// outside the sandbox, which is the part worth warning about.
 	scheme, rest, hasScheme := strings.Cut(v, "://")

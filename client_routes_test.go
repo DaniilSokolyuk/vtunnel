@@ -83,7 +83,7 @@ func TestParseForwardTargetDefaultsTLSToPort443(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		target, tlsHost, isTLS := parseForwardTarget(tc.in)
+		target, tlsHost, isTLS, _ := parseForwardTarget(tc.in)
 		if target != tc.wantTarget || tlsHost != tc.wantTLSHost || isTLS != tc.wantTLS {
 			t.Errorf("parseForwardTarget(%q) = (%q, %q, %v), want (%q, %q, %v)",
 				tc.in, target, tlsHost, isTLS, tc.wantTarget, tc.wantTLSHost, tc.wantTLS)
