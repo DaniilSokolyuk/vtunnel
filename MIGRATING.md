@@ -147,6 +147,8 @@ ls /etc/vtunnel-ca.pem                 # should not exist
 | Before (0.6) | Now (1.0) |
 |---|---|
 | `client.Forward(domain, target, opts...)` | `client.Proxy().ForwardTo(domain, target, opts...)` |
+| `MITMProxy.Forward(domain)` | `MITMProxy.Forward(domain, opts...) error` |
+| — | `vtunnel.WithTarget(target)`; `ForwardTo` is `Forward` with it |
 | `client.Unforward(domain)` | `client.Proxy().Remove(domain)` |
 | `vtunnel.WithProxyMitmCA(cert)` — ServerOption | `vtunnel.WithMitm(cert)` — Option, on the client |
 | `server.SetDomainMapping` / `SetDomainHeaders` | removed; routes arrive over the tunnel |
@@ -262,11 +264,13 @@ Rewriting a 0.6 call site is mechanical:
 +    vtunnel.WithHeader("Authorization", "Bearer "+token))
 ```
 
-`MITMProxy.Handle` and `MITMProxy.ForwardTo` now return an `error`. They use it
-to refuse a route that could only be served by decrypting — an in-process
-handler, or any route carrying injected headers — on a proxy with no CA. That
-configuration used to be accepted and then quietly drop the credential on every
-request. Check the error, or keep the CLI's shape and treat it as fatal:
+`MITMProxy.Handle`, `MITMProxy.ForwardTo` and `MITMProxy.Forward` all return an
+`error`. They use it to refuse a route that could only be served by decrypting —
+an in-process handler, or any route carrying injected headers — on a proxy with
+no CA. That configuration used to be accepted and then quietly drop the
+credential on every request. A route that names a target but injects nothing is
+still accepted without a CA, and piped. Check the error, or keep the CLI's shape
+and treat it as fatal:
 
 ```go
 if err := client.Proxy().ForwardTo("api.corp", "localhost:8081",

@@ -709,6 +709,12 @@ func (p *MITMProxy) closeDetached() {
 // hand a decrypted request to a handler without decrypting it first, and a
 // route that could only ever answer HTTPS with an error is better reported when
 // it is declared than on every request that reaches it.
+//
+// [WithHeader] applies, and lands in the request the handler is given rather
+// than in one sent upstream — a header every request to this domain should
+// carry before any of it reaches your code. [WithTarget] and [WithSNI] say
+// nothing here: a handler route opens no upstream connection and performs no
+// handshake.
 func (p *MITMProxy) Handle(domain string, h http.Handler, opts ...ForwardOption) error {
 	if p.mitmCA == nil {
 		return fmt.Errorf("handle %s: serving a domain in process means decrypting it, %w",

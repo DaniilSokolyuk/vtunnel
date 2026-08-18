@@ -248,6 +248,9 @@ type forwardConfig struct {
 //
 //	proxy.Forward("api.corp", vtunnel.WithTarget("localhost:8081"))
 //	proxy.Forward("*.corp", vtunnel.WithTarget("gw.internal")) // all of them, one gateway
+//
+// It says nothing to a [MITMProxy.Handle] route, which opens no upstream
+// connection at all.
 func WithTarget(target string) ForwardOption {
 	return func(fc *forwardConfig) {
 		fc.target = target
@@ -259,6 +262,8 @@ func WithTarget(target string) ForwardOption {
 // they are dialled at — behind a load balancer, or reached by IP.
 //
 //	proxy.ForwardTo("api.corp", "tls://10.0.0.7:443", vtunnel.WithSNI("api.corp"))
+//
+// It says nothing to a [MITMProxy.Handle] route, which performs no handshake.
 func WithSNI(host string) ForwardOption {
 	return func(fc *forwardConfig) {
 		fc.sni = host

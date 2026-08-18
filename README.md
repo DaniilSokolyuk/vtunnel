@@ -393,8 +393,8 @@ A domain is served in one of three shapes. Which one you pick decides what is po
 | | What happens | Needs a CA | Can inject headers |
 |---|---|---|---|
 | [`Forward(domain)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Forward) | the target is the host the client asked for, filled in per request | only to inject | **yes** |
-| [`ForwardTo(domain, target)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo)<br>= `Forward(domain, WithTarget(target))` | TLS is terminated and the request re-issued to `target` | yes | **yes** |
-| [`Handle(domain, h)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Handle) | served by your `http.Handler` in this process; no upstream connection at all | yes | n/a |
+| [`ForwardTo(domain, target)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo)<br>= `Forward(domain, WithTarget(target))` | TLS is terminated and the request re-issued to `target` | only to inject | **yes** |
+| [`Handle(domain, h)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Handle) | served by your `http.Handler` in this process; no upstream connection at all | **yes** | into the request the handler sees |
 
 They differ in **where** the request goes, not in whether it is decrypted. With a CA configured, everything routed through this proxy is intercepted — including `Forward`, whose target is simply the authority the client named. Without one nothing can be, so `Forward` is piped and `ForwardTo` degrades to a pipe aimed at its target.
 
@@ -404,7 +404,9 @@ The way out of interception is [`MITMExceptions`](#when-interception-cannot-work
 
 A wildcard is the domain half of a route and says nothing about the other half, so it works on either shape. `Forward("*.corp")` sends every host under it to itself, each reaching its own address; `Forward("*.corp", WithTarget("gw.internal"))` sends all of them to one gateway, each on the port it was asked for. Both are things people want, and which one you get is what you wrote on the right.
 
-Anything in the "needs a CA" column is **refused when no CA is configured**, at the point the route is declared rather than on every request that reaches it. Injection happens after TLS is terminated, so on a proxy that cannot terminate it a route carrying headers would answer requests perfectly normally and simply never add the credential — a failure with no error to see. A CA-less proxy is still fully useful for routing and passthrough; it just cannot promise what it cannot do.
+Two things are **refused when no CA is configured**, at the point the route is declared rather than on every request that reaches it: a handler route, which has nothing to hand a handler without decrypting first, and any route carrying headers. Injection happens after TLS is terminated, so on a proxy that cannot terminate it a route carrying headers would answer requests perfectly normally and simply never add the credential — a failure with no error to see. Everything else is accepted and piped: a CA-less proxy is still fully useful for routing and passthrough, it just cannot promise what it cannot do.
+
+`WithTarget` and `WithSNI` say nothing to a handler route, which opens no upstream connection and performs no handshake; `WithHeader` is the one option it reads.
 
 Anything with no route is dialled directly. [`HandleUnmapped`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.HandleUnmapped) changes that — a controlplane proxy usually wants to refuse, so a compromised tunnel cannot turn it into an open relay:
 
@@ -470,6 +472,7 @@ client.Proxy().Forward("gitlab.corp", vtunnel.WithHeader("Authorization", "Beare
 ```
 
 - Each `-H` attaches to the **most recent** `-forward`; order matters. Only domain forwards accept it, not port forwards — a raw pipe parses nothing and has no request to put a header in.
+- A [`Handle`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Handle) route takes headers too, and they land in the request your handler is given rather than in one sent upstream.
 - Values never cross the tunnel. The sandbox is told the domain name; the header is applied on this machine.
 - Values overwrite any same-named header the application sent (Set, not Add).
 - Injection needs interception, so it needs `-mitm-ca`. Without it the flag is rejected at startup rather than silently ignored.
