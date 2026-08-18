@@ -542,7 +542,22 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	// all and its response-header timeout fired on a request that was being
 	// served correctly. A failed flush means the client is gone, which the copy
 	// below discovers on its own write.
-	_ = http.NewResponseController(w).Flush()
+	//
+	// Unless there is no body to wait for, and then flushing is the wrong thing
+	// twice over: it buys nothing — the whole response is already in hand — and
+	// it changes the framing. A reply with no body is one HEADERS frame with
+	// END_STREAM; committing the head on its own splits it into a header block
+	// and an empty DATA frame that ends the stream. HTTP cannot tell the
+	// difference, and gRPC's mapping onto HTTP/2 can: a status-only reply
+	// ("trailers-only", which is how any server answers an unknown method, and
+	// so what every gRPC tool meets on its first reflection probe) carries
+	// grpc-status in that single frame. Split in two, the client reads the
+	// status as initial metadata and then watches the stream finish with no
+	// trailers at all — "server closed the stream without sending trailers",
+	// with every byte present and the call failed.
+	if resp.ContentLength != 0 {
+		_ = http.NewResponseController(w).Flush()
+	}
 
 	copyErr := flushingCopy(w, resp.Body)
 	forwardTrailers(w, resp, announced)

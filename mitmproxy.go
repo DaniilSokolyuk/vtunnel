@@ -1570,6 +1570,18 @@ func (p *MITMProxy) serveMITMTLS(clientConn net.Conn, connectAuthority string, r
 						mirrored.NextProtos = narrowed
 					}
 				}
+			} else if narrowed := httpALPN(hello.SupportedProtos); len(narrowed) > 0 {
+				// The upstream answered ALPN with nothing, which a great many
+				// TLS servers do, so there is no decision of its to mirror —
+				// leaving this the same situation as having no upstream at all,
+				// and the client's own order the only preference there is to go
+				// on. The base list would answer from this proxy's order
+				// instead: crypto/tls picks from the *server's* list, so h2
+				// standing first in it hands h2 to a client that put http/1.1
+				// first and left it no way to say otherwise. The far leg is
+				// HTTP/1.1 either way, so that trade buys nothing and costs a
+				// translation on every request.
+				mirrored.NextProtos = narrowed
 			}
 			return mirrored, nil
 		}
@@ -1712,14 +1724,32 @@ func httpALPN(offered []string) []string {
 }
 
 // upstreamALPN is what the proxy offers the upstream on the client's behalf:
-// the client's own HTTP protocols, plus HTTP/1.1 as a floor. The floor matters
-// because this proxy re-issues requests rather than piping them, so an upstream
-// that only speaks HTTP/1.1 still serves an h2-only client. Without it, such a
-// pairing dies on the upstream handshake with no_application_protocol.
+// the client's own HTTP protocols first, and then both of the ones it left out.
+//
+// Neither addition is a preference — the server picks, from its own list, so
+// what this controls is only which pairings are possible at all. Both matter
+// because this proxy re-issues requests rather than piping them, and can
+// therefore translate between whatever the two sides settle on:
+//
+//   - Without http/1.1, an h2-only client cannot reach an upstream that speaks
+//     only HTTP/1.1: the handshake dies with no_application_protocol.
+//   - Without h2, an HTTP/1.1 client cannot reach an upstream that speaks only
+//     h2 — and that failure is worse, because it is silent. Go answers such a
+//     handshake with no protocol rather than an alert (crypto/tls, issue
+//     46310), so the connection comes up, the upstream drops it on the first
+//     request, and the client is told 502 with nothing to explain it.
+//
+// An upstream reached this way may end up on a protocol the client is not
+// speaking. That is the proxy's problem to solve and it already does, on both
+// sides: the client's handshake is answered with what it can take, and an
+// upgrade — which cannot exist over h2 — dials its own HTTP/1.1 connection
+// rather than reusing this one.
 func upstreamALPN(offered []string) []string {
 	out := httpALPN(offered)
-	if !slices.Contains(out, "http/1.1") {
-		out = append(out, "http/1.1")
+	for _, proto := range []string{"http/1.1", "h2"} {
+		if !slices.Contains(out, proto) {
+			out = append(out, proto)
+		}
 	}
 	return out
 }
@@ -2568,7 +2598,7 @@ func (p *MITMProxy) upstreamTransport(rt route, up *upstreamTLSConn, preferH2 bo
 		transport := p.cachedTransport(upstreamKey{target: target, tlsHost: tlsHost, h2: preferH2}, func() http.RoundTripper {
 			dialer := &net.Dialer{Timeout: dialTimeout}
 			transport := p.transport.Clone()
-			transport.ForceAttemptHTTP2 = preferH2
+			transport.ForceAttemptHTTP2 = true
 			transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return dialer.DialContext(ctx, network, target)
 			}
@@ -2580,11 +2610,12 @@ func (p *MITMProxy) upstreamTransport(rt route, up *upstreamTLSConn, preferH2 bo
 				transport.TLSClientConfig = transport.TLSClientConfig.Clone()
 			}
 			transport.TLSClientConfig.ServerName = tlsHost
-			if preferH2 {
-				transport.TLSClientConfig.NextProtos = []string{"h2", "http/1.1"}
-			} else {
-				transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
-			}
+			// Both, whatever the client is speaking, for the reasons
+			// upstreamALPN gives: withholding one of them makes a whole class
+			// of upstream unreachable rather than merely slower. http.Transport
+			// then follows the ALPN result per connection, so the protocol this
+			// ends up on is the upstream's answer and not a guess made here.
+			transport.TLSClientConfig.NextProtos = []string{"h2", "http/1.1"}
 			if transport.TLSClientConfig.KeyLogWriter == nil {
 				transport.TLSClientConfig.KeyLogWriter = tlsKeyLogWriter()
 			}
