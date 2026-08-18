@@ -232,7 +232,9 @@ func TestNoMITMSweepDropsOnlyExpiredEntries(t *testing.T) {
 	p.sweepNoMITMLocked(now)
 	_, expired := p.noMITM["expired.test:443"]
 	_, fresh := p.noMITM["fresh.test:443"]
-	_, permanent := p.noMITM["permanent.test:443"]
+	// Stored as it was written: an exception without a port covers every port,
+	// the way a route without one does.
+	_, permanent := p.noMITM["permanent.test"]
 	p.noMITMMu.Unlock()
 
 	if expired {

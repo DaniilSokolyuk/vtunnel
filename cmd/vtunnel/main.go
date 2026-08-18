@@ -111,25 +111,43 @@ Client flags:
   -mitm-ca string   PEM file with CA cert+key for HTTPS MITM [$VTUNNEL_MITM_CA]
                     Created if missing. Without it TLS is piped through
                     untouched and -H cannot be used.
-  -forward value    Forward mapping (repeatable)
-                    Port:   -forward 8080=localhost:3000
+  -forward value    Forward mapping (repeatable). The left side is what to
+                    catch, the right side is where to go, and a port is
+                    optional on both:
+                      no port on the left   the route covers EVERY port of
+                                            that name, as an egress rule
+                                            without a port does
+                      no port on the right  the upstream is dialled on the
+                                            port the client asked for
                     Domain: -forward llmproxy.local=localhost:8080
+                            -forward db.corp:5432=10.0.0.9:5432  that port only
                     Real host: -forward gitlab.corp
                             No target = go to the host that was asked for.
                             Intercepted like any other route when -mitm-ca is
-                            given; a wildcard is allowed here and nowhere else,
-                            since the target comes from the request.
-                    TLS:    -forward 8085=tls://www.google.com:443
+                            given, and it takes -H like any other.
+                    A wildcard is the left half of a route and works with a
+                    target or without: '*.corp' sends every host under it to
+                    itself, '*.corp=gw.internal' sends all of them to one
+                    gateway, each on the port it was asked for.
                     A domain target may state how to reach the upstream:
-                      tls://host:port   TLS, SNI from the host (":443" too)
-                      h2c://host:port   cleartext HTTP/2, nothing probed
-                      http://host:port  cleartext, and do not ask
-                    Left unstated it is discovered, which costs a probe on a
-                    route carrying -H, and cannot find h2c behind an HTTP/1.1
-                    client.
+                      tls://host[:port]   TLS, SNI from the host (":443" too)
+                      h2c://host[:port]   cleartext HTTP/2, nothing probed
+                      http://host[:port]  cleartext, and do not ask
+                    A scheme says how to speak to the upstream, not where it
+                    is, so it never fills a port in. Left unstated the scheme
+                    is discovered, which costs a probe on a route carrying -H,
+                    and cannot find h2c behind an HTTP/1.1 client.
+  Port forward:     A number on the left, and a raw pipe that parses nothing:
+                      -forward 8080=localhost:3000
+                      -forward 8085=tls://www.google.com:443
+                    The port on the right is required here, except after
+                    tls://, where it is 443 — the left side is the port being
+                    listened on, so there is no requested port to follow.
   -H value          Inject HTTP header into requests for the preceding
-  -header value     -forward (domain-flavored). Format "Name: Value".
-                    Repeatable. Each -H attaches to the most recent -forward.
+  -header value     -forward (domain-flavored, with a target or without).
+                    Format "Name: Value". Repeatable. Each -H attaches to the
+                    most recent -forward. A port forward takes none: a raw pipe
+                    parses nothing and has no request to put a header in.
                     Values never leave this machine.
 `)
 	os.Exit(1)
@@ -427,16 +445,16 @@ func runClient(args []string) {
 	for _, f := range forwards {
 		if f.domain != "" {
 			// Routes live on the proxy; the client mirrors them into the sandbox.
-			if f.localAddr == "" {
-				// No target: go to whatever host the request named.
-				client.Proxy().Forward(f.domain)
-				continue
-			}
+			// No target is a route to whatever host the request named, which is
+			// the absence of the option rather than a second call.
 			var opts []vtunnel.ForwardOption
 			for _, h := range f.headers {
 				opts = append(opts, vtunnel.WithHeader(h.name, h.value))
 			}
-			if err := client.Proxy().ForwardTo(f.domain, f.localAddr, opts...); err != nil {
+			if f.localAddr != "" {
+				opts = append(opts, vtunnel.WithTarget(f.localAddr))
+			}
+			if err := client.Proxy().Forward(f.domain, opts...); err != nil {
 				log.Fatalf("[vtunnel] %v", err)
 			}
 		} else {
@@ -574,8 +592,7 @@ func (f *forwardList) Set(val string) error {
 		// A wildcard is fine here, and used to be refused on the grounds that it
 		// had no host to stand for. It has one: the target of a targetless
 		// forward is whatever host the request named, so "*.corp" routes every
-		// host under it to itself. That is the only route shape a wildcard can
-		// carry, since a fixed target would send them all to one place.
+		// host under it to itself.
 		*f = append(*f, forward{domain: left})
 		return nil
 	}
@@ -613,10 +630,6 @@ func (h *headerList) Set(val string) error {
 	value = strings.TrimSpace(value)
 	if name == "" {
 		return fmt.Errorf("-H/-header %q: empty header name", val)
-	}
-	if last.localAddr == "" {
-		return fmt.Errorf("-H %q: headers attach to a forward with a target; give %s one, e.g. -forward %s=%s:443",
-			val, last.domain, last.domain, last.domain)
 	}
 	last.headers = append(last.headers, forwardHeader{name: name, value: value})
 	return nil

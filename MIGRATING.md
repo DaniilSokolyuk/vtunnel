@@ -172,6 +172,83 @@ ls /etc/vtunnel-ca.pem                 # should not exist
 
 `client.Listen` and `vtunnel.WithHeader` keep their signatures and behaviour.
 
+### Ports in a route
+
+Two changes, and both are about what a missing port means. They widen what a
+route covers, so read them before upgrading a config that leans on either.
+
+**A domain written without a port now covers every port**, where it used to
+register on `:80` and `:443` only. That is what an egress rule written without
+a port has always meant, and the two now share one matcher — so `-forward
+gitlab.corp` and `-allow-out gitlab.corp` finally say the same thing about the
+same name. The widening is real: `-forward '*.corp'` now sends every port of
+every host under `.corp` into the tunnel, ssh included. Keep the old reach by
+writing the ports out:
+
+```diff
+-vtunnel client … -forward gitlab.corp
++vtunnel client … -forward gitlab.corp:443
+```
+
+**A target written without a port is now dialled on the port the client asked
+for**, rather than being an address that fails at dial time. `tls://host` with
+no port therefore no longer means `:443` in a domain forward — a scheme says how
+to speak to the upstream, not where it is. In a raw port forward it does still
+mean `:443`, because there is no client port to follow there.
+
+```diff
+-vtunnel client … -forward api.corp=tls://api.internal     # used to dial :443
++vtunnel client … -forward api.corp=tls://api.internal:443 # says so
+```
+
+A target with no port also follows the client on *how* to speak, not only on
+which port. The port is what used to carry that — `:443` says TLS as plainly as
+`tls://` does — so with no port to read it off, a target takes the answer from
+the connection the application opened: TLS in, TLS out. State a scheme or give
+the target a port to decide it yourself.
+
+### One Forward, and a target that is an option
+
+`MITMProxy.Forward` now takes route options and reports an error, and
+`ForwardTo` is it with one of them applied:
+
+```diff
+-func (p *MITMProxy) Forward(domain string)
++func (p *MITMProxy) Forward(domain string, opts ...ForwardOption) error
++func WithTarget(target string) ForwardOption
+```
+
+```go
+func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) error {
+    return p.Forward(domain, append(slices.Clone(opts), WithTarget(target))...)
+}
+```
+
+Existing calls to both compile unchanged — `Forward`'s new return value can be
+ignored, and `ForwardTo` keeps its signature. `WithTarget` is for callers that
+build their options up rather than writing the call out, which is what turned the
+CLI's if/else over "was a target given" into one appended option.
+
+Three things follow from the merge, and all three were asymmetries rather than
+decisions:
+
+**`-H` works on a forward with no target.** It used to be refused, with an error
+telling you to give the forward a target. But a targetless forward re-issues the
+request like any other route, so there has always been a request for a header to
+go into; what actually cannot carry one is a raw port forward, which parses
+nothing. `-forward gitlab.corp=gitlab.corp` was the workaround, and it is now the
+same thing said twice.
+
+**A wildcard works with a target too.** It is the left half of a route and says
+nothing about the right: `-forward '*.corp'` sends every host under it to itself,
+and `-forward '*.corp=gw.internal'` sends all of them to one gateway, each on the
+port it was asked for. The docs used to call the first one the only shape a
+wildcard could carry; the code always allowed both.
+
+**A header on a proxy with no CA is an error** from `Forward` as it already was
+from `ForwardTo` — a route that answers normally and simply never adds the
+credential is a failure with nothing to see.
+
 Routes moved off `Client` and onto the proxy it owns, reached with
 [`Client.Proxy`](https://pkg.go.dev/github.com/vivid-money/vtunnel#Client.Proxy).
 The proxy no longer depends on the tunnel at all, which is what makes it usable

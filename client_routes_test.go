@@ -65,28 +65,33 @@ func TestOnChangeNotifiesEverySubscriber(t *testing.T) {
 	}
 }
 
-// "tls://host" says the upstream speaks TLS. Without a port net.SplitHostPort
-// fails, and the intent was dropped on the floor: the request then went out on
-// port 80, in the clear, with the configured credential attached.
-func TestParseForwardTargetDefaultsTLSToPort443(t *testing.T) {
+// "tls://host" says the upstream speaks TLS, port or no port. Without one
+// net.SplitHostPort fails, and the intent used to be dropped on the floor: the
+// request then went out on port 80, in the clear, with the configured
+// credential attached. A missing port is now the request's to supply, and the
+// prefix still says TLS.
+func TestParseRouteTargetKeepsTLSWithoutAPort(t *testing.T) {
 	cases := []struct {
 		in          string
-		wantTarget  string
+		wantHost    string
 		wantTLSHost string
-		wantTLS     bool
+		wantFromReq bool
 	}{
-		{in: "tls://api.corp", wantTarget: "api.corp:443", wantTLSHost: "api.corp", wantTLS: true},
-		{in: "tls://api.corp:8443", wantTarget: "api.corp:8443", wantTLSHost: "api.corp", wantTLS: true},
-		{in: "tls://10.0.0.7:443", wantTarget: "10.0.0.7:443", wantTLSHost: "10.0.0.7", wantTLS: true},
-		{in: "api.corp:443", wantTarget: "api.corp:443", wantTLSHost: "api.corp", wantTLS: true},
-		{in: "localhost:8080", wantTarget: "localhost:8080"},
+		{in: "tls://api.corp", wantHost: "api.corp", wantTLSHost: "api.corp", wantFromReq: true},
+		{in: "tls://api.corp:8443", wantHost: "api.corp:8443", wantTLSHost: "api.corp"},
+		{in: "tls://10.0.0.7:443", wantHost: "10.0.0.7:443", wantTLSHost: "10.0.0.7"},
+		{in: "api.corp:443", wantHost: "api.corp:443", wantTLSHost: "api.corp"},
+		{in: "localhost:8080", wantHost: "localhost:8080"},
+		{in: "gw.internal", wantHost: "gw.internal", wantFromReq: true},
+		{in: "http://gw.internal", wantHost: "gw.internal", wantFromReq: true},
+		{in: "h2c://gw.internal", wantHost: "gw.internal", wantFromReq: true},
 	}
 
 	for _, tc := range cases {
-		target, tlsHost, isTLS, _ := parseForwardTarget(tc.in)
-		if target != tc.wantTarget || tlsHost != tc.wantTLSHost || isTLS != tc.wantTLS {
-			t.Errorf("parseForwardTarget(%q) = (%q, %q, %v), want (%q, %q, %v)",
-				tc.in, target, tlsHost, isTLS, tc.wantTarget, tc.wantTLSHost, tc.wantTLS)
+		got, ok := parseRouteTarget(tc.in)
+		if !ok || got.host != tc.wantHost || got.tlsHost != tc.wantTLSHost || got.portFromRequest != tc.wantFromReq {
+			t.Errorf("parseRouteTarget(%q) = %+v, %v; want host %q, tlsHost %q, portFromRequest %v",
+				tc.in, got, ok, tc.wantHost, tc.wantTLSHost, tc.wantFromReq)
 		}
 	}
 }

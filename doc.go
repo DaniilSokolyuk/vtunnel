@@ -122,15 +122,32 @@
 //	    vtunnel.WithHeader("Authorization", "Bearer "+token))
 //
 //	// Send it to the host the client asked for, whatever that turns out to
-//	// be — the one shape a wildcard can carry. It is intercepted like any
-//	// other route; [MITMProxy.MITMExceptions] is how a domain opts out.
-//	routes.Forward("gitlab.corp")
+//	// be. It is intercepted like any other route, so a credential goes into
+//	// it too; [MITMProxy.MITMExceptions] is how a domain opts out.
+//	routes.Forward("gitlab.corp", vtunnel.WithHeader("Authorization", "Bearer "+token))
+//
+//	// A wildcard is the domain half of a route and works on either shape:
+//	// every host under .corp to itself, or all of them to one gateway.
+//	routes.Forward("*.corp")
+//	routes.Forward("*.corp", vtunnel.WithTarget("gw.internal"))
 //
 // [MITMProxy.ForwardTo], [MITMProxy.Handle], [MITMProxy.Forward] and
 // [MITMProxy.Remove] may be called at any time while connected; each call
 // re-sends the full domain list, which the egress proxy applies wholesale.
 // Connections already established keep their old route until they are
 // re-established.
+//
+// A port is optional on either side of a route, and its absence means a
+// different thing on each. A domain written without one covers every port,
+// which is how an egress rule written without one already reads — the same
+// matcher decides both, so a name resolves identically on either side of the
+// tunnel. A target written without one is dialled on the port the client asked
+// for, since a scheme says how to speak to an upstream and not where it is —
+// and it follows the client on how, too, because the port is what used to carry
+// that: ":443" says TLS as plainly as "tls://" does, and a target with no port
+// has nothing to read it off. Write the port to narrow either: "db.corp:5432"
+// catches that port alone, and "10.0.0.9:5432" dials that port whatever was
+// asked for.
 //
 // Interception happens exactly when [WithMitm] is given. Without it the client
 // still forwards domains, but their TLS is piped through untouched and

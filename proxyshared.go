@@ -19,15 +19,21 @@ import (
 
 // bestDomainMatch picks the key of patterns that best matches hostPort.
 //
-// An exact key wins outright. Otherwise wildcard keys are considered with
-// nginx-style semantics:
-//   - `*.suffix:port`  (leftmost wildcard) matches one or more extra labels.
-//   - `prefix.*:port`  (rightmost wildcard) matches one or more extra labels.
+// A key is a hostname or a wildcard, optionally carrying a port. Written
+// without one it covers every port — which is what an egress rule written
+// without a port already means, and the point of saying it once here is that
+// the two halves of the same allowlist cannot drift apart. Both the sandbox
+// egress proxy and the controlplane proxy route through this, so a host
+// resolves the same way on either side of a tunnel.
+//
+// Wildcards are nginx-style:
+//   - `*.suffix`  (leftmost) matches one or more extra labels.
+//   - `prefix.*`  (rightmost) matches one or more extra labels.
 //   - `*` must be a complete label on a dot border; no `*` in the middle.
 //
-// Priority: exact > leftmost > rightmost; within a group, the longest pattern
-// wins. Both the sandbox egress proxy and the controlplane proxy route through this,
-// so a host resolves the same way on either side of a tunnel.
+// Priority is the egress policy's ladder, [routeKey.beats]: exact beats
+// wildcard, leftmost beats rightmost, a longer host beats a shorter one, and
+// only then a key naming a port beats one that does not.
 //
 // Matching is case-insensitive, as hostnames are (RFC 4343). Comparing them
 // byte for byte meant a single capital letter missed the allowlist: on the
@@ -49,27 +55,81 @@ func bestDomainMatch[V any](patterns map[string]V, hostPort string) (string, boo
 	}
 
 	var bestPattern string
-	var bestLeft bool
+	var best routeKey
 	for pattern := range patterns {
-		canonicalPattern, ok := canonicalHostPort(pattern)
-		if !ok {
+		key, ok := parseRouteKey(pattern)
+		if !ok || !key.matches(host, port) {
 			continue
 		}
-		if canonicalPattern == canonical {
-			return pattern, true // the same name, spelled differently
-		}
-		isLeft, ok := wildcardMatches(canonicalPattern, host, port)
-		if !ok {
+		switch {
+		case bestPattern == "":
+		case key.beats(best):
+		case best.beats(key):
+			continue
+		case pattern >= bestPattern:
+			// Neither is more specific, so the ladder has nothing left to say.
+			// Picking the smaller spelling rather than whichever the map handed
+			// over first is what keeps two equally good keys from resolving one
+			// way on this request and the other way on the next.
 			continue
 		}
-		if bestPattern == "" ||
-			(isLeft && !bestLeft) ||
-			(isLeft == bestLeft && len(pattern) > len(bestPattern)) {
-			bestPattern = pattern
-			bestLeft = isLeft
-		}
+		bestPattern, best = pattern, key
 	}
 	return bestPattern, bestPattern != ""
+}
+
+// routeKey is one key of a route table, parsed: the hostname or wildcard it
+// names, the port it is limited to if any, and which of the three shapes it is.
+//
+// It is deliberately the same shape as the egress policy's nameRule, minus the
+// verdict a rule carries and a route does not. Keeping the two in step is the
+// whole reason this type exists rather than a second reading of "what does
+// `*.corp` mean" written inline.
+type routeKey struct {
+	host string // canonical, wildcard included
+	port string // "" matches every port
+	kind nameKind
+}
+
+// parseRouteKey reads a route table key. It reports false for a key that names
+// no host, which must never be treated as a match: an empty host is a dialable
+// address in Go, and it means the local machine.
+func parseRouteKey(pattern string) (routeKey, bool) {
+	host, port, err := splitRule(pattern)
+	if err != nil {
+		return routeKey{}, false
+	}
+	host = canonicalHost(host)
+	if host == "" {
+		return routeKey{}, false
+	}
+	return routeKey{host: host, port: port, kind: classifyRuleHost(host)}, true
+}
+
+// matches reports whether k covers a canonical host and port.
+func (k routeKey) matches(host, port string) bool {
+	if k.port != "" && k.port != port {
+		return false
+	}
+	if k.kind == nameExact {
+		return k.host == host
+	}
+	_, ok := wildcardHostMatches(k.host, host)
+	return ok
+}
+
+// beats reports whether k is the more specific of the two. It is
+// [nameRule.beats] without the deny tie-break, which a route has no equivalent
+// of — a route table says where traffic goes, not whether it may.
+func (k routeKey) beats(other routeKey) bool {
+	switch {
+	case k.kind != other.kind:
+		return k.kind > other.kind
+	case len(k.host) != len(other.host):
+		return len(k.host) > len(other.host)
+	default:
+		return k.port != "" && other.port == ""
+	}
 }
 
 // canonicalHostPort rewrites an authority into the one spelling route tables
@@ -195,25 +255,10 @@ func isHostname(s string) bool {
 	return true
 }
 
-// wildcardMatches reports whether a domain map key is a wildcard pattern
-// that matches `host:port`. Returns (isLeftmost, matched).
-func wildcardMatches(pattern, host, port string) (bool, bool) {
-	patHost, patPort, err := net.SplitHostPort(pattern)
-	if err != nil {
-		return false, false
-	}
-	if patPort != port {
-		return false, false
-	}
-	return wildcardHostMatches(patHost, host)
-}
-
-// wildcardHostMatches is the host half of wildcardMatches, with no opinion
-// about ports. It is separate because the egress policy shares these semantics
-// and not the port rule: a route is keyed by one port, while a policy rule
-// written without one covers every port. Two copies of "what does `*.corp`
-// mean" is exactly the kind of near-duplicate that ends up disagreeing, and
-// here the two readers are the two sides of the same allowlist.
+// wildcardHostMatches is the host half of a match, with no opinion about
+// ports. Both the egress policy's nameRule and a route's [routeKey] call it, so
+// there is one answer to "what does `*.corp` mean" rather than two that end up
+// disagreeing — and the two readers are the two sides of the same allowlist.
 func wildcardHostMatches(patHost, host string) (isLeftmost, matched bool) {
 	if strings.HasPrefix(patHost, "*.") {
 		suffix := patHost[1:] // ".suffix"

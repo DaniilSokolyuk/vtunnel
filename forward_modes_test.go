@@ -163,21 +163,212 @@ func TestForwardToMirrorsUpstreamALPN(t *testing.T) {
 	}
 }
 
+// A forward with no target carries a credential too. It re-issues the request
+// to the host that was asked for, which is a request like any other, so there
+// has never been anything for a header to be missing from — and saying so meant
+// naming the host twice and a port with it.
+func TestTargetlessForwardInjectsHeadersOnAnyPort(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		fmt.Fprint(w, "upstream")
+	}))
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	// "go to the host you asked for" means the authority has to be dialable.
+	authority := upstream.Listener.Addr().String()
+	host, port, _ := net.SplitHostPort(authority)
+	if port == "443" {
+		t.Skip("httptest picked 443, which cannot show the difference")
+	}
+
+	ca := generateTestCA(t)
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+	proxy.SetTransportTLSConfig(&tls.Config{RootCAs: poolWith(t, upstream.Certificate())})
+
+	egressAddr, _, client, cleanup := startForwardFixtureWithProxy(t, proxy)
+	defer cleanup()
+
+	// The host alone: every port of it, to itself, with the credential.
+	if err := client.Proxy().Forward(host,
+		vtunnel.WithHeader("Authorization", "Bearer sk-ant-xxx")); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	tlsConn := connectThroughEgress(t, egressAddr, authority, nil)
+	defer tlsConn.Close()
+
+	if peer := tlsConn.ConnectionState().PeerCertificates[0]; !signedBy(t, peer, ca) {
+		t.Fatalf("%s was piped, so the credential was never injected", authority)
+	}
+	if got := getOver(t, tlsConn, authority); got != "upstream" {
+		t.Fatalf("got %q, want the upstream's response", got)
+	}
+	if gotAuth != "Bearer sk-ant-xxx" {
+		t.Fatalf("upstream saw Authorization %q, want the injected credential", gotAuth)
+	}
+}
+
+// A credential needs interception, so a forward carrying one is refused where it
+// is declared on a proxy that has no CA — the same rule ForwardTo follows, and
+// for the same reason: a route that answered normally and simply never added the
+// header is a failure with nothing to see.
+func TestTargetlessForwardWithHeadersNeedsACA(t *testing.T) {
+	proxy := vtunnel.NewMITMProxy()
+	if err := proxy.Forward("gitlab.corp", vtunnel.WithHeader("Authorization", "Bearer s3cret")); err == nil {
+		t.Fatal("a forward carrying a header was accepted on a proxy with no CA")
+	}
+	if err := proxy.Forward("gitlab.corp"); err != nil {
+		t.Fatalf("a forward carrying nothing was refused: %v", err)
+	}
+}
+
+// The same over a target that names a host and no port, which is the longer way
+// of saying the test above.
+func TestPortlessRouteAndTargetInterceptOnAnyPort(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		fmt.Fprint(w, "upstream")
+	}))
+	upstream.StartTLS()
+	defer upstream.Close()
+
+	// Whatever port httptest picked, and it is not 443 — which is the point.
+	upstreamHost, upstreamPort, _ := net.SplitHostPort(upstream.Listener.Addr().String())
+	if upstreamPort == "443" {
+		t.Skip("httptest picked 443, which cannot show the difference")
+	}
+
+	ca := generateTestCA(t)
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+	proxy.SetTransportTLSConfig(&tls.Config{RootCAs: poolWith(t, upstream.Certificate())})
+
+	egressAddr, _, client, cleanup := startForwardFixtureWithProxy(t, proxy)
+	defer cleanup()
+
+	// Neither side names a port and no scheme is stated: the route covers every
+	// port of gitlab.corp, the target is reached on whichever one the
+	// application asked for, and how to speak to it is followed from the client.
+	// The port used to be what said TLS, so without this the upstream would be
+	// handed a cleartext request and answer with an error page.
+	if err := client.Proxy().ForwardTo("gitlab.corp", upstreamHost,
+		vtunnel.WithHeader("Authorization", "Bearer sk-ant-xxx")); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	authority := net.JoinHostPort("gitlab.corp", upstreamPort)
+	tlsConn := connectThroughEgress(t, egressAddr, authority, nil)
+	defer tlsConn.Close()
+
+	if peer := tlsConn.ConnectionState().PeerCertificates[0]; !signedBy(t, peer, ca) {
+		t.Fatalf("gitlab.corp:%s was piped, so the credential was never injected", upstreamPort)
+	}
+	if got := getOver(t, tlsConn, authority); got != "upstream" {
+		t.Fatalf("got %q, want the upstream's response", got)
+	}
+	if gotAuth != "Bearer sk-ant-xxx" {
+		t.Fatalf("upstream saw Authorization %q, want the injected credential", gotAuth)
+	}
+}
+
+// Following the client is what a route says nothing about how is owed, and no
+// more than that: a stated scheme still decides, and so does a stated SNI.
+func TestPortlessTargetDoesNotOverrideAStatedScheme(t *testing.T) {
+	var sawTLS bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawTLS = r.TLS != nil
+		fmt.Fprint(w, "cleartext upstream")
+	}))
+	defer upstream.Close()
+	upstreamHost, upstreamPort, _ := net.SplitHostPort(upstream.Listener.Addr().String())
+
+	ca := generateTestCA(t)
+	proxy := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+	egressAddr, _, client, cleanup := startForwardFixtureWithProxy(t, proxy)
+	defer cleanup()
+
+	// "http://" says cleartext outright, port or no port. The client speaks TLS
+	// to the proxy and the upstream leg must not follow it.
+	if err := client.Proxy().ForwardTo("legacy.corp", "http://"+upstreamHost); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	authority := net.JoinHostPort("legacy.corp", upstreamPort)
+	tlsConn := connectThroughEgress(t, egressAddr, authority, nil)
+	defer tlsConn.Close()
+
+	if got := getOver(t, tlsConn, authority); got != "cleartext upstream" {
+		t.Fatalf("got %q, want the cleartext upstream's response", got)
+	}
+	if sawTLS {
+		t.Fatal("an http:// target was reached over TLS; a stated scheme decides")
+	}
+}
+
+// WithTarget and ForwardTo are the same route said two ways, and a caller
+// building options up must not get a different answer from one writing the
+// target out.
+func TestWithTargetAndForwardToAgree(t *testing.T) {
+	ca := generateTestCA(t)
+	viaOption := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+	viaMethod := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(ca))
+
+	for _, target := range []string{
+		"localhost:8081", "gw.internal", "tls://api.corp", "tls://api.corp:8443",
+		"h2c://api.internal:13002", "http://legacy.corp",
+	} {
+		optErr := viaOption.Forward("api.test", vtunnel.WithTarget(target),
+			vtunnel.WithHeader("X-Env", "preview"))
+		methodErr := viaMethod.ForwardTo("api.test", target,
+			vtunnel.WithHeader("X-Env", "preview"))
+		if (optErr == nil) != (methodErr == nil) {
+			t.Fatalf("target %q: WithTarget err = %v, ForwardTo err = %v", target, optErr, methodErr)
+		}
+	}
+
+	// And the option slice the caller handed over is not written into.
+	opts := make([]vtunnel.ForwardOption, 1, 4)
+	opts[0] = vtunnel.WithHeader("X-Env", "preview")
+	if err := viaMethod.ForwardTo("api.test", "localhost:8081", opts...); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	if len(opts) != 1 {
+		t.Fatalf("the caller's options grew to %d entries", len(opts))
+	}
+	if err := viaMethod.Forward("other.test", opts...); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	if got := viaMethod.Routes(); len(got) != 2 {
+		t.Fatalf("Routes() = %v; the appended target leaked into the caller's slice", got)
+	}
+}
+
+// An empty target is still refused where a target is what the method is for.
+func TestForwardToRefusesAnEmptyTarget(t *testing.T) {
+	p := vtunnel.NewMITMProxy(vtunnel.WithMitmCA(generateTestCA(t)))
+	if err := p.ForwardTo("api.test", ""); err == nil {
+		t.Fatal("ForwardTo with an empty target was accepted")
+	}
+	if err := p.Forward("api.test"); err != nil {
+		t.Fatalf("Forward with no target was refused: %v", err)
+	}
+}
+
 // A wildcard Forward is fine: the host to dial comes from the request, not from
 // the pattern, so "let everything under this suffix through untouched" is one
-// call. A domain without a port covers both :80 and :443.
-func TestForwardWildcardRegistersBothPorts(t *testing.T) {
+// call. It is registered as written — a domain without a port covers every
+// port, and the sandbox is told the same one key rather than an expansion of it.
+func TestForwardWildcardRegistersOneKeyForEveryPort(t *testing.T) {
 	proxy := vtunnel.NewMITMProxy()
 	proxy.Forward("*.wild.test")
 
-	got := map[string]bool{}
-	for _, r := range proxy.Routes() {
-		got[r] = true
-	}
-	for _, want := range []string{"*.wild.test:80", "*.wild.test:443"} {
-		if !got[want] {
-			t.Fatalf("Routes() = %v, missing %s", proxy.Routes(), want)
-		}
+	if got := proxy.Routes(); len(got) != 1 || got[0] != "*.wild.test" {
+		t.Fatalf("Routes() = %v, want exactly [*.wild.test]", got)
 	}
 }
 

@@ -161,6 +161,11 @@ type route struct {
 	// the upstream is spoken to that way without being asked and whatever the
 	// client side settled on.
 	h2c bool
+	// targetPortFromRequest records that the target named no port, so the port
+	// dialled is the one the client asked for. It is resolved into target the
+	// moment a request picks the route up, before anything branches on the
+	// address, so nothing downstream has to know a port was ever missing.
+	targetPortFromRequest bool
 	// selfTarget records that target was filled in from the authority the
 	// client asked for rather than configured — a [MITMProxy.Forward] route,
 	// served by a proxy that holds a CA.
@@ -183,6 +188,46 @@ type route struct {
 	// and a map could then hand the wrong answer to whichever asked second, or
 	// keep a stale mark alive after the route that set it was replaced.
 	tlsHost string
+}
+
+// withRequestPort fills in a target that named no port, from the authority the
+// request was aimed at. A route written "api.corp=gw.internal" says which host
+// to reach and leaves the port to the request, and resolving that here — once,
+// before anything branches on the address — is what keeps every path that dials,
+// pipes, probes or pools a target from having to know a port was ever missing.
+func (r route) withRequestPort(authority string) route {
+	if !r.targetPortFromRequest || r.target == "" {
+		return r
+	}
+	if _, _, err := net.SplitHostPort(r.target); err == nil {
+		return r // already carrying one
+	}
+	r.target = net.JoinHostPort(r.target, portFromAuthority(authority))
+	return r
+}
+
+// followClientScheme fills in the upstream server name for a route that named a
+// host but not how to reach it, from what the client turned out to be speaking.
+//
+// A route whose port came from the request is in the same position as one with
+// no target at all: it says which host, and nothing about how. The port used to
+// carry that — a target on ":443" means TLS — so a target written without one
+// has to learn it from the client instead, or "gitlab.corp=gitlab.corp" talks
+// cleartext to an HTTPS upstream and the reply is an error page. A stated
+// scheme, a [WithSNI] name and a target carrying its own port each say how, and
+// none of them is overridden here.
+//
+// It runs once the tunnel has been classified rather than when the target was
+// filled in, because until then there was nothing to follow.
+func (r route) followClientScheme(clientIsTLS bool) route {
+	if !clientIsTLS || r.cleartext || r.tlsHost != "" {
+		return r
+	}
+	if !r.selfTarget && !r.targetPortFromRequest {
+		return r
+	}
+	r.tlsHost = hostFromAuthority(r.target)
+	return r
 }
 
 // terminates reports whether serving this route means decrypting the client's
@@ -674,29 +719,23 @@ func (p *MITMProxy) Handle(domain string, h http.Handler, opts ...ForwardOption)
 	return nil
 }
 
-// Forward routes a domain through this proxy to the host the client asked for.
-// The target comes from the request rather than from the route, which is what
-// lets one wildcard stand for a whole family of hosts.
+// Forward routes a domain through this proxy. Without [WithTarget] the target
+// is the host the client asked for, filled in per request — which is what lets
+// one wildcard stand for a family of hosts, each reaching itself.
 //
-// What happens to its TLS follows the proxy, not the route. With a CA it is
-// terminated like any other route, so middleware and [WithHeader] apply; with
-// no CA there is nothing to terminate with and the bytes are piped. An upstream
-// that must not be intercepted — one the client pins, or something that is not
-// HTTP — is [MITMProxy.MITMExceptions], which is also what the proxy records
-// for itself after a handshake that could not have worked.
-func (p *MITMProxy) Forward(domain string) {
-	p.setRoute(domain, route{}, "the host the client asked for")
-}
-
-// ForwardTo terminates the client's TLS and re-issues the request to target,
-// carrying any headers declared with [WithHeader].
+// The domain may be a hostname, a wildcard, or either with a port, and it means
+// the same thing whatever the route does with it: written without a port it
+// covers every port of that name. A wildcard is as legal with a target as
+// without one — `*.corp` with no target sends every host under it to itself,
+// and with [WithTarget]("gw.internal") sends all of them to one gateway, on
+// whichever port each was asked for.
 //
-// How to speak to that target can be stated or left to be discovered:
+// How the target is reached can be stated or left to be discovered:
 //
 //	localhost:8080        asked about, if the route carries a header
-//	tls://host:port       TLS, SNI from the host; a bare ":443" says the same
-//	h2c://host:port       cleartext HTTP/2, so nothing is probed for it
-//	http://host:port      cleartext, and do not ask
+//	tls://host[:port]     TLS, SNI from the host
+//	h2c://host[:port]     cleartext HTTP/2, so nothing is probed for it
+//	http://host[:port]    cleartext, and do not ask
 //
 // Discovery is the right default for an address somebody typed, and it is not
 // free. An unstated scheme on a route that injects a credential costs a probe
@@ -705,13 +744,23 @@ func (p *MITMProxy) Forward(domain string) {
 // client side is HTTP/2 as well, so an h2c-only upstream behind an HTTP/1.1
 // client is reachable by saying "h2c://" and not otherwise.
 //
-// "h2c://" and [WithSNI] contradict each other and are refused together: one is
-// cleartext, the other names the server for a TLS handshake.
-func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) error {
-	if target == "" {
-		return fmt.Errorf("forward %s: empty target; use Forward to route a domain to itself", domain)
-	}
-
+// A target written without a port is dialled on the port the client asked for,
+// and follows the client on protocol too — the port is what used to say TLS, so
+// with none to read it off the answer comes from the same place the port does.
+//
+// What happens to the client's TLS follows the proxy, not the route. With a CA
+// it is terminated like any other route, so middleware and [WithHeader] apply;
+// with no CA there is nothing to terminate with and the bytes are piped. An
+// upstream that must not be intercepted — one the client pins, or something
+// that is not HTTP — is [MITMProxy.MITMExceptions], which is also what the
+// proxy records for itself after a handshake that could not have worked.
+//
+// Injecting a header needs a CA and a route carrying one is refused without it,
+// rather than answering requests perfectly normally and never adding the
+// credential — a failure with no error to see. "h2c://" and [WithSNI]
+// contradict each other and are refused together: one is cleartext, the other
+// names the server for a TLS handshake.
+func (p *MITMProxy) Forward(domain string, opts ...ForwardOption) error {
 	cfg := forwardConfig{}
 	for _, opt := range opts {
 		opt(&cfg)
@@ -721,41 +770,73 @@ func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) erro
 		return fmt.Errorf("forward %s: %d configured header(s) need a MITM CA, %w",
 			domain, len(cfg.headers), errNoMitmCA)
 	}
+	if cfg.sni != "" && strings.HasPrefix(cfg.target, "h2c://") {
+		return fmt.Errorf("forward %s: WithSNI names the server for a TLS handshake, and an "+
+			"h2c:// target is cleartext; drop one of the two", domain)
+	}
 
-	addr, tlsHost, upstreamIsTLS, h2c := parseForwardTarget(target)
-	if addr == "" {
+	if cfg.target == "" {
+		p.setRoute(domain, route{headers: cfg.headers, tlsHost: cfg.sni},
+			"the host the client asked for")
+		return nil
+	}
+
+	t, ok := parseRouteTarget(cfg.target)
+	if !ok {
 		// A scheme and nothing else. Left alone this becomes a dial to an empty
 		// host, which in Go is this machine — so it is refused where it is
 		// written rather than discovered as a connection to the wrong place.
-		return fmt.Errorf("forward %s: target %q names no host", domain, target)
+		return fmt.Errorf("forward %s: target %q names no host", domain, cfg.target)
 	}
 	if cfg.sni != "" {
-		if h2c {
-			return fmt.Errorf("forward %s: WithSNI names the server for a TLS handshake, and an "+
-				"h2c:// target is cleartext; drop one of the two", domain)
-		}
-		tlsHost, upstreamIsTLS = cfg.sni, true
-	}
-	if !upstreamIsTLS {
-		tlsHost = ""
+		t.tlsHost = cfg.sni
 	}
 	// Both stated schemes are cleartext, and stating one is what excuses the
 	// route from being asked whether its upstream speaks TLS.
-	cleartext := strings.HasPrefix(target, "http://") || h2c
-	p.setRoute(domain, route{target: addr, headers: cfg.headers, tlsHost: tlsHost, cleartext: cleartext, h2c: h2c}, addr)
+	cleartext := strings.HasPrefix(cfg.target, "http://") || t.h2c
+	p.setRoute(domain, route{
+		target:                t.host,
+		targetPortFromRequest: t.portFromRequest,
+		headers:               cfg.headers,
+		tlsHost:               t.tlsHost,
+		cleartext:             cleartext,
+		h2c:                   t.h2c,
+	}, describeTarget(t))
 	return nil
+}
+
+// ForwardTo is [MITMProxy.Forward] with [WithTarget], and exists because a
+// target is where a request goes rather than a detail of how it gets there:
+// at a call site somebody writes by hand it belongs where it can be read.
+// Building the options up instead — a CLI turning flags into a route — is what
+// WithTarget is for.
+func (p *MITMProxy) ForwardTo(domain, target string, opts ...ForwardOption) error {
+	if target == "" {
+		return fmt.Errorf("forward %s: empty target; use Forward to route a domain to itself", domain)
+	}
+	// Appended to a copy, since append to the caller's own slice can write into
+	// the array behind it. Last wins, so the argument this method is named for
+	// is the one that decides.
+	return p.Forward(domain, append(slices.Clone(opts), WithTarget(target))...)
+}
+
+// describeTarget renders a target for the route log, saying so when the port is
+// not the route's to name.
+func describeTarget(t forwardTarget) string {
+	if t.portFromRequest {
+		return t.host + ":<the port asked for>"
+	}
+	return t.host
 }
 
 // Remove drops a domain's route.
 func (p *MITMProxy) Remove(domain string) {
 	p.domainMu.Lock()
-	var targets []string
-	for _, key := range domainKeys(domain) {
-		if rt, ok := p.routes[key]; ok && rt.target != "" {
-			targets = append(targets, rt.target)
-		}
-		delete(p.routes, key)
+	var targets []upstreamTarget
+	if rt, ok := p.routes[domain]; ok && rt.target != "" {
+		targets = append(targets, upstreamTarget{addr: rt.target, anyPort: rt.targetPortFromRequest})
 	}
+	delete(p.routes, domain)
 	changed := p.changedLocked()
 	p.domainMu.Unlock()
 
@@ -769,8 +850,25 @@ func (p *MITMProxy) Remove(domain string) {
 	notify(changed)
 }
 
+// upstreamTarget names the upstream connections a route owned, so that they go
+// when it does. A route whose port came from the request pooled one transport
+// per port that was ever asked for, and its address alone does not name any of
+// them.
+type upstreamTarget struct {
+	addr    string
+	anyPort bool
+}
+
+func (t upstreamTarget) matches(target string) bool {
+	if !t.anyPort {
+		return target == t.addr
+	}
+	host, _, err := net.SplitHostPort(target)
+	return err == nil && host == t.addr
+}
+
 // dropUpstreams closes and forgets the cached transports for the given targets.
-func (p *MITMProxy) dropUpstreams(targets []string) {
+func (p *MITMProxy) dropUpstreams(targets []upstreamTarget) {
 	if len(targets) == 0 {
 		return
 	}
@@ -778,7 +876,7 @@ func (p *MITMProxy) dropUpstreams(targets []string) {
 	p.upstreamsMu.Lock()
 	var stale []http.RoundTripper
 	for key, transport := range p.upstreams {
-		if slices.Contains(targets, key.target) {
+		if slices.ContainsFunc(targets, func(t upstreamTarget) bool { return t.matches(key.target) }) {
 			stale = append(stale, transport)
 			delete(p.upstreams, key)
 		}
@@ -884,9 +982,7 @@ func (p *MITMProxy) setRoute(domain string, rt route, describe string) {
 	rt.generation = p.routeGeneration.Add(1)
 
 	p.domainMu.Lock()
-	for _, key := range domainKeys(domain) {
-		p.routes[key] = rt
-	}
+	p.routes[domain] = rt
 	changed := p.changedLocked()
 	p.domainMu.Unlock()
 
@@ -930,9 +1026,7 @@ func (p *MITMProxy) MITMExceptions(domains ...string) {
 		p.noMITM = make(map[string]time.Time)
 	}
 	for _, domain := range domains {
-		for _, key := range domainKeys(domain) {
-			p.noMITM[key] = time.Time{} // zero: no expiry
-		}
+		p.noMITM[domain] = time.Time{} // zero: no expiry
 	}
 	p.noMITMMu.Unlock()
 
@@ -1067,6 +1161,9 @@ func mitmRefused(err error) bool {
 	return strings.Contains(msg, "remote error: tls:") && strings.Contains(msg, "certificate")
 }
 
+// resolveDomain finds the route serving an authority, with a target that named
+// no port filled in from it. Every caller resolves through here, so none of
+// them sees a half-finished route.
 func (p *MITMProxy) resolveDomain(host string) (route, bool) {
 	p.domainMu.RLock()
 	defer p.domainMu.RUnlock()
@@ -1075,7 +1172,7 @@ func (p *MITMProxy) resolveDomain(host string) (route, bool) {
 	if !ok {
 		return route{}, false
 	}
-	return p.routes[pattern], true
+	return p.routes[pattern].withRequestPort(host), true
 }
 
 // unmappedHandler returns the handler for unrouted domains, or nil to dial the
@@ -1320,15 +1417,9 @@ func (p *MITMProxy) handleConnectMITM(w http.ResponseWriter, r *http.Request, co
 
 	switch {
 	case kind == tunnelTLS:
-		if rt.selfTarget {
-			// The client is speaking TLS to the host it named, so this proxy
-			// speaks TLS to that same host under that same name. Decided here
-			// rather than when the target was filled in, because a route with
-			// no configured target says where to go and nothing about how: it
-			// follows the client, and until the tunnel was classified there was
-			// nothing to follow.
-			rt.tlsHost = hostFromAuthority(connectAuthority)
-		}
+		// The client is speaking TLS to the host it named, so this proxy speaks
+		// TLS to the route's host under that host's own name.
+		rt = rt.followClientScheme(true)
 		p.serveMITMTLS(tunnelConn, connectAuthority, rt, certs)
 	case kind == tunnelH2C && overHijackedSocket:
 		defer tunnelConn.Close()
@@ -2726,8 +2817,10 @@ func (p *MITMProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		// A Forward route names no target of its own, so it means "go to the
 		// host you asked for" — here as on the CONNECT path.
 		rt.target, rt.selfTarget = hostPort, true
-		rt.tlsHost = schemeTLSHost(r, hostPort)
 	}
+	// An absolute-form "GET https://…" is this path's equivalent of a TLS
+	// tunnel, and the only thing here a route can follow.
+	rt = rt.followClientScheme(r.URL != nil && r.URL.Scheme == "https")
 
 	if rt.handler == nil {
 		log.Printf("[vtunnel-proxy] %s %s %s -> %s", r.URL.Scheme, r.Method, hostPort, rt.target)
@@ -3024,6 +3117,18 @@ func isH2CPreface(br *bufio.Reader) bool {
 		return false
 	}
 	return string(full) == http2.ClientPreface
+}
+
+// portFromAuthority reads the port half of an authority. Every authority a
+// route is resolved from has been through isRoutableAuthority, which refuses
+// one without a port, so the empty answer is unreachable rather than a default
+// worth picking.
+func portFromAuthority(authority string) string {
+	_, port, err := net.SplitHostPort(authority)
+	if err != nil {
+		return ""
+	}
+	return port
 }
 
 func hostFromAuthority(authority string) string {

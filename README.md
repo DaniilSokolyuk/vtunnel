@@ -109,8 +109,8 @@ vtunnel server -listen ws://:3001/ -proxy 9090
 
 ```bash
 vtunnel client -server ws://container:3001/ -mitm-ca ca.pem \
-  -forward gitlab.corp=gitlab.corp:443 \
-  -forward jira.corp=jira.corp:443
+  -forward gitlab.corp \
+  -forward jira.corp
 ```
 
 **4. Use it:**
@@ -335,10 +335,11 @@ client.Proxy().ForwardTo("10.0.0.9:5432", "10.0.0.9:5432")
 
 Set an egress policy and that blanket refusal is retired rather than added to: addresses are first-class once there are rules written in them, so a literal is judged by those rules — and judged the same way `CONNECT` judges it, which has accepted literals all along.
 
-A non-HTTP target needs its port in the route, since a bare domain covers `:80` and `:443` only:
+A bare domain in a route covers every port, so a non-HTTP target needs no special spelling — write the port only when the route is meant to cover that port alone:
 
 ```go
-client.Proxy().ForwardTo("db.corp:5432", "10.0.0.9:5432")
+client.Proxy().ForwardTo("db.corp", "10.0.0.9:5432")      // every port of db.corp
+client.Proxy().ForwardTo("db.corp:5432", "10.0.0.9:5432") // that one port
 ```
 
 Only `CONNECT` is implemented. `BIND` and `UDP ASSOCIATE` are answered with `0x07 command not supported`, which is what mitmproxy answers too — a UDP association needs a datagram path the tunnel does not have, and refusing it up front lets a client fail immediately instead of waiting for something that is not coming.
@@ -357,7 +358,7 @@ client.SetEgressPolicy(vtunnel.Policy{
 })
 ```
 
-A rule is a CIDR, an address, a hostname or a wildcard hostname, each optionally carrying a port; without one it covers every port. Between two rules the more specific wins — an exact name or a single address beats a wildcard or a prefix, a longer suffix or prefix beats a shorter one, a rule naming a port beats one that does not — and on a tie, deny wins.
+A rule is a CIDR, an address, a hostname or a wildcard hostname, each optionally carrying a port; without one it covers every port — the same reading a route gets, and the same matcher decides both. Between two rules the more specific wins — an exact name or a single address beats a wildcard or a prefix, a longer suffix or prefix beats a shorter one, a rule naming a port beats one that does not — and on a tie, deny wins.
 
 **Names are judged before resolution, addresses after it.** That split is the design. A name rule is the only thing that can be said about a name, and an address rule is about where the bytes actually go — so `Deny: ["169.254.0.0/16"]` holds even against a hostname pointing at cloud metadata, which is the case that matters. The address is checked from inside the dialler, on the address the kernel is about to connect to, so there is no window between checking and connecting for a name to change its answer in.
 
@@ -387,19 +388,21 @@ Automatic, with exponential backoff. Server-side listeners persist across reconn
 
 ## Routes
 
-A domain is served in exactly one of three shapes. Which one you pick decides what is possible with it.
+A domain is served in one of three shapes. Which one you pick decides what is possible with it — and the first two are one function, differing in whether a target is named.
 
 | | What happens | Needs a CA | Can inject headers |
 |---|---|---|---|
-| [`ForwardTo(domain, target)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo) | TLS is terminated and the request re-issued to `target` | yes | **yes** |
+| [`Forward(domain)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Forward) | the target is the host the client asked for, filled in per request | only to inject | **yes** |
+| [`ForwardTo(domain, target)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo)<br>= `Forward(domain, WithTarget(target))` | TLS is terminated and the request re-issued to `target` | yes | **yes** |
 | [`Handle(domain, h)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Handle) | served by your `http.Handler` in this process; no upstream connection at all | yes | n/a |
-| [`Forward(domain)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Forward) | the target is the host the client asked for, filled in per request | no | no |
 
 They differ in **where** the request goes, not in whether it is decrypted. With a CA configured, everything routed through this proxy is intercepted — including `Forward`, whose target is simply the authority the client named. Without one nothing can be, so `Forward` is piped and `ForwardTo` degrades to a pipe aimed at its target.
 
+Which is why `Forward` injects headers as readily as `ForwardTo` does: it re-issues a request like any other, and the only thing it leaves to the request is the address. Naming a target is for sending a domain somewhere it does not already point.
+
 The way out of interception is [`MITMExceptions`](#when-interception-cannot-work), which is also what the proxy records for itself after a handshake that could not have worked. Reach for it when the client pins certificates, or when what rides inside the TLS is not HTTP.
 
-`Forward` is the only shape a wildcard can carry: its target comes from the request, so `*.corp` sends every host under it to itself, where a fixed target would send them all to one place.
+A wildcard is the domain half of a route and says nothing about the other half, so it works on either shape. `Forward("*.corp")` sends every host under it to itself, each reaching its own address; `Forward("*.corp", WithTarget("gw.internal"))` sends all of them to one gateway, each on the port it was asked for. Both are things people want, and which one you get is what you wrote on the right.
 
 Anything in the "needs a CA" column is **refused when no CA is configured**, at the point the route is declared rather than on every request that reaches it. Injection happens after TLS is terminated, so on a proxy that cannot terminate it a route carrying headers would answer requests perfectly normally and simply never add the credential — a failure with no error to see. A CA-less proxy is still fully useful for routing and passthrough; it just cannot promise what it cannot do.
 
@@ -420,7 +423,9 @@ How to reach the target can be stated, or left to be discovered:
 | `h2c://host:port` | cleartext HTTP/2, nothing probed for it |
 | `http://host:port` | cleartext, and do not ask |
 
-[`WithSNI`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSNI) overrides the name presented in the handshake, for a certificate issued for something the address does not carry; it contradicts `h2c://` and is refused with it. A domain given without a port registers on both `:80` and `:443`.
+The port is the target's own, and a target written without one is dialled on the port the client asked for — the scheme says how to speak to the upstream, not where it is. See [`-forward` formats](#-forward-formats) for every combination.
+
+[`WithSNI`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSNI) overrides the name presented in the handshake, for a certificate issued for something the address does not carry; it contradicts `h2c://` and is refused with it. A domain given without a port covers every port, the same way an egress rule without one does.
 
 Discovery is the right default for an address somebody typed, and it costs something. An unstated scheme on a route that injects a credential is probed before the first request, because writing the credential to find out is exactly what must not happen — and an upstream that answers neither way is refused rather than guessed at. h2c is only ever looked for when the client side is HTTP/2 too, so an h2c-only upstream behind an HTTP/1.1 client is reachable by saying `h2c://` and not otherwise ([`mitmproxy_h2c_target_test.go`](mitmproxy_h2c_target_test.go), [`mitmproxy_upstream_scheme_test.go`](mitmproxy_upstream_scheme_test.go)).
 
@@ -429,13 +434,16 @@ Discovery is the right default for an address somebody typed, and it costs somet
 One entry matches a family of hostnames. The same matcher serves both sides of the tunnel ([`proxyshared.go`](proxyshared.go)), so a host resolves identically in the sandbox and on the controlplane.
 
 ```bash
--forward '*.example.test=localhost:8080'   # all subdomains
+-forward '*.example.test'                  # each subdomain to itself
+-forward '*.example.test=localhost:8080'   # all of them to one place
+-forward '*.example.test=gw.internal'      # all of them to one host, port preserved
 -forward 'mail.*=localhost:8080'           # all hosts starting with mail.
 ```
 
+- A wildcard is the **left half** of a route and says nothing about the right: it works with a target and without, and what you wrote on the right decides whether each host reaches itself or all of them reach one place.
 - `*` must be a **complete label on a dot border**, either leftmost (`*.example.test`) or rightmost (`mail.*`). Middle or partial-label asterisks (`a.*.b`, `w*.example.test`) are literal strings.
 - Matches **one or more** extra labels: `*.example.test` matches `a.example.test` and `a.b.example.test`, but not the apex `example.test`.
-- **Priority**: exact beats wildcard; leftmost beats rightmost; within a group, the longer pattern wins.
+- **Priority**: exact beats wildcard; leftmost beats rightmost; a longer host beats a shorter one; and only then a pattern naming a port beats one that does not. The same ladder the egress rules use.
 
 Covered by [`mitmproxy_wildcard_test.go`](mitmproxy_wildcard_test.go).
 
@@ -448,17 +456,20 @@ vtunnel client -server ws://... -mitm-ca ca.pem \
   -forward api.example.test=localhost:8081 \
     -H 'Authorization: Bearer sk-ant-xxx' \
     -H 'X-Env: preview' \
-  -forward plain.example.test=plain.example.test:443
+  -forward plain.example.test
 ```
 
 ```go
-client.Proxy().ForwardTo("api.example.test:443", "localhost:8081",
+client.Proxy().ForwardTo("api.example.test", "localhost:8081",
     vtunnel.WithHeader("Authorization", "Bearer sk-ant-xxx"),
     vtunnel.WithHeader("X-Env", "preview"),
 )
+
+// Or to the host the domain already points at, on every port of it:
+client.Proxy().Forward("gitlab.corp", vtunnel.WithHeader("Authorization", "Bearer "+pat))
 ```
 
-- Each `-H` attaches to the **most recent** `-forward`; order matters. Only domain forwards accept it, not port forwards.
+- Each `-H` attaches to the **most recent** `-forward`; order matters. Only domain forwards accept it, not port forwards — a raw pipe parses nothing and has no request to put a header in.
 - Values never cross the tunnel. The sandbox is told the domain name; the header is applied on this machine.
 - Values overwrite any same-named header the application sent (Set, not Add).
 - Injection needs interception, so it needs `-mitm-ca`. Without it the flag is rejected at startup rather than silently ignored.
@@ -671,36 +682,81 @@ Nothing dials in, no client exists, and the rules apply from the first connectio
 
 ### `-forward` formats
 
+A forward reads left to right: **the left side is what to catch, the right side is where to go.** A port is optional on both, and its absence means a different thing on each side:
+
+* **no port on the left** — the route covers **every** port of that name;
+* **no port on the right** — the upstream is dialled on **the port the client asked for**.
+
+That first rule is the one an egress rule already follows: `-allow-out foo.corp` with no port covers every port. One name, one meaning, on both sides of the tunnel.
+
+#### The left side
+
+| Written | Matches |
+|---|---|
+| `gitlab.corp` | `gitlab.corp` on any port |
+| `gitlab.corp:5432` | `gitlab.corp:5432` and nothing else |
+| `*.corp` | every host under `.corp`, on any port |
+| `*.corp:5432` | every host under `.corp`, on `:5432` only |
+| `9000` | not a name at all — a raw port forward, which needs a target |
+
+When more than one matches, the more specific wins, by the same ladder the egress rules use: an exact name beats a wildcard, `*.suffix` beats `prefix.*`, a longer name beats a shorter one, and only then does a route naming a port beat one that does not.
+
+```
+gitlab.corp:5432   ▸   gitlab.corp   ▸   *.corp:5432   ▸   *.corp
+```
+
+#### The right side
+
+| Written | Dialled | How the hop is spoken |
+|---|---|---|
+| *nothing* | the host and port the client asked for | follows the client |
+| `api.internal` | `api.internal`, **the client's port** | **follows the client** |
+| `api.internal:8080` | `api.internal:8080` | asked about, if the route injects a header |
+| `api.internal:443` | `api.internal:443` | TLS, SNI from the host |
+| `tls://api.internal` | `api.internal`, **the client's port** | TLS, SNI from the host |
+| `tls://api.internal:8443` | `api.internal:8443` | TLS, SNI from the host |
+| `h2c://api.internal` | `api.internal`, **the client's port** | cleartext HTTP/2, nothing probed |
+| `h2c://api.internal:13002` | `api.internal:13002` | the same |
+| `http://api.internal` | `api.internal`, **the client's port** | cleartext, and do not ask |
+| `http://api.internal:8080` | `api.internal:8080` | the same |
+
+A scheme says **how** to speak to the target, not **where** it is: it does not invent a port for you. `tls://api.internal:443` and `api.internal:443` say the same thing.
+
+**A target with no port follows the client on both counts.** The port used to be what said TLS — `:443` means the same as `tls://` — so a target written without one has nothing to read it off, and it takes the answer from the same place it takes the port: the connection the application opened. TLS in, TLS out. Say `tls://`, `h2c://` or `http://` to decide it yourself, or give the target a port.
+
+#### All nine combinations
+
+|  | nothing on the right | no port on the right | a port on the right |
+|---|---|---|---|
+| **no port on the left**<br>`gitlab.corp` | any port → the same host, the same port<br>`-forward gitlab.corp` | any port → another host, **port preserved**<br>`-forward gitlab.corp=gw.internal` | any port → **one** fixed address<br>`-forward gitlab.corp=localhost:8080` |
+| **a port on the left**<br>`gitlab.corp:5432` | `:5432` only → the same host, `:5432`<br>`-forward gitlab.corp:5432` | `:5432` only → another host, `:5432`<br>`-forward gitlab.corp:5432=db.internal` | `:5432` only → a fixed address<br>`-forward gitlab.corp:5432=10.0.0.9:5432` |
+
+The top right corner is the one to watch: `-forward gitlab.corp=localhost:8080` now catches `gitlab.corp:22` as well and sends it to `localhost:8080`. If HTTPS was what you meant, say so on the left — `-forward gitlab.corp:443=localhost:8080`.
+
+#### Headers
+
+`-H` attaches to the preceding `-forward`, in either form. A forward with no target re-issues the request to the host that was asked for, which is a request like any other, so a credential lands in it:
+
 ```bash
-# No target: go to whatever host was asked for. Intercepted like any other
-# route when -mitm-ca is given. -H does not apply — attach headers to the
-# target form below.
--forward gitlab.corp
+-forward gitlab.corp -H 'Authorization: Bearer …'
+```
 
-# Intercepted and re-issued to the real host — the form to use when you want
-# headers injected into it.
--forward gitlab.corp=gitlab.corp:443
+Only a port forward refuses `-H`, since a raw pipe parses nothing and has no request to put a header in. And `-forward gitlab.corp=gitlab.corp` is the same thing said twice — a target is for sending a domain somewhere it does not already point.
 
-# Route to a service on the controlplane
--forward myapi.local=localhost:8080
+#### A route on a port that is not HTTP
 
-# State how to reach the target instead of leaving it to be discovered. The
-# client terminates the application's TLS and opens this second hop itself,
-# so the two legs are independent and only this one needs a scheme.
--forward myapi.local=tls://api.example.com:443   # TLS, SNI from the host
--forward grpc.corp=h2c://api.internal:13002      # cleartext HTTP/2, nothing probed
--forward legacy.corp=http://api.internal:8080    # cleartext, no TLS probe
+Interception does not change: the proxy reads the first bytes of the tunnel and decides. A TLS record is terminated with a minted leaf, an h2c preface is terminated without one, a request line is read as HTTP/1.1, and anything else is piped through byte for byte. Headers cannot be injected into that last case, and a `WARNING` says so.
 
-# Wildcards
--forward '*.example.test=localhost:8080'
--forward 'mail.*=localhost:8080'
+#### Port forwards are a different thing
 
-# Port forward: the server opens a TCP port and tunnels every connection.
-# tls:// is the client wrapping that pipe; a raw pipe parses nothing, so no
-# other scheme means anything here.
+A number on the left, not a name: the server opens a TCP port in the sandbox and pipes every connection to a local address, parsing nothing.
+
+```bash
 -forward 9000=localhost:3000
 -forward 8085=tls://www.google.com:443
 ```
+
+Here the port on the right is required in every form but `tls://host`, which alone means `:443` — there is no client port to follow, because the left side is the port being listened on rather than the one being dialled. `tls://` is the client wrapping that pipe; a raw pipe parses nothing, so no other scheme means anything here.
 
 ## Go library
 
@@ -757,7 +813,17 @@ The two stream windows are independent, so raising one raises one — and the wo
 
 ### Route options
 
-Passed to [`MITMProxy.ForwardTo`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo) and its siblings: [`WithHeader`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithHeader) injects a header into every request for the domain, [`WithSNI`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSNI) sets the server name the proxy presents upstream. Proxy construction takes [`WithMitmCA`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithMitmCA); see [Using it without a tunnel](#using-it-without-a-tunnel).
+Passed to [`MITMProxy.Forward`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.Forward) and its siblings:
+
+| Option | What it does |
+|---|---|
+| [`WithTarget`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithTarget) | send the domain somewhere other than where it already points |
+| [`WithHeader`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithHeader) | inject a header into every request for the domain |
+| [`WithSNI`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithSNI) | the server name the proxy presents upstream |
+
+[`ForwardTo(domain, target, opts...)`](https://pkg.go.dev/github.com/vivid-money/vtunnel#MITMProxy.ForwardTo) is `Forward` with `WithTarget`, and exists because a target is where a request goes rather than a detail of how it gets there: at a call site somebody writes by hand it belongs where it can be read. Building the options up instead — a CLI turning flags into a route — is what `WithTarget` is for.
+
+Proxy construction takes [`WithMitmCA`](https://pkg.go.dev/github.com/vivid-money/vtunnel#WithMitmCA); see [Using it without a tunnel](#using-it-without-a-tunnel).
 
 See [pkg.go.dev](https://pkg.go.dev/github.com/vivid-money/vtunnel).
 

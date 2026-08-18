@@ -432,29 +432,37 @@ func FuzzForwardTargetIsCoherent(f *testing.F) {
 	f.Add("")
 
 	f.Fuzz(func(t *testing.T, addr string) {
-		target, tlsHost, isTLS, h2c := parseForwardTarget(addr)
-
-		if (tlsHost != "") != isTLS {
-			t.Fatalf("parseForwardTarget(%q) = %q, %q, %v: a server name without TLS, "+
-				"or TLS without a server name", addr, target, tlsHost, isTLS)
+		got, ok := parseRouteTarget(addr)
+		if !ok {
+			// A refusal claims nothing, which is the whole point of it.
+			if got != (forwardTarget{}) {
+				t.Fatalf("parseRouteTarget(%q) refused but returned %+v", addr, got)
+			}
+			return
 		}
+
 		// The two stated schemes are mutually exclusive: h2c is cleartext, and
 		// TLS is not. A target that came back as both would leave
 		// upstreamTransport picking between them by the order of its branches.
-		if h2c && isTLS {
-			t.Fatalf("parseForwardTarget(%q) says both h2c and TLS", addr)
+		if got.h2c && got.tlsHost != "" {
+			t.Fatalf("parseRouteTarget(%q) says both h2c and TLS", addr)
 		}
 		for _, scheme := range []string{"tls://", "http://", "h2c://"} {
-			if strings.HasPrefix(target, scheme) {
-				t.Fatalf("parseForwardTarget(%q) left a scheme on the dial address %q", addr, target)
+			if strings.HasPrefix(got.host, scheme) {
+				t.Fatalf("parseRouteTarget(%q) left a scheme on the dial address %q", addr, got.host)
 			}
 		}
-		if isTLS {
-			// A TLS target is dialled, so it must carry a port for the dial and
-			// a name for the handshake.
-			if _, _, err := net.SplitHostPort(target); err != nil {
-				t.Fatalf("parseForwardTarget(%q) says TLS but %q is not host:port", addr, target)
-			}
+		if got.host == "" {
+			t.Fatalf("parseRouteTarget(%q) accepted a target that names no host", addr)
+		}
+		// Whatever came back has to be dialable once a port is on it, whether
+		// the target carried one or the request supplies it.
+		dialable := got.host
+		if got.portFromRequest {
+			dialable = net.JoinHostPort(got.host, "5432")
+		}
+		if host, _, err := net.SplitHostPort(dialable); err != nil || host == "" {
+			t.Fatalf("parseRouteTarget(%q) produced %q, which is not host:port", addr, dialable)
 		}
 	})
 }

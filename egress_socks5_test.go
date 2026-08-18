@@ -165,9 +165,83 @@ func TestSocks5UnroutedDomainNeverEntersTheTunnel(t *testing.T) {
 	}
 }
 
-// A route is a host and a port together. A wildcard for :5432 must not hand out
-// :22 on the same domain — that is the difference between forwarding a database
-// and forwarding ssh.
+// The other half of the same rule: written without a port, a route covers every
+// port of that name, which is what an egress rule without one has always meant.
+// That is what makes "forward this host" one line rather than one per port.
+func TestSocks5PortlessRouteCoversEveryPort(t *testing.T) {
+	controlplaneOnly, _ := tcpEcho(t, "controlplane")
+	egressAddr, client := sandbox(t)
+
+	if err := client.Proxy().ForwardTo("db.corp", controlplaneOnly); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Neither of these is 80 or 443, which is all a portless route used to cover.
+	for _, port := range []string{"5432", "6379"} {
+		conn := socksDial(t, egressAddr, net.JoinHostPort("db.corp", port))
+		if got := ask(t, conn, "SELECT 1"); got != "controlplane: SELECT 1" {
+			t.Fatalf("db.corp:%s answered %q, want the controlplane's target", port, got)
+		}
+	}
+}
+
+// A target written without a port is dialled on the port the client asked for.
+// A scheme, or the lack of one, says how to speak to an upstream and not where
+// it is — so one route can move a whole host to another address without pinning
+// every port of it to one.
+func TestSocks5PortlessTargetFollowsTheRequestedPort(t *testing.T) {
+	first, _ := tcpEcho(t, "first")
+	second, _ := tcpEcho(t, "second")
+	_, firstPort, _ := net.SplitHostPort(first)
+	_, secondPort, _ := net.SplitHostPort(second)
+
+	egressAddr, client := sandbox(t)
+	if err := client.Proxy().ForwardTo("db.corp", "127.0.0.1"); err != nil {
+		t.Fatalf("ForwardTo: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	for _, tc := range []struct{ port, want string }{
+		{firstPort, "first: ping"},
+		{secondPort, "second: ping"},
+	} {
+		conn := socksDial(t, egressAddr, net.JoinHostPort("db.corp", tc.port))
+		if got := ask(t, conn, "ping"); got != tc.want {
+			t.Fatalf("db.corp:%s answered %q, want %q — the target's port did not follow the request",
+				tc.port, got, tc.want)
+		}
+	}
+}
+
+// A wildcard means the same thing on the left of any route: it is the domain
+// half, and what the route does with what it matched is the other half. With no
+// target every host under it reaches itself; with one they all reach that, each
+// on the port it was asked for.
+func TestSocks5WildcardWithATargetCoversEveryHostAndPort(t *testing.T) {
+	gateway, _ := tcpEcho(t, "gateway")
+	gatewayHost, gatewayPort, _ := net.SplitHostPort(gateway)
+
+	egressAddr, client := sandbox(t)
+	if err := client.Proxy().Forward("*.corp", vtunnel.WithTarget(gatewayHost)); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+
+	// Two different hosts under the wildcard, on a port that is neither 80 nor
+	// 443, both arriving at the one gateway.
+	for _, host := range []string{"db.corp", "cache.corp"} {
+		conn := socksDial(t, egressAddr, net.JoinHostPort(host, gatewayPort))
+		if got := ask(t, conn, "ping"); got != "gateway: ping" {
+			t.Fatalf("%s:%s answered %q, want the gateway", host, gatewayPort, got)
+		}
+	}
+}
+
+// A route is a host and a port together when it is written that way. A wildcard
+// for :5432 must not hand out :22 on the same domain — that is the difference
+// between forwarding a database and forwarding ssh, and writing the port is how
+// it is said.
 func TestSocks5RouteDoesNotLeakToOtherPorts(t *testing.T) {
 	tunnelSide, tunnelHits := tcpEcho(t, "controlplane")
 	egressAddr, client := sandbox(t)

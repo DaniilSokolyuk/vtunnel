@@ -233,6 +233,25 @@ type ForwardOption func(*forwardConfig)
 type forwardConfig struct {
 	headers http.Header
 	sni     string
+	target  string
+}
+
+// WithTarget sends the domain somewhere other than where it already points.
+// Without it a route goes to the host the request named, which is what lets one
+// wildcard stand for a family of hosts, each reaching itself.
+//
+// The target is a "host[:port]", optionally prefixed with "tls://", "h2c://" or
+// "http://" to state how the upstream is spoken to rather than leaving it to be
+// discovered. Written without a port it is dialled on the port the client asked
+// for, and follows the client on protocol too; see [MITMProxy.ForwardTo], which
+// is this option with the target where a reader expects to find it.
+//
+//	proxy.Forward("api.corp", vtunnel.WithTarget("localhost:8081"))
+//	proxy.Forward("*.corp", vtunnel.WithTarget("gw.internal")) // all of them, one gateway
+func WithTarget(target string) ForwardOption {
+	return func(fc *forwardConfig) {
+		fc.target = target
+	}
 }
 
 // WithSNI sets the server name the proxy presents when it opens TLS to the
@@ -481,65 +500,92 @@ func (c *Client) startProxy() error {
 	return c.proxyErr
 }
 
-// parseForwardTarget splits a forward target into a dialable address and how to
-// speak to it: the hostname for SNI when the upstream speaks TLS, and whether it
-// was declared as cleartext HTTP/2.
+// forwardTarget is a route target read into its parts: where to dial, how to
+// speak to it, and whether the port is still to be decided.
+type forwardTarget struct {
+	// host is what to dial. It carries a port only when the target was written
+	// with one; otherwise it is a bare host, with the brackets already off an
+	// IPv6 literal so that net.JoinHostPort can put them back.
+	host string
+	// tlsHost is the server name to present when opening TLS to host, and is
+	// empty when the hop is not TLS.
+	tlsHost string
+	// portFromRequest says the target named no port, so the port dialled is the
+	// one the client asked for. A scheme states how to speak to an upstream and
+	// not where it is, so none of them fills a port in.
+	portFromRequest bool
+	// h2c records that "h2c://" was written: cleartext HTTP/2, without asking.
+	h2c bool
+}
+
+// parseRouteTarget reads the target of a domain route.
 //
 // Three schemes, and each exists to replace a guess with a statement:
 //
-//	tls://host:port   TLS, SNI from the host. A bare ":443" says the same.
-//	h2c://host:port   cleartext HTTP/2, so nothing is probed for it.
-//	http://host:port  cleartext, and do not ask.
+//	tls://host[:port]   TLS, SNI from the host.
+//	h2c://host[:port]   cleartext HTTP/2, so nothing is probed for it.
+//	http://host[:port]  cleartext, and do not ask.
 //
 // Everything else is a bare address, about which the proxy asks the upstream
-// rather than reading its intentions off a port number.
+// rather than reading its intentions off a port number — except ":443", which
+// says TLS as plainly as the prefix does.
+//
+// The port is optional throughout, and a target without one is dialled on the
+// port the client asked for. That is what lets one route cover a host rather
+// than a host and a port: "api.corp=gw.internal" reaches gw.internal on
+// whatever port was asked for, where "gw.internal:8080" pins every one of them
+// to 8080.
 //
 // A target that names no host is no target: an empty host is dialable in Go and
-// means this machine, so "tls://", "tls://:0" and a bare ":443" all come back
-// empty rather than as a quiet connection to local port 443 — with, on a route
+// means this machine, so "tls://", "tls://:0" and a bare ":443" are all refused
+// rather than becoming a quiet connection to a local port — with, on a route
 // configured for one, the credential attached. Found by
 // FuzzForwardTargetIsCoherent.
-func parseForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS, h2c bool) {
-	target, tlsHost, upstreamIsTLS, h2c = readForwardTarget(addr)
+func parseRouteTarget(addr string) (forwardTarget, bool) {
+	t, ok := readForwardTarget(addr)
+	if !ok {
+		return forwardTarget{}, false
+	}
 
 	// A scheme that survived the strip means there was a second one behind it —
 	// "tls://tls://" left "tls://" to be dialled as a hostname.
-	if strings.Contains(target, "://") {
-		return "", "", false, false
+	if strings.Contains(t.host, "://") {
+		return forwardTarget{}, false
 	}
-	if host, _, err := net.SplitHostPort(target); err == nil && host == "" {
-		return "", "", false, false
+	if t.portFromRequest {
+		// The host is the whole of the address, so it is the whole of the check —
+		// and it has to survive the JoinHostPort that will put a port on it. A
+		// stray bracket produced "]0:443", which is not an address and would
+		// have been discovered as a failed dial.
+		if t.host == "" {
+			return forwardTarget{}, false
+		}
+		if host, _, err := net.SplitHostPort(net.JoinHostPort(t.host, "0")); err != nil || host != t.host {
+			return forwardTarget{}, false
+		}
+		return t, true
 	}
-	return target, tlsHost, upstreamIsTLS, h2c
+	if host, _, err := net.SplitHostPort(t.host); err != nil || host == "" {
+		return forwardTarget{}, false
+	}
+	return t, true
 }
 
-// readForwardTarget is parseForwardTarget without the check that the result
-// names somewhere. Split out so that check is written once, on every shape,
-// rather than per branch — which is how the shapes that lacked it got missed.
-func readForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS, h2c bool) {
+// readForwardTarget is parseRouteTarget without the check that the result names
+// somewhere. Split out so that check is written once, on every shape, rather
+// than per branch — which is how the shapes that lacked it got missed.
+func readForwardTarget(addr string) (forwardTarget, bool) {
 	if after, ok := strings.CutPrefix(addr, "tls://"); ok {
-		host, _, err := net.SplitHostPort(after)
-		if err != nil {
-			// No port: TLS means 443. Reading the missing port as "not TLS
-			// after all" dropped the one thing the prefix was there to say,
-			// and the request went out on port 80 in the clear — with the
-			// configured credential attached to it.
-			//
-			// The brackets of an IPv6 literal come off first: JoinHostPort puts
-			// them back, and leaving them on produced "[[::1]]:443", which is
-			// not an address anything can dial.
-			bare := strings.TrimSuffix(strings.TrimPrefix(after, "["), "]")
-			joined := net.JoinHostPort(bare, "443")
-			if _, _, err := net.SplitHostPort(joined); err != nil {
-				// The port was supplied here rather than written by the caller,
-				// so what came out is this function's own work and has to be
-				// dialable. A stray bracket produced "]0:443", which is not an
-				// address and would have been discovered as a failed dial.
-				return "", "", false, false
-			}
-			return joined, bare, true, false
-		}
-		return after, host, true, false
+		host, fromRequest := splitTargetPort(after)
+		// The prefix says TLS whether or not a port came with it. Reading a
+		// missing port as "not TLS after all" dropped the one thing the prefix
+		// was there to say, and the request went out in the clear — with the
+		// configured credential attached to it.
+		return forwardTarget{
+			host:            host,
+			tlsHost:         hostFromAuthority(host),
+			portFromRequest: fromRequest,
+		}, host != ""
 	}
 	if after, ok := strings.CutPrefix(addr, "h2c://"); ok {
 		// Cleartext HTTP/2, said outright. The proxy can find this by asking —
@@ -548,32 +594,54 @@ func readForwardTarget(addr string) (target, tlsHost string, upstreamIsTLS, h2c 
 		// the client side is HTTP/2 as well. Stating it skips both: an h2c
 		// upstream stays h2c even for an HTTP/1.1 client, which is the one case
 		// the probe cannot reach.
-		if after == "" {
-			return "", "", false, false
-		}
-		return after, "", false, true
+		host, fromRequest := splitTargetPort(after)
+		return forwardTarget{host: host, portFromRequest: fromRequest, h2c: true}, host != ""
 	}
 	if after, ok := strings.CutPrefix(addr, "http://"); ok {
 		// Said outright: reach this one in the clear, do not ask.
-		return after, "", false, false
+		host, fromRequest := splitTargetPort(after)
+		return forwardTarget{host: host, portFromRequest: fromRequest}, host != ""
 	}
 	if host, port, err := net.SplitHostPort(addr); err == nil && port == "443" {
-		return addr, host, true, false
+		return forwardTarget{host: addr, tlsHost: host}, true
 	}
 	// No scheme and no well-known port. Whether this upstream speaks TLS is
 	// decided by asking it — see MITMProxy.upstreamTLSName — because reading it
 	// off the port number is what sent a credential to an HTTPS backend on 8443
 	// in plaintext.
-	return addr, "", false, false
+	host, fromRequest := splitTargetPort(addr)
+	return forwardTarget{host: host, portFromRequest: fromRequest}, host != ""
 }
 
-// domainKeys expands a forward domain into proxy mapping keys. A domain
-// without a port covers both :80 and :443.
-func domainKeys(domain string) []string {
-	if _, _, err := net.SplitHostPort(domain); err != nil {
-		return []string{net.JoinHostPort(domain, "80"), net.JoinHostPort(domain, "443")}
+// splitTargetPort reports the address to dial and whether a port still has to
+// be found for it. With no port written it takes the brackets off an IPv6
+// literal, since net.JoinHostPort is what puts them back and "[[::1]]:443" is
+// not an address anything can dial.
+func splitTargetPort(addr string) (host string, portFromRequest bool) {
+	if _, _, err := net.SplitHostPort(addr); err == nil {
+		return addr, false
 	}
-	return []string{domain}
+	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), true
+}
+
+// parsePipeTarget reads the target of a raw port forward, where "tls://" is the
+// only scheme that means anything: the pipe parses nothing, so there is nothing
+// else to state.
+//
+// It is also the one place a missing port becomes 443 rather than the port the
+// client asked for. The left side of a port forward is the port being listened
+// on, not a destination, so there is no requested port to follow.
+func parsePipeTarget(addr string) (target, tlsHost string, ok bool) {
+	t, ok := parseRouteTarget(addr)
+	if !ok || t.tlsHost == "" {
+		return "", "", false
+	}
+	if !t.portFromRequest {
+		return t.host, t.tlsHost, true
+	}
+	// parseRouteTarget has already established that this host survives having a
+	// port joined onto it, so what comes out here is dialable.
+	return net.JoinHostPort(t.host, "443"), t.tlsHost, true
 }
 
 // Close closes the client and all connections.
@@ -682,9 +750,13 @@ func (c *Client) handleStream(stream net.Conn, h streamHeader) {
 // a TLS connection is established with the appropriate ServerName.
 func (c *Client) dialTarget(addr string) (net.Conn, error) {
 	if strings.HasPrefix(addr, "tls://") {
-		// Same rule as parseForwardTarget: the prefix is the instruction, and a
-		// missing port is 443 rather than a reason to ignore it.
-		target, host, _, _ := parseForwardTarget(addr)
+		// parsePipeTarget, not the route reader: the prefix is the instruction,
+		// and here a missing port is 443 rather than something to take from a
+		// request this pipe never sees.
+		target, host, ok := parsePipeTarget(addr)
+		if !ok {
+			return nil, fmt.Errorf("vtunnel: forward target %q names no host", addr)
+		}
 		dialer := &net.Dialer{Timeout: defaultDialTimeout}
 		conn, err := tls.DialWithDialer(dialer, "tcp", target, &tls.Config{ServerName: host})
 		if err != nil {

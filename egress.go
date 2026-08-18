@@ -128,7 +128,10 @@ func (r *EgressProxy) warnRoutesContradictingPolicy(policy *compiledPolicy) {
 	defer r.mu.RUnlock()
 
 	for domain := range r.routes {
-		host, port, err := net.SplitHostPort(domain)
+		// splitRule, not net.SplitHostPort: a route covering every port is
+		// written without one, and reading that as a parse failure skipped the
+		// warning for exactly the shape most likely to contradict a rule.
+		host, port, err := splitRule(domain)
 		if err != nil {
 			continue
 		}
@@ -605,7 +608,9 @@ func (r *EgressProxy) Close() {
 // previously registered for that port. The client re-sends its full list on
 // every reconnect, so replacing keeps the allowlist in step with it.
 //
-// A domain without a port is registered for both :80 and :443.
+// Domains are stored as the controlplane spelled them. A domain without a port
+// covers every port, the same way an egress rule without one does — both are
+// read by bestDomainMatch, so a name resolves identically on either side.
 func (r *EgressProxy) SetRoutes(chainPort int, domains []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -616,11 +621,6 @@ func (r *EgressProxy) SetRoutes(chainPort int, domains []string) {
 		}
 	}
 	for _, domain := range domains {
-		if _, _, err := net.SplitHostPort(domain); err != nil {
-			r.routes[net.JoinHostPort(domain, "80")] = chainPort
-			r.routes[net.JoinHostPort(domain, "443")] = chainPort
-			continue
-		}
 		r.routes[domain] = chainPort
 	}
 	log.Printf("[vtunnel-egress] Routes for tunnel port %d: %v", chainPort, domains)
