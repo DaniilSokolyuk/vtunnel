@@ -1,10 +1,12 @@
 /**
  * vtunnel controlplane example
  *
- * The sandbox has vtunnel server with MITM proxy. When code inside does
+ * The sandbox runs vtunnel server with a routing proxy that never decrypts:
+ * it reads the domain from the cleartext CONNECT line and chains matching
+ * requests through the tunnel. When code inside does
  * `https://api.anthropic.com/...` or `git clone https://github.com/...`,
- * the MITM proxy intercepts TLS, decrypts, and routes through the tunnel
- * to this controlplane as plain HTTP.
+ * the request arrives here, where the MITM proxy terminates TLS, injects the
+ * credential and forwards it on.
  *
  * This example returns mock responses to demonstrate credential injection
  * without requiring real API keys. In production, you'd inject real
@@ -12,11 +14,11 @@
  *
  *   Sandbox Container                        Controlplane (this process)
  *   ┌──────────────────────┐                ┌─────────────────────────────┐
- *   │                      │                │                             │
- *   │ HTTPS_PROXY=:9090    │     TUNNEL     │ vtunnel client              │
- *   │ vtunnel server :3001 │◀══════════════▶│   ├─ api.anthropic.com     │
- *   │   + proxy :9090      │                │   └─ github.com            │
- *   │   + mitm ca.pem      │                │                             │
+ *   │                      │                │ vtunnel client              │
+ *   │ HTTPS_PROXY=:9090    │     TUNNEL     │   + MITM proxy + CA key     │
+ *   │ vtunnel server :3001 │◀══════════════▶│   ├─ api.anthropic.com      │
+ *   │   + router :9090     │                │   └─ github.com             │
+ *   │   + ca.crt only      │                │                             │
  *   └──────────────────────┘                └─────────────────────────────┘
  */
 
@@ -25,7 +27,7 @@ import { spawn, ChildProcess } from "node:child_process";
 
 // --- Config ---
 
-const VTUNNEL_KEY = process.env.VTUNNEL_KEY;
+const VTUNNEL_SECRET = process.env.VTUNNEL_SECRET;
 const SANDBOX_WS_URL = process.env.SANDBOX_WS_URL || "ws://localhost:3001/";
 
 const ANTHROPIC_PROXY_PORT = 8081;
@@ -118,11 +120,11 @@ function startGitHubProxy(): Promise<void> {
 function startVtunnelClient(): ChildProcess {
   const args = ["client", "-server", SANDBOX_WS_URL];
 
-  if (VTUNNEL_KEY) {
-    args.push("-key", VTUNNEL_KEY);
+  if (VTUNNEL_SECRET) {
+    args.push("-secret", VTUNNEL_SECRET);
   }
 
-  // Domain forwards: sandbox MITM proxy → tunnel → controlplane HTTP service
+  // Domain forwards: sandbox router → tunnel → this machine's MITM proxy → local service
   args.push("-forward", `api.anthropic.com=localhost:${ANTHROPIC_PROXY_PORT}`);
   args.push("-forward", `github.com=localhost:${GITHUB_PROXY_PORT}`);
 

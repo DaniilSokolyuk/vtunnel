@@ -36,6 +36,47 @@ func TestParseClientFlags(t *testing.T) {
 			},
 		},
 		{
+			name: "headers on a forward with no target, which goes to the host asked for",
+			args: []string{
+				"-forward", "gitlab.corp",
+				"-H", "Authorization: Bearer sk-ant-xxx",
+			},
+			wantForwards: []forward{
+				{
+					domain:  "gitlab.corp",
+					headers: []forwardHeader{{"Authorization", "Bearer sk-ant-xxx"}},
+				},
+			},
+		},
+		{
+			name: "a target with no port, which follows the requested one",
+			args: []string{
+				"-forward", "gitlab.corp=gitlab.corp",
+				"-H", "Authorization: Bearer sk-ant-xxx",
+			},
+			wantForwards: []forward{
+				{
+					domain:    "gitlab.corp",
+					localAddr: "gitlab.corp",
+					headers:   []forwardHeader{{"Authorization", "Bearer sk-ant-xxx"}},
+				},
+			},
+		},
+		{
+			name: "a scheme with no port is still a target",
+			args: []string{"-forward", "api.corp=tls://api.internal"},
+			wantForwards: []forward{
+				{domain: "api.corp", localAddr: "tls://api.internal"},
+			},
+		},
+		{
+			name: "a port on the left narrows the route to it",
+			args: []string{"-forward", "db.corp:5432=10.0.0.9:5432"},
+			wantForwards: []forward{
+				{domain: "db.corp:5432", localAddr: "10.0.0.9:5432"},
+			},
+		},
+		{
 			name: "two forwards, each with different headers",
 			args: []string{
 				"-forward", "a.test=localhost:8081",
@@ -96,6 +137,15 @@ func TestParseClientFlags(t *testing.T) {
 					headers:   []forwardHeader{{"X-Who", "charlie"}},
 				},
 			},
+		},
+
+		{
+			// A wildcard is only expressible without a target: the host to go
+			// to comes from the request, and a fixed target would send every
+			// host under the pattern to one place. This used to be refused.
+			name:         "wildcard forward, no target",
+			args:         []string{"-forward", "*.beta.corp"},
+			wantForwards: []forward{{domain: "*.beta.corp"}},
 		},
 
 		// --- error paths ---
@@ -175,6 +225,38 @@ func TestParseClientFlags(t *testing.T) {
 						t.Fatalf("forward[%d].headers[%d]: got %+v, want %+v", i, j, got.headers[j], wh)
 					}
 				}
+			}
+		})
+	}
+}
+
+// -H is only meaningful when the proxy terminates TLS. runClient rejects the
+// combination at startup rather than dropping the header silently, which is the
+// difference between a failed run and a credential that never arrives.
+func TestFirstHeaderName(t *testing.T) {
+	cases := []struct {
+		name     string
+		forwards forwardList
+		want     string
+	}{
+		{name: "no forwards"},
+		{
+			name:     "forwards without headers",
+			forwards: forwardList{{domain: "a.test"}, {remotePort: 8080}},
+		},
+		{
+			name: "reports the first header",
+			forwards: forwardList{
+				{domain: "a.test"},
+				{domain: "b.test", headers: []forwardHeader{{"Authorization", "x"}, {"X-Env", "y"}}},
+			},
+			want: "Authorization",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.forwards.firstHeaderName(); got != tc.want {
+				t.Fatalf("firstHeaderName() = %q, want %q", got, tc.want)
 			}
 		})
 	}

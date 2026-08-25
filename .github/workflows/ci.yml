@@ -17,5 +17,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # -race, because the bugs this catches are exactly the ones that survive
+      # review: a field written by whichever goroutine declared a route and read
+      # by the one calling Close looks fine in every reading of the code.
       - name: Test
-        run: go test ./...
+        run: go test -race ./...
+
+      # e2e/ is its own module so that its dependencies — a real gRPC client and
+      # server — stay out of the library's go.mod. `./...` stops at a module
+      # boundary, so it needs its own run.
+      - name: Test e2e
+        run: go test -race ./...
+        working-directory: e2e

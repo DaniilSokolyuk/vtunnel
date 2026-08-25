@@ -38,7 +38,7 @@ func newReconnectEnv(t *testing.T, opts ...vtunnel.Option) *reconnectEnv {
 			return
 		}
 		env.connCh <- conn
-		env.server.HandleConn(conn)
+		env.server.HandleWebSocket(conn)
 	}))
 
 	defaults := []vtunnel.Option{
@@ -382,7 +382,7 @@ func TestKeepAliveDetectsSilentDrop(t *testing.T) {
 		if err != nil {
 			return
 		}
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	}))
 	defer tunnelServer.Close()
 
@@ -503,7 +503,7 @@ func TestReconnectBackoffRespected(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	}))
 	defer ts.Close()
 

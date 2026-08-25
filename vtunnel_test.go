@@ -58,7 +58,7 @@ func startTunnelServer(t *testing.T) (*httptest.Server, *vtunnel.Server) {
 			return
 		}
 		defer conn.Close()
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	}))
 	return ts, server
 }
@@ -277,7 +277,7 @@ func TestHandleConnReplace(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		server.HandleConn(conn)
+		server.HandleWebSocket(conn)
 	}))
 	defer tunnelServer.Close()
 

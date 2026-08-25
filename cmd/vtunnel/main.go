@@ -2,48 +2,153 @@ package main
 
 import (
 	"crypto/tls"
-	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
-
-	"github.com/gorilla/websocket"
+	"time"
 
 	vtunnel "github.com/vivid-money/vtunnel"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
+var upgrader = vtunnel.NewUpgrader()
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Usage:
-  vtunnel server [flags]
-  vtunnel client [flags]
-  vtunnel keygen
+  vtunnel server [flags]        # runs in the sandbox: routes, never decrypts
+  vtunnel client [flags]        # runs on the controlplane: MITM, credentials
+  vtunnel ca [flags]            # MITM CA: makes the pair, exports the certificate
 
 Server flags:
-  -port int            WebSocket listen port (default 3001)
-  -proxy int           HTTP CONNECT proxy port (0 = disabled, default 0)
-  -proxy-mitm-ca string PEM file with CA cert+key for HTTPS MITM (enables interception)
-  -client-key string   Client public key for auth (vt-pub-...) [$VTUNNEL_CLIENT_KEY]
+  -listen string       Where to accept the tunnel. The scheme picks the
+                       transport, and the client's -server URL must use the
+                       same one:
+                         ws://:3001/    also serves /health  (default)
+                         tcp://:3001    a raw socket, and cheaper
+                       Neither is more secure — the session authenticates the
+                       peer either way. [$VTUNNEL_LISTEN]
+  -proxy string        Where the egress proxy listens (empty = disabled).
+                       It serves HTTP and SOCKS5 on the one port, so the
+                       sandbox can point HTTP_PROXY and ALL_PROXY at it:
+                         9090                      loopback only  (do this)
+                         127.0.0.1:9090            the same, spelled out
+                         :9090                     every interface — see below
+                         mixed://127.0.0.1:9090    both, spelled out
+                         socks5://127.0.0.1:1080   one protocol only
+                         http://127.0.0.1:8080
+                       A scheme needs the whole host:port — the bare-port form
+                       and its loopback default do not carry over, so
+                       socks5://1080 is an error and socks5://:1080 is every
+                       interface. Point SOCKS5 clients at socks5h:// so the
+                       name arrives unresolved; an address is refused unless
+                       it is forwarded by address too.
+                       It authenticates nobody, so a port reachable from
+                       outside the sandbox hands whoever finds it an open
+                       relay and the controlplane's injected credentials.
+                       [$VTUNNEL_PROXY]
+  -secret string       Shared tunnel secret, the same value the client is
+                       given. Any hard-to-guess string; @/path reads it from
+                       a file. [$VTUNNEL_SECRET]
+  -protocol string     Session protocol, the same value the client is given:
+                       ssh (default), yamux, or yamux-insecure — the last of
+                       which has no encryption and no authentication, and is
+                       there to be measured against. [$VTUNNEL_PROTOCOL]
+
+Egress policy (both server and client take these):
+  -default-egress      What happens to a destination no rule names:
+                       allow (default) or deny. [$VTUNNEL_DEFAULT_EGRESS]
+  -allow-out value     Permit a destination (repeatable).
+  -deny-out value      Refuse a destination (repeatable).
+                       Each is a CIDR, an address, a hostname or a wildcard
+                       hostname, optionally with a port; without one it covers
+                       every port:
+                         10.0.0.0/8   192.0.2.7   2001:db8::/32   [::1]:5432
+                         api.corp     *.corp      api.corp:443
+                       Names are matched before anything is resolved and
+                       addresses after, so a deny of 169.254.0.0/16 holds even
+                       against a hostname pointing there. Write a deny-all as
+                       -default-egress deny, not as -deny-out 0.0.0.0/0: the
+                       first is a backdrop an allowlist of names is written
+                       against, the second outranks those names and refuses
+                       everything.
+                       On the server they apply from startup, which is the only
+                       way to close the gap before a client connects; whatever
+                       the client sends then replaces them. They cannot cut off
+                       the tunnel itself — the client dials in, and the hop to
+                       a tunnel port is exempt.
+                       This governs what the sandbox reaches on its own. It
+                       cannot govern a process that ignores HTTPS_PROXY, and
+                       nothing here sees UDP, DNS included.
+
+CA flags:
+  -mitm-ca string   PEM file with CA cert+key, created if missing. Same file
+                    the client takes. [$VTUNNEL_MITM_CA] (default ./ca.pem)
+  -out string       Where to write the certificate to install in the sandbox
+                    (default: the -mitm-ca path with a .crt extension)
+  -stdout           Print the certificate to stdout instead of writing a file
 
 Client flags:
-  -server string    WebSocket server URL (e.g. ws://example.com/)
-  -key string       Private key for auth (vt-priv-...) [$VTUNNEL_KEY]
-  -forward value    Forward mapping (repeatable)
-                    Port:   -forward 8080=localhost:3000
+  -server string    Tunnel URL. The scheme picks the transport:
+                      ws://sandbox:3001/   wss://sandbox.example.com/
+                      tcp://sandbox:3001
+                    It must match how the sandbox is listening.
+  -secret string    Shared tunnel secret, the same value the sandbox is given.
+                    Any hard-to-guess string, e.g. openssl rand -base64 32;
+                    @/path reads it from a file. [$VTUNNEL_SECRET]
+  -protocol string  Session protocol, the same value the sandbox is given:
+                    ssh (default), yamux, or yamux-insecure — the last of
+                    which has no encryption and no authentication, and is
+                    there to be measured against. [$VTUNNEL_PROTOCOL]
+  -mitm-ca string   PEM file with CA cert+key for HTTPS MITM [$VTUNNEL_MITM_CA]
+                    Created if missing. Without it TLS is piped through
+                    untouched and -H cannot be used.
+  -forward value    Forward mapping (repeatable). The left side is what to
+                    catch, the right side is where to go, and a port is
+                    optional on both:
+                      no port on the left   the route covers EVERY port of
+                                            that name, as an egress rule
+                                            without a port does
+                      no port on the right  the upstream is dialled on the
+                                            port the client asked for
                     Domain: -forward llmproxy.local=localhost:8080
-                    TLS:    -forward 8085=tls://www.google.com:443
-  -H value          Inject HTTP header into MITM-proxied requests for the
-  -header value     preceding -forward (domain-flavored). Format "Name: Value".
-                    Repeatable. Each -H attaches to the most recent -forward.
+                            -forward db.corp:5432=10.0.0.9:5432  that port only
+                    Real host: -forward gitlab.corp
+                            No target = go to the host that was asked for.
+                            Intercepted like any other route when -mitm-ca is
+                            given, and it takes -H like any other.
+                    A wildcard is the left half of a route and works with a
+                    target or without: '*.corp' sends every host under it to
+                    itself, '*.corp=gw.internal' sends all of them to one
+                    gateway, each on the port it was asked for.
+                    A domain target may state how to reach the upstream:
+                      tls://host[:port]   TLS, SNI from the host (":443" too)
+                      h2c://host[:port]   cleartext HTTP/2, nothing probed
+                      http://host[:port]  cleartext, and do not ask
+                    A scheme says how to speak to the upstream, not where it
+                    is, so it never fills a port in. Left unstated the scheme
+                    is discovered, which costs a probe on a route carrying -H,
+                    and cannot find h2c behind an HTTP/1.1 client.
+  Port forward:     A number on the left, and a raw pipe that parses nothing:
+                      -forward 8080=localhost:3000
+                      -forward 8085=tls://www.google.com:443
+                    The port on the right is required here, except after
+                    tls://, where it is 443 — the left side is the port being
+                    listened on, so there is no requested port to follow.
+  -H value          Inject HTTP header into requests for the preceding
+  -header value     -forward (domain-flavored, with a target or without).
+                    Format "Name: Value". Repeatable. Each -H attaches to the
+                    most recent -forward. A port forward takes none: a raw pipe
+                    parses nothing and has no request to put a header in.
+                    Values never leave this machine.
 `)
 	os.Exit(1)
 }
@@ -58,8 +163,8 @@ func main() {
 		runServer(os.Args[2:])
 	case "client":
 		runClient(os.Args[2:])
-	case "keygen":
-		runKeygen()
+	case "ca":
+		runCA(os.Args[2:])
 	default:
 		usage()
 	}
@@ -67,66 +172,219 @@ func main() {
 
 var srv *vtunnel.Server
 
-func runKeygen() {
-	priv, pub, err := vtunnel.GenerateKeyPair()
-	if err != nil {
-		log.Fatalf("[vtunnel] keygen error: %v", err)
+// readSecret resolves a secret given on the command line. "@/path" reads the
+// file instead, because an argument is visible in ps output and lands in shell
+// history — and this one value is the whole tunnel.
+func readSecret(v string) string {
+	path, ok := strings.CutPrefix(v, "@")
+	if !ok {
+		return v
 	}
-	fmt.Printf("Private key (client): %s\n", priv)
-	fmt.Printf("Public key (server):  %s\n", pub)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("[vtunnel] read secret from %s: %v", path, err)
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// defaultCAName is where the MITM CA lands when no path is given: the working
+// directory, so the files are where you ran the command and not hidden in a
+// home directory you have to remember.
+const defaultCAName = "ca.pem"
+
+// loadOrCreateCA reads the CA at path, generating one if it does not exist yet.
+// The file is written 0600: it holds a key that can mint trusted certificates.
+func loadOrCreateCA(path string) (tls.Certificate, error) {
+	blob, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		blob, err = vtunnel.GenerateCA("vtunnel MITM CA")
+		if err != nil {
+			return tls.Certificate{}, err
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return tls.Certificate{}, fmt.Errorf("create CA directory: %w", err)
+		}
+		if err := os.WriteFile(path, blob, 0o600); err != nil {
+			return tls.Certificate{}, fmt.Errorf("write CA: %w", err)
+		}
+		log.Printf("[vtunnel] Generated a new MITM CA at %s", path)
+	} else if err != nil {
+		return tls.Certificate{}, fmt.Errorf("read CA: %w", err)
+	}
+	return vtunnel.LoadCA(blob)
+}
+
+// certExportPath decides where the certificate half is written, and refuses to
+// name the CA pair itself.
+//
+// The default swaps the extension for .crt, which is right for the conventional
+// ca.pem and catastrophic for a CA already called ca.crt: the export would
+// overwrite the pair with a certificate-only file, destroying the private key.
+// There is no recovering from that — every sandbox trusting the CA needs a new
+// one — so it is refused rather than warned about.
+func certExportPath(caPath, out string) (string, error) {
+	path := out
+	if path == "" {
+		path = strings.TrimSuffix(caPath, filepath.Ext(caPath)) + ".crt"
+	}
+
+	if filepath.Clean(path) == filepath.Clean(caPath) || sameFile(path, caPath) {
+		return "", fmt.Errorf(
+			"refusing to write the certificate over the CA at %s: that would destroy its private key; "+
+				"pass -out with a different path, or name the pair something other than %s",
+			caPath, filepath.Base(caPath))
+	}
+	return path, nil
+}
+
+// sameFile reports whether two paths resolve to the same file on disk, which
+// plain string comparison misses across symlinks and hard links.
+func sameFile(a, b string) bool {
+	ai, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	bi, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(ai, bi)
+}
+
+// runCA generates the MITM CA if it does not exist yet and writes its two
+// halves as separate files: the cert+key PEM to keep here, and the certificate
+// on its own to install in a sandbox. Running it again re-exports the
+// certificate from the existing CA rather than making a new one.
+func runCA(args []string) {
+	fs := flag.NewFlagSet("ca", flag.ExitOnError)
+	caFile := fs.String("mitm-ca", os.Getenv("VTUNNEL_MITM_CA"), "PEM file with CA cert+key (created if missing)")
+	out := fs.String("out", "", "Where to write the certificate (default: alongside the CA, as .crt)")
+	toStdout := fs.Bool("stdout", false, "Print the certificate to stdout instead of writing a file")
+	fs.Parse(args)
+
+	path := *caFile
+	if path == "" {
+		path = defaultCAName
+	}
+	if _, err := loadOrCreateCA(path); err != nil {
+		log.Fatalf("[vtunnel] MITM CA: %v", err)
+	}
+
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("[vtunnel] read CA: %v", err)
+	}
+	certPEM, err := vtunnel.CACertPEM(blob)
+	if err != nil {
+		log.Fatalf("[vtunnel] extract CA certificate: %v", err)
+	}
+
+	if *toStdout {
+		os.Stdout.Write(certPEM)
+		return
+	}
+
+	certPath, err := certExportPath(path, *out)
+	if err != nil {
+		log.Fatalf("[vtunnel] %v", err)
+	}
+	// 0644: this half is meant to be copied around and read by anything.
+	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {
+		log.Fatalf("[vtunnel] write certificate: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "CA ready.\n")
+	fmt.Fprintf(os.Stderr, "  private key + cert  %s   keep here, pass to: vtunnel client -mitm-ca\n", path)
+	fmt.Fprintf(os.Stderr, "  certificate only    %s   copy into the sandbox trust store\n", certPath)
+	fmt.Fprintf(os.Stderr, "\n%s can mint certificates every sandbox trusts. Do not commit it.\n", path)
 }
 
 func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
-	port := fs.Int("port", 3001, "WebSocket listen port")
-	proxyPort := fs.Int("proxy", 0, "HTTP CONNECT proxy port (0 = disabled)")
-	mitmCAFile := fs.String("proxy-mitm-ca", "", "PEM file with CA cert+key for HTTPS MITM")
-	clientKey := fs.String("client-key", os.Getenv("VTUNNEL_CLIENT_KEY"), "Client public key (vt-pub-...)")
+	listen := fs.String("listen", envOr("VTUNNEL_LISTEN", "ws://:3001/"), "Tunnel listen URL: ws://:3001/ or tcp://:3001")
+	proxyAddr := fs.String("proxy", os.Getenv("VTUNNEL_PROXY"),
+		"Routing proxy address: 9090 (loopback), 127.0.0.1:9090, :9090 for every interface, "+
+			"or mixed|http|socks5://host:port for one front end (empty = disabled)")
+	secret := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
+	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the client")
+	egress := egressFlags(fs)
 	fs.Parse(args)
 
-	var opts []vtunnel.ServerOption
-	if *clientKey != "" {
-		opts = append(opts, vtunnel.WithClientKey(*clientKey))
-		log.Println("[vtunnel] Client key authentication enabled")
+	listenURL, err := url.Parse(*listen)
+	if err != nil || listenURL.Scheme == "" {
+		log.Fatalf("[vtunnel] bad -listen %q: want ws://:3001/ or tcp://:3001", *listen)
 	}
-	if *mitmCAFile != "" {
-		pem, err := os.ReadFile(*mitmCAFile)
-		if err != nil {
-			log.Fatalf("[vtunnel] Failed to read MITM CA file: %v", err)
-		}
-		cert, err := tls.X509KeyPair(pem, pem)
-		if err != nil {
-			log.Fatalf("[vtunnel] Failed to parse MITM CA cert+key: %v", err)
-		}
-		cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			log.Fatalf("[vtunnel] Failed to parse MITM CA leaf: %v", err)
-		}
-		opts = append(opts, vtunnel.WithProxyMitmCA(cert))
-		log.Println("[vtunnel] HTTPS MITM interception enabled")
+
+	opts := []vtunnel.ServerOption{vtunnel.WithServerProtocol(parseProtocol(*protocol))}
+	if *secret != "" {
+		opts = append(opts, vtunnel.WithServerSecret(readSecret(*secret)))
+		log.Println("[vtunnel] Tunnel authentication enabled")
+	}
+	// Installed before the proxy is started, which is the whole point: the port
+	// must never accept a connection it has no rules for.
+	policy, hasPolicy, err := egress.policy()
+	if err != nil {
+		log.Fatalf("[vtunnel] %v", err)
+	}
+	if hasPolicy {
+		opts = append(opts, vtunnel.WithServerEgressPolicy(policy))
+		log.Printf("[vtunnel] Egress policy: default %s, %d allow, %d deny",
+			policy.Default, len(policy.Allow), len(policy.Deny))
 	}
 	srv = vtunnel.NewServer(opts...)
 
-	if *proxyPort > 0 {
-		proxyAddr := fmt.Sprintf(":%d", *proxyPort)
-		if err := srv.StartProxy(proxyAddr); err != nil {
+	addr, public, err := proxyListenAddr(*proxyAddr)
+	if err != nil {
+		log.Fatalf("[vtunnel] bad -proxy %q: %v", *proxyAddr, err)
+	}
+	if addr != "" {
+		if err := srv.StartProxy(addr); err != nil {
 			log.Fatalf("[vtunnel] Failed to start proxy: %v", err)
 		}
-		log.Printf("[vtunnel] CONNECT proxy on %s", proxyAddr)
+		log.Printf("[vtunnel] Routing proxy on %s (no TLS interception here)", addr)
+		if public {
+			log.Printf("[vtunnel] WARNING: the egress proxy on %s is reachable from outside "+
+				"this sandbox. It authenticates nobody: whoever reaches it gets an open relay, "+
+				"and for every forwarded domain the controlplane's injected credentials with it. "+
+				"Use -proxy 9090 to keep it on loopback unless something else guards the port.",
+				addr)
+		}
 	}
 
+	log.Printf("[vtunnel] Starting server on %s", *listen)
+
+	if listenURL.Scheme != "ws" {
+		// Nothing to share the port with, so the transport's own listener is
+		// the whole server. /health has no place on a raw socket.
+		ln, err := vtunnel.Listen(*listen)
+		if err != nil {
+			log.Fatalf("[vtunnel] %v", err)
+		}
+		log.Fatal(vtunnel.Serve(ln, srv))
+	}
+
+	// WebSocket shares a mux with the health endpoint, so the HTTP server is
+	// ours rather than the transport's.
 	http.HandleFunc("/", handleWebSocket)
 	http.HandleFunc("/health", handleHealth)
 
-	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("[vtunnel] Starting server on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, nil))
+	// ReadHeaderTimeout so a peer that opens a connection and dawdles over the
+	// request line cannot pin a goroutine indefinitely. No write or read
+	// timeout: once upgraded, this connection is a long-lived tunnel.
+	httpSrv := &http.Server{
+		Addr:              listenURL.Host,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Fatal(httpSrv.ListenAndServe())
 }
 
 func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	server := fs.String("server", "", "WebSocket server URL")
-	key := fs.String("key", os.Getenv("VTUNNEL_KEY"), "Private key (vt-priv-...)")
+	key := fs.String("secret", os.Getenv("VTUNNEL_SECRET"), "Shared tunnel secret, or @/path to a file")
+	mitmCAFile := fs.String("mitm-ca", os.Getenv("VTUNNEL_MITM_CA"), "PEM file with CA cert+key for HTTPS MITM (created if missing); unset = no interception")
+	protocol := fs.String("protocol", os.Getenv("VTUNNEL_PROTOCOL"), "Session protocol: ssh (default), yamux, or yamux-insecure; must match the sandbox")
+	egress := egressFlags(fs)
 	var forwards forwardList
 	fs.Var(&forwards, "forward", "Port forward: remotePort=localAddr (repeatable)")
 	headers := headerList{forwards: &forwards}
@@ -141,12 +399,44 @@ func runClient(args []string) {
 		log.Fatal("[vtunnel] at least one -forward is required")
 	}
 
-	var opts []vtunnel.Option
+	opts := []vtunnel.Option{vtunnel.WithProtocol(parseProtocol(*protocol))}
 	if *key != "" {
-		opts = append(opts, vtunnel.WithKey(*key))
-		log.Println("[vtunnel] Key authentication enabled")
+		opts = append(opts, vtunnel.WithSecret(readSecret(*key)))
+		log.Println("[vtunnel] Tunnel authentication enabled")
 	}
+
+	// No CA, no interception. Headers can only be injected into traffic we
+	// terminate, so asking for both at once is a mistake worth naming rather
+	// than silently dropping the header.
+	if *mitmCAFile == "" {
+		if name := forwards.firstHeaderName(); name != "" {
+			log.Fatalf("[vtunnel] -H %q needs -mitm-ca: headers can only be injected into intercepted TLS", name)
+		}
+		log.Println("[vtunnel] No -mitm-ca: TLS is piped through untouched")
+	} else {
+		cert, err := loadOrCreateCA(*mitmCAFile)
+		if err != nil {
+			log.Fatalf("[vtunnel] MITM CA: %v", err)
+		}
+		opts = append(opts, vtunnel.WithMitm(cert))
+		log.Printf("[vtunnel] HTTPS MITM enabled, CA %s (private key stays on this machine)", *mitmCAFile)
+	}
+
 	client := vtunnel.NewClient(*server, opts...)
+
+	// Declared before Connect, so the sandbox is told what it may reach as part
+	// of coming up rather than some moment afterwards. The client replays it on
+	// every reconnect either way.
+	policy, hasPolicy, err := egress.policy()
+	if err != nil {
+		log.Fatalf("[vtunnel] %v", err)
+	}
+	if hasPolicy {
+		if err := client.SetEgressPolicy(policy); err != nil {
+			log.Fatalf("[vtunnel] %v", err)
+		}
+	}
+
 	if err := client.Connect(); err != nil {
 		log.Fatalf("[vtunnel] Connect error: %v", err)
 	}
@@ -154,12 +444,18 @@ func runClient(args []string) {
 
 	for _, f := range forwards {
 		if f.domain != "" {
+			// Routes live on the proxy; the client mirrors them into the sandbox.
+			// No target is a route to whatever host the request named, which is
+			// the absence of the option rather than a second call.
 			var opts []vtunnel.ForwardOption
 			for _, h := range f.headers {
 				opts = append(opts, vtunnel.WithHeader(h.name, h.value))
 			}
-			if err := client.Forward(f.domain, f.localAddr, opts...); err != nil {
-				log.Fatalf("[vtunnel] Forward error for %s: %v", f.domain, err)
+			if f.localAddr != "" {
+				opts = append(opts, vtunnel.WithTarget(f.localAddr))
+			}
+			if err := client.Proxy().Forward(f.domain, opts...); err != nil {
+				log.Fatalf("[vtunnel] %v", err)
 			}
 		} else {
 			if err := client.Listen(f.remotePort, f.localAddr); err != nil {
@@ -175,11 +471,92 @@ func runClient(args []string) {
 	log.Println("[vtunnel] Shutting down")
 }
 
+// envOr returns the environment variable, or def when it is unset or empty.
+func envOr(name, def string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return def
+}
+
+// parseProtocol resolves -protocol / $VTUNNEL_PROTOCOL.
+//
+// An unrecognised value is fatal rather than a fallback to the default. The
+// two ends must agree, and a typo that quietly leaves one of them on ssh would
+// present as a handshake that never completes.
+func parseProtocol(v string) vtunnel.Protocol {
+	switch vtunnel.Protocol(v) {
+	case "":
+		return vtunnel.ProtocolSSH
+	case vtunnel.ProtocolSSH:
+		return vtunnel.ProtocolSSH
+	case vtunnel.ProtocolYamux:
+		return vtunnel.ProtocolYamux
+	case vtunnel.ProtocolYamuxInsecure:
+		return vtunnel.ProtocolYamuxInsecure
+	default:
+		log.Fatalf("[vtunnel] unknown -protocol %q: expected %q, %q or %q",
+			v, vtunnel.ProtocolSSH, vtunnel.ProtocolYamux, vtunnel.ProtocolYamuxInsecure)
+		return ""
+	}
+}
+
+// egressOptions gathers the three flags that make up an egress policy. Both
+// ends take the same three: the sandbox so it can start closed, the
+// controlplane so it can say what the sandbox may reach.
+type egressOptions struct {
+	def   *string
+	allow *stringList
+	deny  *stringList
+}
+
+func egressFlags(fs *flag.FlagSet) egressOptions {
+	o := egressOptions{
+		def:   fs.String("default-egress", os.Getenv("VTUNNEL_DEFAULT_EGRESS"), "What happens to a destination no rule names: allow (default) or deny"),
+		allow: &stringList{},
+		deny:  &stringList{},
+	}
+	fs.Var(o.allow, "allow-out", "Permit a CIDR, address, hostname or *.hostname, optionally :port (repeatable)")
+	fs.Var(o.deny, "deny-out", "Refuse a CIDR, address, hostname or *.hostname, optionally :port (repeatable)")
+	return o
+}
+
+// policy builds the policy these flags describe, and reports whether any were
+// given at all. None means none: a tunnel nobody configured a policy for keeps
+// the behaviour it has always had.
+func (o egressOptions) policy() (vtunnel.Policy, bool, error) {
+	if *o.def == "" && len(*o.allow) == 0 && len(*o.deny) == 0 {
+		return vtunnel.Policy{}, false, nil
+	}
+
+	var def vtunnel.Action
+	switch *o.def {
+	case "", "allow":
+		def = vtunnel.ActionAllow
+	case "deny":
+		def = vtunnel.ActionDeny
+	default:
+		return vtunnel.Policy{}, false, fmt.Errorf("unknown -default-egress %q: expected allow or deny", *o.def)
+	}
+
+	p := vtunnel.Policy{Default: def, Allow: *o.allow, Deny: *o.deny}
+	if err := p.Validate(); err != nil {
+		return vtunnel.Policy{}, false, err
+	}
+	return p, true, nil
+}
+
+// stringList implements flag.Value for a repeatable string flag.
+type stringList []string
+
+func (l *stringList) String() string     { return strings.Join(*l, ",") }
+func (l *stringList) Set(v string) error { *l = append(*l, v); return nil }
+
 // forward represents a single forward mapping (port-based or domain-based)
 type forward struct {
 	remotePort int    // port-based forward (mutually exclusive with domain)
 	domain     string // domain-based forward (mutually exclusive with remotePort)
-	localAddr  string
+	localAddr  string // empty for a domain = go to the host that was asked for
 	headers    []forwardHeader
 }
 
@@ -188,17 +565,37 @@ type forwardHeader struct {
 	value string
 }
 
+// firstHeaderName returns the name of the first configured -H header, or "" if
+// none were given.
+func (f forwardList) firstHeaderName() string {
+	for _, fwd := range f {
+		if len(fwd.headers) > 0 {
+			return fwd.headers[0].name
+		}
+	}
+	return ""
+}
+
 // forwardList implements flag.Value for repeatable -forward flags
 type forwardList []forward
 
 func (f *forwardList) String() string { return fmt.Sprintf("%v", *f) }
 
 func (f *forwardList) Set(val string) error {
-	parts := strings.SplitN(val, "=", 2)
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid forward format %q, expected port=localAddr or domain=localAddr", val)
+	left, right, hasTarget := strings.Cut(val, "=")
+	if !hasTarget {
+		// "-forward gitlab.corp": the domain stands for itself. A port form
+		// has nowhere to send its connections, so it still needs a target.
+		if _, err := strconv.Atoi(left); err == nil {
+			return fmt.Errorf("invalid forward %q: a port forward needs a target, e.g. %s=localhost:3000", val, left)
+		}
+		// A wildcard is fine here, and used to be refused on the grounds that it
+		// had no host to stand for. It has one: the target of a targetless
+		// forward is whatever host the request named, so "*.corp" routes every
+		// host under it to itself.
+		*f = append(*f, forward{domain: left})
+		return nil
 	}
-	left, right := parts[0], parts[1]
 	if port, err := strconv.Atoi(left); err == nil {
 		*f = append(*f, forward{remotePort: port, localAddr: right})
 	} else {
@@ -245,9 +642,68 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
-	srv.HandleConn(conn)
+	srv.HandleWebSocket(conn)
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
+}
+
+// proxyListenAddr resolves the -proxy flag into an address to listen on, and
+// reports whether that address faces anything beyond the sandbox. An empty
+// value means the egress proxy is off.
+//
+// A bare port is loopback, which is both the common case and the safe one: the
+// egress proxy has no authentication, so the port is worth exactly as much as the
+// credentials the controlplane injects behind it. Anything wider has to be
+// written out in full.
+func proxyListenAddr(v string) (addr string, public bool, err error) {
+	if v == "" {
+		return "", false, nil
+	}
+
+	// A scheme says which protocols the port serves and belongs to the egress proxy;
+	// everything below only decides whether the address is reachable from
+	// outside the sandbox, which is the part worth warning about.
+	scheme, rest, hasScheme := strings.Cut(v, "://")
+	if hasScheme {
+		switch scheme {
+		case "mixed", "http", "socks5":
+		default:
+			return "", false, fmt.Errorf("unsupported scheme %q (want mixed, http or socks5)", scheme)
+		}
+		if _, _, splitErr := net.SplitHostPort(rest); splitErr != nil {
+			return "", false, fmt.Errorf("%q needs a port, as in %s://127.0.0.1:9090", v, scheme)
+		}
+	}
+
+	bare := v
+	if hasScheme {
+		bare = rest
+	}
+
+	host, port := "", bare
+	if h, p, splitErr := net.SplitHostPort(bare); splitErr == nil {
+		host, port = h, p
+	} else if strings.ContainsAny(bare, ":.") {
+		// Looked like an address and was not one; a bare port contains neither.
+		return "", false, fmt.Errorf("want a port (9090) or an address (127.0.0.1:9090)")
+	}
+
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return "", false, fmt.Errorf("%q is not a port in 1..65535", port)
+	}
+
+	if host == "" && bare == port {
+		// A bare port: keep it where only this sandbox can reach it.
+		return net.JoinHostPort("127.0.0.1", port), false, nil
+	}
+	if host == "localhost" {
+		return v, false, nil
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return v, false, nil
+	}
+	return v, true, nil
 }
